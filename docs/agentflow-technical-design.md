@@ -901,7 +901,7 @@ Recommended V1 behavior:
 - Require an explicit runner path such as `/opt/conda/bin/conda` or `/opt/homebrew/bin/micromamba` for deterministic execution.
 - Execute with `conda run --no-capture-output` or `micromamba run` without shell interpolation.
 - Support `agentflow env check <tool-ref>` to verify runner accessibility, environment selector metadata, declared env-file hashability, and a lightweight `run true` probe before a real analysis.
-- Support `environment.yml` preparation behind an explicit `agentflow env prepare` command.
+- Support `environment.yml` preparation behind an explicit `agentflow env prepare <tool-ref>` command.
 - Record env file hash and resolved package export when available.
 - Do not auto-install dependencies during normal `run` unless the user approved env preparation.
 
@@ -1495,7 +1495,7 @@ agentflow hypotheses list
 agentflow hypotheses inspect <hypothesis-id>
 agentflow hypotheses challenge <hypothesis-id>
 agentflow report generate <flow-id>
-agentflow env prepare <tool-or-flow>
+agentflow env prepare <tool-ref>
 agentflow cache list
 agentflow cache explain <step-id>
 agentflow cleanup --work --cache

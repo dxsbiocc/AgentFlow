@@ -68,11 +68,13 @@ cargo run -q -p agentflow-cli -- report marker_demo --path "$AF_DEMO"
 - Local runtime timeout control through `runtime.timeout_seconds`
 - Existing Conda/micromamba environment execution through explicit `runtime.runner` plus `env_name` or `env_prefix`
 - Environment readiness checks through `env check <tool-ref>`
+- Explicit Conda/micromamba environment update through `env prepare <tool-ref>` when `runtime.env_file` is declared
 
 ## Explicitly Not Supported Yet
 
 - Agent planning, tool recommendation, or autonomous graph authoring
-- Automatic environment creation, solving, or package installation
+- Implicit environment creation, solving, or package installation during `run`
+- Environment lock/export, package diffing, or environment garbage collection
 - Remote or isolated execution backends such as Docker, Singularity, or SLURM
 - Parallel scheduler execution or cancellation controls
 - Rich semantic validators such as file signatures, domain-specific QC policies, and pluggable validator registries

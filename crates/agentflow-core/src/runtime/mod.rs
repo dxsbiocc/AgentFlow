@@ -1449,6 +1449,7 @@ fn validate_declared_inputs(
             validate_port_file("input", name, &input.path, port)?;
         }
     }
+    validate_sample_id_consistency(inputs, ports)?;
     Ok(())
 }
 
@@ -1470,7 +1471,10 @@ fn validate_port_file(
     path: &Path,
     port: &crate::storage::ToolPortSpec,
 ) -> Result<(), StorageError> {
-    if port.min_rows.is_none() && port.required_columns.is_empty() {
+    if port.min_rows.is_none()
+        && port.required_columns.is_empty()
+        && port.sample_id_column.is_none()
+    {
         return Ok(());
     }
 
@@ -1486,7 +1490,9 @@ fn validate_port_file(
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
 
-    let data_rows = if port.required_columns.is_empty() {
+    let has_header_validators =
+        !port.required_columns.is_empty() || port.sample_id_column.is_some();
+    let data_rows = if !has_header_validators {
         lines.len()
     } else {
         let header = lines.first().ok_or_else(|| {
@@ -1506,6 +1512,13 @@ fn validate_port_file(
                 )));
             }
         }
+        if let Some(sample_id_column) = port.sample_id_column.as_deref() {
+            if !columns.contains(sample_id_column) {
+                return Err(StorageError::InvalidInput(format!(
+                    "{direction} {name} missing sample_id_column {sample_id_column}"
+                )));
+            }
+        }
         lines.len().saturating_sub(1)
     };
 
@@ -1518,6 +1531,113 @@ fn validate_port_file(
     }
 
     Ok(())
+}
+
+fn validate_sample_id_consistency(
+    inputs: &BTreeMap<String, ResolvedInput>,
+    ports: &BTreeMap<String, crate::storage::ToolPortSpec>,
+) -> Result<(), StorageError> {
+    let mut sample_sets: Vec<(String, BTreeSet<String>)> = Vec::new();
+    for (name, input) in inputs {
+        let Some(port) = ports.get(name) else {
+            continue;
+        };
+        let Some(sample_id_column) = port.sample_id_column.as_deref() else {
+            continue;
+        };
+        let ids = sample_ids_for_input(name, &input.path, port, sample_id_column)?;
+        sample_sets.push((name.clone(), ids));
+    }
+
+    let Some((reference_name, reference_ids)) = sample_sets.first() else {
+        return Ok(());
+    };
+    for (name, ids) in sample_sets.iter().skip(1) {
+        if ids != reference_ids {
+            let missing = reference_ids.difference(ids).cloned().collect::<Vec<_>>();
+            let extra = ids.difference(reference_ids).cloned().collect::<Vec<_>>();
+            return Err(StorageError::InvalidInput(format!(
+                "input {name} sample ids differ from {reference_name}: missing [{}], extra [{}]",
+                preview_values(&missing),
+                preview_values(&extra)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn sample_ids_for_input(
+    name: &str,
+    path: &Path,
+    port: &crate::storage::ToolPortSpec,
+    sample_id_column: &str,
+) -> Result<BTreeSet<String>, StorageError> {
+    let text = fs::read_to_string(path).map_err(|error| {
+        StorageError::InvalidInput(format!(
+            "input {name} sample_id_column validator requires UTF-8 text at {}: {error}",
+            path.display()
+        ))
+    })?;
+    let lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let header = lines.first().ok_or_else(|| {
+        StorageError::InvalidInput(format!(
+            "input {name} is empty and cannot satisfy sample_id_column"
+        ))
+    })?;
+    let delimiter = delimiter_for_port(&port.type_name, header);
+    let columns = header.split(delimiter).map(str::trim).collect::<Vec<_>>();
+    let Some(column_index) = columns
+        .iter()
+        .position(|column| *column == sample_id_column)
+    else {
+        return Err(StorageError::InvalidInput(format!(
+            "input {name} missing sample_id_column {sample_id_column}"
+        )));
+    };
+
+    let mut ids = BTreeSet::new();
+    for (row_index, line) in lines.iter().skip(1).enumerate() {
+        let value = line
+            .split(delimiter)
+            .nth(column_index)
+            .map(str::trim)
+            .unwrap_or_default();
+        if value.is_empty() {
+            return Err(StorageError::InvalidInput(format!(
+                "input {name} has empty sample id in row {}",
+                row_index + 2
+            )));
+        }
+        if !ids.insert(value.to_string()) {
+            return Err(StorageError::InvalidInput(format!(
+                "input {name} has duplicate sample id {value}"
+            )));
+        }
+    }
+    if ids.is_empty() {
+        return Err(StorageError::InvalidInput(format!(
+            "input {name} sample_id_column {sample_id_column} has no ids"
+        )));
+    }
+    Ok(ids)
+}
+
+fn preview_values(values: &[String]) -> String {
+    let preview = values
+        .iter()
+        .take(5)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    if values.len() > 5 {
+        format!("{preview},...")
+    } else {
+        preview
+    }
 }
 
 fn delimiter_for_port(type_name: &str, header: &str) -> char {
@@ -1849,6 +1969,49 @@ fi
     }
 
     #[test]
+    fn sample_id_validator_rejects_duplicate_ids() {
+        let path = temp_project_path("duplicate-sample-id");
+        fs::create_dir_all(&path).unwrap();
+        let table_path = path.join("expression.tsv");
+        fs::write(&table_path, "sample\tTP53\nA\t1.2\nA\t0.4\n").unwrap();
+        let port = crate::storage::ToolPortSpec {
+            type_name: "TSV".to_string(),
+            required: true,
+            observer: None,
+            min_rows: None,
+            required_columns: Vec::new(),
+            sample_id_column: Some("sample".to_string()),
+        };
+
+        let err =
+            sample_ids_for_input("expression_table", &table_path, &port, "sample").unwrap_err();
+        assert!(err.to_string().contains("duplicate sample id A"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn sample_id_min_rows_counts_data_rows_not_header() {
+        let path = temp_project_path("sample-id-min-rows");
+        fs::create_dir_all(&path).unwrap();
+        let table_path = path.join("expression.tsv");
+        fs::write(&table_path, "sample\tTP53\n").unwrap();
+        let port = crate::storage::ToolPortSpec {
+            type_name: "TSV".to_string(),
+            required: true,
+            observer: None,
+            min_rows: Some(1),
+            required_columns: Vec::new(),
+            sample_id_column: Some("sample".to_string()),
+        };
+
+        let err = validate_port_file("input", "expression_table", &table_path, &port).unwrap_err();
+        assert!(err.to_string().contains("has 0 rows"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn run_flow_executes_local_commands_and_resolves_step_outputs() {
         let path = temp_project_path("success");
         fs::create_dir_all(&path).unwrap();
@@ -1871,11 +2034,13 @@ inputs:
     type: TSV
     required: true
     required_columns: sample,TP53
+    sample_id_column: sample
     min_rows: 1
   survival_table:
     type: TSV
     required: true
     required_columns: sample,time,status
+    sample_id_column: sample
     min_rows: 1
 params:
   gene:
@@ -2139,11 +2304,13 @@ inputs:
     type: TSV
     required: true
     required_columns: sample,TP53
+    sample_id_column: sample
     min_rows: 1
   survival_table:
     type: TSV
     required: true
     required_columns: sample,time,status
+    sample_id_column: sample
     min_rows: 1
 params:
   gene:
@@ -2326,6 +2493,101 @@ steps:
         assert!(logs
             .stderr
             .contains("input expression_table missing required column missing_gene"));
+        let computed = store
+            .list_artifacts()
+            .unwrap()
+            .into_iter()
+            .filter(|artifact| artifact.kind == "computed")
+            .count();
+        assert_eq!(computed, 0);
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn run_flow_enforces_sample_id_consistency_before_command() {
+        let path = temp_project_path("sample-id-validator");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Runtime Demo")).unwrap();
+        let script_path = path.join("should_not_run_sample.sh");
+        fs::write(
+            &script_path,
+            r#"printf 'should not run\n' > "$AGENTFLOW_OUTPUT_REPORT"
+echo "unexpected sample execution"
+"#,
+        )
+        .unwrap();
+
+        register_tool(
+            &store,
+            format!(
+                r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: sample_checked_scan
+version: 0.1.0
+maturity: wrapped
+description: Require matching sample ids
+inputs:
+  expression_table:
+    type: TSV
+    required: true
+    required_columns: sample,TP53
+    sample_id_column: sample
+  survival_table:
+    type: TSV
+    required: true
+    required_columns: sample,time,status
+    sample_id_column: sample
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {}
+"#,
+                script_path.display()
+            ),
+        );
+
+        let expression_path = path.join("expression.tsv");
+        fs::write(&expression_path, "sample\tTP53\nA\t1.2\nB\t0.4\n").unwrap();
+        let survival_path = path.join("survival.tsv");
+        fs::write(&survival_path, "sample\ttime\tstatus\nA\t10\t1\nC\t8\t0\n").unwrap();
+        let expression_id = import_artifact(&store, expression_path);
+        let survival_id = import_artifact(&store, survival_path);
+        let flow = FlowDraft::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.flow.v0
+id: sample_validator_demo
+name: Sample validator demo
+steps:
+  - id: scan
+    tool: marker/sample_checked_scan
+    reason: Prove sample ids match before command execution
+    needs: []
+    inputs:
+      expression_table: {expression_id}
+      survival_table: {survival_id}
+    outputs:
+      report: marker_report
+"#
+        ))
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+
+        let summary = store.run_flow("sample_validator_demo").unwrap();
+        assert_eq!(summary.completed_steps, 0);
+        assert_eq!(summary.failed_steps, 1);
+        assert_eq!(summary.attempts[0].status, "failed");
+
+        let logs = store.read_logs(&summary.attempts[0].attempt_id).unwrap();
+        assert!(!logs.stdout.contains("unexpected sample execution"));
+        assert!(logs.stderr.contains("sample ids differ"));
+        assert!(logs.stderr.contains("missing [B]"));
+        assert!(logs.stderr.contains("extra [C]"));
         let computed = store
             .list_artifacts()
             .unwrap()

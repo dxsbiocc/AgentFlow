@@ -9,11 +9,13 @@ inputs:
     type: TSV
     required: true
     required_columns: sample,TP53
+    sample_id_column: sample
     min_rows: 1
   survival_table:
     type: TSV
     required: true
     required_columns: sample,time,status
+    sample_id_column: sample
     min_rows: 1
 params:
   gene:

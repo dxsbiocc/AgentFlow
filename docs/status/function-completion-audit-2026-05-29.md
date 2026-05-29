@@ -54,11 +54,11 @@ Manual evidence already recorded in `docs/status/v1-usable-slice-status.md`:
 | Runtime scheduler | Complete for MVP | 82% | Sequential ready-step DAG execution works, targeted `run-step` execution is dependency-gated, declared validators gate inputs/outputs, and declared output observers run after successful execution or cache restore. No parallelism, cancellation, or advanced resume. |
 | Local executor | Usable but constrained | 70% | Workdir/logs/env isolation/output validation are implemented. Still local-process only. |
 | Environment layer | Minimal | 20% | Local backend only. Conda/micromamba, Docker, Singularity, SLURM are not implemented. |
-| Cache/resume | Partial | 60% | Cache key and restore work for equivalent runnable flows. Same-flow rerun is a no-op after completion; no cache list/prune UX. Flow and step cache explanation are implemented. |
+| Cache/resume | Partial | 68% | Cache key and restore work for equivalent runnable flows. Same-flow rerun is a no-op after completion. Flow/step cache explanation, cache list, and explicit cache prune are implemented. No artifact garbage collection or richer miss diagnostics yet. |
 | Retry and partial replay | Partial | 68% | Failed-step retry works and preserves history. Targeted `run-step` can execute draft/ready/failed steps once dependencies are complete and rejects completed-step reruns. `update_params` patches invalidate the target and downstream steps for replay. No retry policy, max attempts, or richer replay policy. |
 | Logs/status | Complete for MVP | 80% | Attempt/run log reading and status counts work. Status remains coarse. |
 | Report | Baseline complete | 70% | Markdown report generated from persisted evidence, including observations, graph patches, branch comparisons, and research notes. No persisted report artifact, JSON/HTML export, citation model, or redaction. |
-| Validators | Partial | 58% | Tool port validation, required input/param checks, output non-empty/path containment, and declarative `min_rows`/`required_columns` checks for inputs and outputs. No richer schema profiles, sample identity checks, or pluggable validator registry yet. |
+| Validators | Partial | 65% | Tool port validation, required input/param checks, output non-empty/path containment, declarative `min_rows`/`required_columns` checks, and cross-input `sample_id_column` checks. No richer schema profiles, QC policy packs, or pluggable validator registry yet. |
 | Observer layer | Partial | 60% | Generic artifact summary observations, simple scalar metric extraction, a first `marker_report` adapter, and tool-declared postflight observation are persisted and available through CLI/runtime. No general observer registry, QC inspectors, figure/data interpretation, or adapter selection policy yet. |
 | Agent planning layer | Missing | 0% | No goal-to-draft planner, failure explainer, tool recommender, or graph patch proposer. |
 | Research Mode | Seed state only | 20% | Manual research notes with confidence and source context are persisted. No source adapters, literature search, citation tracking, tool-gap workflow, or anti-self-deception critique loop. |
@@ -96,7 +96,7 @@ Manual evidence already recorded in `docs/status/v1-usable-slice-status.md`:
    - richer computed comparison metrics from tool-specific observer summaries
 
 3. Add richer validators and observer adapters:
-   - schema/sample identity validators
+   - schema profiles and domain QC validators
    - tool-specific observer adapter selection policy
    - richer report rendering for observation payloads
 
@@ -111,7 +111,7 @@ Manual evidence already recorded in `docs/status/v1-usable-slice-status.md`:
 
 6. Strengthen cache/report contracts:
    - SHA-256 or dependency-backed hash decision
-   - cache list/prune
+   - storage lifecycle and artifact garbage collection
    - persisted report artifact/manifest
    - redaction policy
 

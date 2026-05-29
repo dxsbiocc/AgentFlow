@@ -2257,11 +2257,13 @@ inputs:
     type: TSV
     required: true
     required_columns: sample,TP53
+    sample_id_column: sample
     min_rows: 1
   survival_table:
     type: TSV
     required: true
     required_columns: sample,time,status
+    sample_id_column: sample
     min_rows: 1
 params:
   gene:
@@ -2314,11 +2316,13 @@ inputs:
     type: TSV
     required: true
     required_columns: sample,TP53
+    sample_id_column: sample
     min_rows: 1
   survival_table:
     type: TSV
     required: true
     required_columns: sample,time,status
+    sample_id_column: sample
     min_rows: 1
 params:
   gene:
@@ -2410,8 +2414,11 @@ steps:
             .and_then(|rest| rest.lines().next())
             .unwrap();
 
-        let survival_path =
-            write_sample_artifact(path, "survival.tsv", "sample\ttime\tstatus\nA\t10\t1\n");
+        let survival_path = write_sample_artifact(
+            path,
+            "survival.tsv",
+            "sample\ttime\tstatus\nA\t10\t1\nB\t12\t0\n",
+        );
         let survival_import = run(args(&[
             "agentflow",
             "import",
@@ -3491,8 +3498,11 @@ runtime:
             .nth(1)
             .and_then(|rest| rest.lines().next())
             .unwrap();
-        let survival_path =
-            write_sample_artifact(&path, "survival.tsv", "sample\ttime\tstatus\nA\t10\t1\n");
+        let survival_path = write_sample_artifact(
+            &path,
+            "survival.tsv",
+            "sample\ttime\tstatus\nA\t10\t1\nB\t12\t0\n",
+        );
         let survival_import = run(args(&[
             "agentflow",
             "import",
@@ -3609,8 +3619,11 @@ runtime:
             .nth(1)
             .and_then(|rest| rest.lines().next())
             .unwrap();
-        let survival_path =
-            write_sample_artifact(&path, "survival.tsv", "sample\ttime\tstatus\nA\t10\t1\n");
+        let survival_path = write_sample_artifact(
+            &path,
+            "survival.tsv",
+            "sample\ttime\tstatus\nA\t10\t1\nB\t12\t0\n",
+        );
         let survival_import = run(args(&[
             "agentflow",
             "import",
@@ -3774,8 +3787,11 @@ runtime:
             .nth(1)
             .and_then(|rest| rest.lines().next())
             .unwrap();
-        let survival_path =
-            write_sample_artifact(&path, "survival.tsv", "sample\ttime\tstatus\nA\t10\t1\n");
+        let survival_path = write_sample_artifact(
+            &path,
+            "survival.tsv",
+            "sample\ttime\tstatus\nA\t10\t1\nB\t12\t0\n",
+        );
         let survival_import = run(args(&[
             "agentflow",
             "import",
@@ -3942,8 +3958,11 @@ runtime:
             .nth(1)
             .and_then(|rest| rest.lines().next())
             .unwrap();
-        let survival_path =
-            write_sample_artifact(&path, "survival.tsv", "sample\ttime\tstatus\nA\t10\t1\n");
+        let survival_path = write_sample_artifact(
+            &path,
+            "survival.tsv",
+            "sample\ttime\tstatus\nA\t10\t1\nB\t12\t0\n",
+        );
         let survival_import = run(args(&[
             "agentflow",
             "import",

@@ -654,6 +654,7 @@ validators:
     - expression_matrix_schema
     - survival_table_schema
     - gene_exists_in_expression
+    - sample_id_consistency
   postflight:
     - output_exists
     - table_has_required_columns

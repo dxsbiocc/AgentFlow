@@ -33,6 +33,7 @@ pub struct ToolPortSpec {
     pub observer: Option<String>,
     pub min_rows: Option<usize>,
     pub required_columns: Vec<String>,
+    pub sample_id_column: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +140,7 @@ impl ToolSpec {
                 "\"output_observers\":{},",
                 "\"input_min_rows\":{},",
                 "\"input_required_columns\":{},",
+                "\"input_sample_id_columns\":{},",
                 "\"output_min_rows\":{},",
                 "\"output_required_columns\":{},",
                 "\"runtime_backend\":\"{}\",",
@@ -168,6 +170,7 @@ impl ToolSpec {
             observer_map_json(&self.outputs),
             min_rows_map_json(&self.inputs),
             required_columns_map_json(&self.inputs),
+            sample_id_column_map_json(&self.inputs),
             min_rows_map_json(&self.outputs),
             required_columns_map_json(&self.outputs),
             escape_json(&self.runtime.backend),
@@ -610,6 +613,7 @@ fn parse_executable_sections(source_text: &str) -> Result<ParsedExecutableSectio
                                 observer: None,
                                 min_rows: None,
                                 required_columns: Vec::new(),
+                                sample_id_column: None,
                             });
                         }
                         "outputs" => {
@@ -619,6 +623,7 @@ fn parse_executable_sections(source_text: &str) -> Result<ParsedExecutableSectio
                                 observer: None,
                                 min_rows: None,
                                 required_columns: Vec::new(),
+                                sample_id_column: None,
                             });
                         }
                         "params" => {
@@ -735,6 +740,7 @@ fn set_tool_item_field(
                 }
                 "min_rows" => port.min_rows = Some(parse_usize_field("min_rows", &value)?),
                 "required_columns" => port.required_columns = parse_columns(&value)?,
+                "sample_id_column" => port.sample_id_column = Some(parse_column_name(&value)?),
                 other => {
                     return Err(StorageError::InvalidInput(format!(
                         "unsupported input field {other}"
@@ -755,6 +761,11 @@ fn set_tool_item_field(
                 }
                 "min_rows" => port.min_rows = Some(parse_usize_field("min_rows", &value)?),
                 "required_columns" => port.required_columns = parse_columns(&value)?,
+                "sample_id_column" => {
+                    return Err(StorageError::InvalidInput(
+                        "sample_id_column is only supported on input ports".to_string(),
+                    ));
+                }
                 other => {
                     return Err(StorageError::InvalidInput(format!(
                         "unsupported output field {other}"
@@ -808,18 +819,7 @@ fn parse_usize_field(field: &str, value: &str) -> Result<usize, StorageError> {
 fn parse_columns(value: &str) -> Result<Vec<String>, StorageError> {
     let mut columns = Vec::new();
     for column in value.split(',') {
-        let column = column.trim();
-        if column.is_empty() {
-            return Err(StorageError::InvalidInput(
-                "required_columns must not contain empty column names".to_string(),
-            ));
-        }
-        if column.contains('\n') || column.contains('\0') {
-            return Err(StorageError::InvalidInput(
-                "required_columns entries must be single-line text".to_string(),
-            ));
-        }
-        columns.push(column.to_string());
+        columns.push(parse_column_name_with_label("required_columns", column)?);
     }
     if columns.is_empty() {
         return Err(StorageError::InvalidInput(
@@ -827,6 +827,25 @@ fn parse_columns(value: &str) -> Result<Vec<String>, StorageError> {
         ));
     }
     Ok(columns)
+}
+
+fn parse_column_name(value: &str) -> Result<String, StorageError> {
+    parse_column_name_with_label("sample_id_column", value)
+}
+
+fn parse_column_name_with_label(label: &str, value: &str) -> Result<String, StorageError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(StorageError::InvalidInput(format!(
+            "{label} must not contain empty column names"
+        )));
+    }
+    if value.contains('\n') || value.contains('\0') {
+        return Err(StorageError::InvalidInput(format!(
+            "{label} entries must be single-line text"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 fn validate_ports(label: &str, ports: &BTreeMap<String, ToolPortSpec>) -> Result<(), StorageError> {
@@ -844,6 +863,11 @@ fn validate_ports(label: &str, ports: &BTreeMap<String, ToolPortSpec>) -> Result
                 )));
             }
             validate_observer_adapter(observer)?;
+        }
+        if label != "input" && port.sample_id_column.is_some() {
+            return Err(StorageError::InvalidInput(format!(
+                "{label} {name} must not declare sample_id_column"
+            )));
         }
     }
     Ok(())
@@ -875,6 +899,15 @@ fn stored_columns(map: &BTreeMap<String, String>, name: &str) -> Result<Vec<Stri
         .map(Option::unwrap_or_default)
 }
 
+fn stored_sample_id_column(
+    map: &BTreeMap<String, String>,
+    name: &str,
+) -> Result<Option<String>, StorageError> {
+    map.get(name)
+        .map(|value| parse_column_name(value))
+        .transpose()
+}
+
 fn parse_u64_field(field_name: &str, value: &str) -> Result<u64, StorageError> {
     let parsed = value.parse::<u64>().map_err(|_| {
         StorageError::InvalidInput(format!("{field_name} must be a positive integer"))
@@ -904,6 +937,8 @@ fn executable_from_stored_json(
     let output_observers = extract_optional_string_map(spec_json, "output_observers")?;
     let input_min_rows = extract_optional_string_map(spec_json, "input_min_rows")?;
     let input_required_columns = extract_optional_string_map(spec_json, "input_required_columns")?;
+    let input_sample_id_columns =
+        extract_optional_string_map(spec_json, "input_sample_id_columns")?;
     let output_min_rows = extract_optional_string_map(spec_json, "output_min_rows")?;
     let output_required_columns =
         extract_optional_string_map(spec_json, "output_required_columns")?;
@@ -919,6 +954,7 @@ fn executable_from_stored_json(
             let required = required_inputs.contains(&name);
             let min_rows = stored_min_rows(&input_min_rows, &name)?;
             let required_columns = stored_columns(&input_required_columns, &name)?;
+            let sample_id_column = stored_sample_id_column(&input_sample_id_columns, &name)?;
             Ok((
                 name,
                 ToolPortSpec {
@@ -927,6 +963,7 @@ fn executable_from_stored_json(
                     observer: None,
                     min_rows,
                     required_columns,
+                    sample_id_column,
                 },
             ))
         })
@@ -958,6 +995,7 @@ fn executable_from_stored_json(
                     observer,
                     min_rows,
                     required_columns,
+                    sample_id_column: None,
                 },
             ))
         })
@@ -1077,6 +1115,19 @@ fn required_columns_map_json(map: &BTreeMap<String, ToolPortSpec>) -> String {
                 escape_json(name),
                 escape_json(&port.required_columns.join(","))
             )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{fields}}}")
+}
+
+fn sample_id_column_map_json(map: &BTreeMap<String, ToolPortSpec>) -> String {
+    let fields = map
+        .iter()
+        .filter_map(|(name, port)| {
+            port.sample_id_column
+                .as_ref()
+                .map(|column| format!("\"{}\":\"{}\"", escape_json(name), escape_json(column)))
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -1507,6 +1558,7 @@ inputs:
     type: TSV
     required: true
     required_columns: sample,TP53
+    sample_id_column: sample
     min_rows: 1
 outputs:
   report:
@@ -1525,8 +1577,37 @@ runtime:
             spec.inputs["expression_table"].required_columns,
             ["sample".to_string(), "TP53".to_string()]
         );
+        assert_eq!(
+            spec.inputs["expression_table"].sample_id_column.as_deref(),
+            Some("sample")
+        );
         assert_eq!(spec.outputs["report"].min_rows, Some(3));
         assert!(spec.stored_json().contains("\"input_required_columns\""));
+        assert!(spec.stored_json().contains("\"input_sample_id_columns\""));
+    }
+
+    #[test]
+    fn rejects_sample_id_column_on_outputs() {
+        let err = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: bad_sample_id_output
+version: 0.1.0
+maturity: wrapped
+description: bad
+outputs:
+  report:
+    type: Markdown
+    sample_id_column: sample
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("sample_id_column"));
     }
 
     #[test]

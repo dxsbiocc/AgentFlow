@@ -15,7 +15,7 @@ Scope: CLI-first AgentFlow runtime usable without Omiga integration
 - Cache explanation: flow-level and step-level `cache explain` targets
 - Retry and partial replay: targeted execution through `run-step <flow.step|flow/step|step:flow/step|unique-step>` and failed-step retry through `retry <flow.step|flow/step|step:flow/step|unique-step>`
 - Report: Markdown provenance report from persisted flow, step, run, attempt, and artifact state
-- Environment execution: local backend plus existing Conda/micromamba wrappers through explicit runner/env metadata
+- Environment execution: local backend plus existing Conda/micromamba wrappers through explicit runner/env metadata; `env check` validates runner accessibility, env metadata, env-file readability/hash, and a lightweight probe.
 - Phase 2/3 state primitives: artifact observations with simple metric extraction, first `marker_report` observer adapter, automatic postflight observation for declared outputs, research notes, graph patch proposal/approval/apply records, approved `add_step`/`add_edge`/`update_params` materialization, downstream invalidation after parameter changes, and branch comparisons
 - Security hardening: absolute local executable or environment runner requirement, inline shell/interpreter command rejection, cleared child environment, output path escape rejection, runtime input re-hashing
 

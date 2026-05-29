@@ -49,6 +49,7 @@ where
         Some(command) if command == "status" => status_command(args),
         Some(command) if command == "doctor" => doctor_command(args),
         Some(command) if command == "tools" => tools_command(args),
+        Some(command) if command == "env" => env_command(args),
         Some(command) if command == "import" => import_command(args),
         Some(command) if command == "artifacts" => artifacts_command(args),
         Some(command) if command == "flow" => flow_command(args),
@@ -81,6 +82,7 @@ pub fn usage() -> String {
         "  agentflow tools register <tool.yaml> [--path <path>]",
         "  agentflow tools list [--json] [--path <path>]",
         "  agentflow tools inspect <tool-ref> [--json] [--path <path>]",
+        "  agentflow env check <tool-ref> [--json] [--path <path>]",
         "  agentflow import <file> --type <artifact-type> [--mode reference|copy] [--path <path>]",
         "  agentflow artifacts list [--json] [--path <path>]",
         "  agentflow artifacts inspect <artifact-id> [--json] [--path <path>]",
@@ -1044,6 +1046,40 @@ where
             inspection.created_at,
             inspection.spec_json
         ))
+    }
+}
+
+fn env_command<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    match next_arg(&mut args)? {
+        Some(command) if command == "check" => env_check_command(args),
+        Some(command) => Err(CliError::InvalidArgument(format!(
+            "unknown env command: {command}"
+        ))),
+        None => Err(CliError::InvalidArgument(
+            "env requires a command: check".to_string(),
+        )),
+    }
+}
+
+fn env_check_command<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let options = parse_single_positional_options(args, "tool ref", true)?;
+    let tool_ref = options
+        .positional
+        .ok_or_else(|| CliError::InvalidArgument("env check requires <tool-ref>".to_string()))?;
+    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
+    let check = store.check_tool_environment(&tool_ref)?;
+    if options.project.json {
+        Ok(environment_check_json(&check))
+    } else {
+        Ok(format_environment_check(&check))
     }
 }
 
@@ -2041,6 +2077,49 @@ fn research_notes_json(notes: &[agentflow_core::research::ResearchNote]) -> Stri
     format!("{{\"schema_version\":\"agentflow.research_notes.v0\",\"notes\":[{items}]}}")
 }
 
+fn environment_check_json(check: &agentflow_core::runtime::EnvironmentCheckSummary) -> String {
+    let items = check
+        .items
+        .iter()
+        .map(environment_check_item_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        concat!(
+            "{{",
+            "\"schema_version\":\"agentflow.env_check.v0\",",
+            "\"tool_ref\":\"{}\",",
+            "\"version\":\"{}\",",
+            "\"backend\":\"{}\",",
+            "\"ok\":{},",
+            "\"items\":[{}]",
+            "}}"
+        ),
+        escape_json(&check.tool_ref),
+        escape_json(&check.version),
+        escape_json(&check.backend),
+        check.ok,
+        items
+    )
+}
+
+fn environment_check_item_json(item: &agentflow_core::runtime::EnvironmentCheckItem) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"name\":\"{}\",",
+            "\"status\":\"{}\",",
+            "\"message\":\"{}\",",
+            "\"details\":{}",
+            "}}"
+        ),
+        escape_json(&item.name),
+        escape_json(&item.status),
+        escape_json(&item.message),
+        optional_json_string(item.details.as_deref())
+    )
+}
+
 fn optional_json_string(value: Option<&str>) -> String {
     value.map_or_else(
         || "null".to_string(),
@@ -2200,6 +2279,30 @@ fn format_attempts(attempts: &[agentflow_core::runtime::AttemptSummary]) -> Stri
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_environment_check(check: &agentflow_core::runtime::EnvironmentCheckSummary) -> String {
+    let status = if check.ok { "ok" } else { "failed" };
+    let items = check
+        .items
+        .iter()
+        .map(|item| {
+            let details = item
+                .details
+                .as_deref()
+                .map(|details| format!("\n  details: {details}"))
+                .unwrap_or_default();
+            format!(
+                "- {} [{}]: {}{}",
+                item.name, item.status, item.message, details
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Environment check\nTool: {}\nVersion: {}\nBackend: {}\nStatus: {}\nItems:\n{}",
+        check.tool_ref, check.version, check.backend, status, items
+    )
 }
 
 fn escape_json(input: &str) -> String {
@@ -2500,6 +2603,7 @@ steps:
         assert!(output.contains("agentflow compare metrics <flow-id>"));
         assert!(output.contains("agentflow runs list [--flow <flow-id>]"));
         assert!(output.contains("agentflow runs inspect <run-or-attempt-id>"));
+        assert!(output.contains("agentflow env check <tool-ref>"));
     }
 
     #[test]
@@ -2695,6 +2799,70 @@ runtime:
         ]))
         .unwrap();
         assert!(env_inspect.contains(&env_file.canonicalize().unwrap().display().to_string()));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn env_check_reports_existing_environment_wrapper() {
+        let path = temp_project_path("env-check");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let spec_path = path.join("env_tool.tool.yaml");
+        fs::write(
+            &spec_path,
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: env_tool
+version: 0.1.0
+maturity: wrapped
+description: Tool with an existing environment wrapper
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: micromamba
+  runner: /bin/echo
+  env_name: af-test
+  command:
+    - python
+    - run.py
+"#,
+        )
+        .unwrap();
+        run(args(&[
+            "agentflow",
+            "tools",
+            "register",
+            spec_path.to_str().unwrap(),
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let output = run(args(&[
+            "agentflow",
+            "env",
+            "check",
+            "marker/env_tool",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(output.contains("\"schema_version\":\"agentflow.env_check.v0\""));
+        assert!(output.contains("\"backend\":\"micromamba\""));
+        assert!(output.contains("\"ok\":true"));
+        assert!(output.contains("\"name\":\"probe\""));
 
         let _ = fs::remove_dir_all(path);
     }

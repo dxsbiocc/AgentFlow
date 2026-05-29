@@ -81,6 +81,7 @@ Current technical preview supports:
 - Declared output publication as artifacts
 - Input/output validation with `required_columns`, `min_rows`, cross-input `sample_id_column`, built-in input `profile`, and paired expression/survival `validator_profile`
 - Existing Conda/micromamba environment execution through explicit `runtime.runner` plus `env_name` or `env_prefix`
+- Environment readiness checks through `env check <tool-ref>`
 - Cache-hit restore for equivalent executable flows plus `cache explain`
 - Cache inventory and explicit cache pruning through `cache list` and `cache prune`
 - Local runtime timeout control through `runtime.timeout_seconds`

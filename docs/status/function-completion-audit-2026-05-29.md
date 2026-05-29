@@ -53,7 +53,7 @@ Manual evidence already recorded in `docs/status/v1-usable-slice-status.md`:
 | Static flow graph | Complete for MVP | 88% | Parse/validate/approve/inspect works for static DAGs. Approved graph patches can now materialize constrained add_step/add_edge changes and update step params in the executable DAG. |
 | Runtime scheduler | Complete for MVP | 82% | Sequential ready-step DAG execution works, targeted `run-step` execution is dependency-gated, declared validators gate inputs/outputs, and declared output observers run after successful execution or cache restore. No parallelism, cancellation, or advanced resume. |
 | Local executor | Usable but constrained | 72% | Workdir/logs/env isolation/output validation are implemented. Environment backends still run as local host processes. |
-| Environment layer | Minimal but runnable | 35% | Local plus existing Conda/micromamba wrappers are implemented with explicit runner/env selection and env-file hash provenance. No env creation, package solving, Docker, Singularity, or SLURM. |
+| Environment layer | Minimal but runnable | 40% | Local plus existing Conda/micromamba wrappers are implemented with explicit runner/env selection, env-file hash provenance, and `env check` readiness probes. No env creation, package solving, Docker, Singularity, or SLURM. |
 | Cache/resume | Partial | 68% | Cache key and restore work for equivalent runnable flows. Same-flow rerun is a no-op after completion. Flow/step cache explanation, cache list, and explicit cache prune are implemented. No artifact garbage collection or richer miss diagnostics yet. |
 | Retry and partial replay | Partial | 68% | Failed-step retry works and preserves history. Targeted `run-step` can execute draft/ready/failed steps once dependencies are complete and rejects completed-step reruns. `update_params` patches invalidate the target and downstream steps for replay. No retry policy, max attempts, or richer replay policy. |
 | Logs/status | Complete for MVP | 80% | Attempt/run log reading and status counts work. Status remains coarse. |
@@ -107,7 +107,7 @@ Manual evidence already recorded in `docs/status/v1-usable-slice-status.md`:
    - claims with confidence and challenge prompts
 
 5. Deepen environment management:
-   - add explicit `agentflow env check/prepare` for Conda/micromamba
+   - add explicit `agentflow env prepare` for Conda/micromamba after the check path is stable
    - keep Docker/Singularity behind a later trust and sandboxing review
 
 6. Strengthen cache/report contracts:

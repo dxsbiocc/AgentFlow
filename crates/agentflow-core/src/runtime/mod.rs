@@ -57,6 +57,23 @@ pub struct CachePruneSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentCheckSummary {
+    pub tool_ref: String,
+    pub version: String,
+    pub backend: String,
+    pub ok: bool,
+    pub items: Vec<EnvironmentCheckItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentCheckItem {
+    pub name: String,
+    pub status: String,
+    pub message: String,
+    pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunLogs {
     pub attempt_id: String,
     pub stdout_path: PathBuf,
@@ -101,6 +118,42 @@ pub struct RunInspection {
 }
 
 impl ProjectStore {
+    pub fn check_tool_environment(
+        &self,
+        tool_ref: &str,
+    ) -> Result<EnvironmentCheckSummary, StorageError> {
+        let tool = self.executable_tool(tool_ref)?;
+        let mut items = Vec::new();
+        match tool.runtime.backend.as_str() {
+            "local" => {
+                items.push(EnvironmentCheckItem::ok(
+                    "backend",
+                    "local runtime does not require an external environment",
+                    None,
+                ));
+            }
+            "conda" | "micromamba" => {
+                check_runner(&tool.runtime, &mut items);
+                check_environment_selector(&tool.runtime, &mut items);
+                check_env_file(&tool.runtime, &mut items);
+                check_environment_probe(&tool.runtime, &mut items);
+            }
+            other => items.push(EnvironmentCheckItem::failed(
+                "backend",
+                format!("unsupported runtime backend {other}"),
+                None,
+            )),
+        }
+        let ok = items.iter().all(|item| item.status == "ok");
+        Ok(EnvironmentCheckSummary {
+            tool_ref: tool.tool_ref,
+            version: tool.version,
+            backend: tool.runtime.backend,
+            ok,
+            items,
+        })
+    }
+
     pub fn run_flow(&self, flow_id: &str) -> Result<FlowRunSummary, StorageError> {
         if self.inspect_flow(flow_id)?.status != "approved" {
             return Err(StorageError::InvalidInput(format!(
@@ -1249,6 +1302,43 @@ struct CacheEntryWrite {
     output_artifacts_json: String,
 }
 
+impl EnvironmentCheckItem {
+    fn ok(name: impl Into<String>, message: impl Into<String>, details: Option<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: "ok".to_string(),
+            message: message.into(),
+            details,
+        }
+    }
+
+    fn failed(
+        name: impl Into<String>,
+        message: impl Into<String>,
+        details: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: "failed".to_string(),
+            message: message.into(),
+            details,
+        }
+    }
+
+    fn skipped(
+        name: impl Into<String>,
+        message: impl Into<String>,
+        details: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: "skipped".to_string(),
+            message: message.into(),
+            details,
+        }
+    }
+}
+
 struct LocalCommandOutput {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
@@ -1447,6 +1537,198 @@ fn prepare_runtime_command(
             "unsupported runtime.backend {other}"
         ))),
     }
+}
+
+fn check_runner(runtime: &ToolRuntimeSpec, items: &mut Vec<EnvironmentCheckItem>) {
+    let Some(runner) = runtime.runner.as_deref() else {
+        items.push(EnvironmentCheckItem::failed(
+            "runner",
+            "environment runtime does not declare runner",
+            None,
+        ));
+        return;
+    };
+    let path = Path::new(runner);
+    match fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => items.push(EnvironmentCheckItem::failed(
+            "runner",
+            format!("runner is not a file: {runner}"),
+            None,
+        )),
+        Ok(metadata) if !is_executable(&metadata) => items.push(EnvironmentCheckItem::failed(
+            "runner",
+            format!("runner is not executable: {runner}"),
+            None,
+        )),
+        Ok(_) => items.push(EnvironmentCheckItem::ok(
+            "runner",
+            format!("runner is available: {runner}"),
+            None,
+        )),
+        Err(error) => items.push(EnvironmentCheckItem::failed(
+            "runner",
+            format!("runner is not accessible: {runner}"),
+            Some(error.to_string()),
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    !metadata.permissions().readonly()
+}
+
+fn check_environment_selector(runtime: &ToolRuntimeSpec, items: &mut Vec<EnvironmentCheckItem>) {
+    match (runtime.env_name.as_deref(), runtime.env_prefix.as_deref()) {
+        (Some(env_name), None) => items.push(EnvironmentCheckItem::ok(
+            "environment",
+            format!("using environment name {env_name}"),
+            None,
+        )),
+        (None, Some(env_prefix)) => {
+            let path = Path::new(env_prefix);
+            if path.exists() {
+                items.push(EnvironmentCheckItem::ok(
+                    "environment",
+                    format!("using environment prefix {env_prefix}"),
+                    None,
+                ));
+            } else {
+                items.push(EnvironmentCheckItem::failed(
+                    "environment",
+                    format!("environment prefix does not exist: {env_prefix}"),
+                    None,
+                ));
+            }
+        }
+        (Some(_), Some(_)) => items.push(EnvironmentCheckItem::failed(
+            "environment",
+            "runtime declares both env_name and env_prefix",
+            None,
+        )),
+        (None, None) => items.push(EnvironmentCheckItem::failed(
+            "environment",
+            "runtime declares neither env_name nor env_prefix",
+            None,
+        )),
+    }
+}
+
+fn check_env_file(runtime: &ToolRuntimeSpec, items: &mut Vec<EnvironmentCheckItem>) {
+    let Some(env_file) = runtime.env_file.as_deref() else {
+        items.push(EnvironmentCheckItem::ok(
+            "env_file",
+            "no env_file declared; using existing environment only",
+            None,
+        ));
+        return;
+    };
+    match file_hash_fnv64(Path::new(env_file)) {
+        Ok(hash) => items.push(EnvironmentCheckItem::ok(
+            "env_file",
+            format!("env_file is readable: {env_file}"),
+            Some(hash),
+        )),
+        Err(error) => items.push(EnvironmentCheckItem::failed(
+            "env_file",
+            format!("env_file is not readable: {env_file}"),
+            Some(error.to_string()),
+        )),
+    }
+}
+
+fn check_environment_probe(runtime: &ToolRuntimeSpec, items: &mut Vec<EnvironmentCheckItem>) {
+    if items
+        .iter()
+        .any(|item| matches!(item.name.as_str(), "runner" | "environment") && item.status != "ok")
+    {
+        items.push(EnvironmentCheckItem::skipped(
+            "probe",
+            "environment probe skipped because runner or environment metadata failed",
+            None,
+        ));
+        return;
+    }
+    let probe = true_command();
+    let Some(command) = prepare_environment_probe(runtime, &probe) else {
+        items.push(EnvironmentCheckItem::failed(
+            "probe",
+            "cannot prepare environment probe",
+            None,
+        ));
+        return;
+    };
+    let mut process = Command::new(&command.executable);
+    process
+        .args(&command.args)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin");
+    match run_local_command(process, Some(15)) {
+        Ok(output) if output.timed_out => items.push(EnvironmentCheckItem::failed(
+            "probe",
+            "environment probe timed out after 15 seconds",
+            Some(String::from_utf8_lossy(&output.stderr).to_string()),
+        )),
+        Ok(output) if output.status.success() => items.push(EnvironmentCheckItem::ok(
+            "probe",
+            "environment probe command succeeded",
+            None,
+        )),
+        Ok(output) => items.push(EnvironmentCheckItem::failed(
+            "probe",
+            format!(
+                "environment probe exited with code {:?}",
+                output.status.code()
+            ),
+            Some(String::from_utf8_lossy(&output.stderr).to_string()),
+        )),
+        Err(error) => items.push(EnvironmentCheckItem::failed(
+            "probe",
+            "environment probe could not start",
+            Some(error.to_string()),
+        )),
+    }
+}
+
+fn prepare_environment_probe(
+    runtime: &ToolRuntimeSpec,
+    probe_command: &str,
+) -> Option<PreparedRuntimeCommand> {
+    let runner = runtime.runner.as_ref()?;
+    let mut args = vec!["run".to_string()];
+    if runtime.backend == "conda" {
+        args.push("--no-capture-output".to_string());
+    }
+    match (runtime.env_name.as_deref(), runtime.env_prefix.as_deref()) {
+        (Some(env_name), None) => {
+            args.push("--name".to_string());
+            args.push(env_name.to_string());
+        }
+        (None, Some(env_prefix)) => {
+            args.push("--prefix".to_string());
+            args.push(env_prefix.to_string());
+        }
+        _ => return None,
+    }
+    args.push(probe_command.to_string());
+    Some(PreparedRuntimeCommand {
+        executable: runner.clone(),
+        args,
+    })
+}
+
+fn true_command() -> String {
+    ["/usr/bin/true", "/bin/true"]
+        .iter()
+        .find(|path| Path::new(path).exists())
+        .map(|path| (*path).to_string())
+        .unwrap_or_else(|| "true".to_string())
 }
 
 fn run_local_command(
@@ -2505,6 +2787,141 @@ steps:
             .expect("runtime json");
         assert!(runtime_text.contains("\"backend\":\"micromamba\""));
         assert!(runtime_text.contains("\"env_name\":\"af-test\""));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn env_check_reports_local_backend_without_probe() {
+        let path = temp_project_path("local-env-check");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Runtime Demo")).unwrap();
+        let script_path = write_script(&path);
+        let command = script_path.display();
+
+        register_tool(
+            &store,
+            format!(
+                r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: local_tool
+version: 0.1.0
+maturity: wrapped
+description: Local tool
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {command}
+"#
+            ),
+        );
+
+        let check = store.check_tool_environment("marker/local_tool").unwrap();
+        assert!(check.ok);
+        assert_eq!(check.backend, "local");
+        assert_eq!(check.items[0].name, "backend");
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn env_check_runs_environment_probe_and_hashes_env_file() {
+        let path = temp_project_path("env-check-probe");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Runtime Demo")).unwrap();
+        let runner_path = write_fake_environment_runner(&path);
+        let env_file = path.join("environment.yml");
+        fs::write(&env_file, "name: af-test\ndependencies:\n  - python=3.11\n").unwrap();
+        let runner = runner_path.display();
+        let env_file = env_file.display();
+
+        register_tool(
+            &store,
+            format!(
+                r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: env_tool
+version: 0.1.0
+maturity: wrapped
+description: Environment tool
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: micromamba
+  runner: {runner}
+  env_name: af-test
+  env_file: {env_file}
+  command:
+    - python
+    - run.py
+"#
+            ),
+        );
+
+        let check = store.check_tool_environment("marker/env_tool").unwrap();
+        assert!(check.ok);
+        assert!(check.items.iter().any(|item| item.name == "env_file"
+            && item
+                .details
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("fnv64:")));
+        assert!(check
+            .items
+            .iter()
+            .any(|item| item.name == "probe" && item.status == "ok"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn env_check_reports_missing_runner_without_probe() {
+        let path = temp_project_path("env-check-missing-runner");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Runtime Demo")).unwrap();
+
+        register_tool(
+            &store,
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: broken_env_tool
+version: 0.1.0
+maturity: wrapped
+description: Environment tool with missing runner
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: micromamba
+  runner: /not/a/runner
+  env_name: af-test
+  command:
+    - python
+    - run.py
+"#
+            .to_string(),
+        );
+
+        let check = store
+            .check_tool_environment("marker/broken_env_tool")
+            .unwrap();
+        assert!(!check.ok);
+        assert!(check
+            .items
+            .iter()
+            .any(|item| item.name == "runner" && item.status == "failed"));
+        assert!(check
+            .items
+            .iter()
+            .any(|item| item.name == "probe" && item.status == "skipped"));
 
         let _ = fs::remove_dir_all(path);
     }

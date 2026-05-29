@@ -67,6 +67,7 @@ cargo run -q -p agentflow-cli -- report marker_demo --path "$AF_DEMO"
 - Deterministic table-oriented validation for `required_columns`, `min_rows`, cross-input `sample_id_column`, input `profile`, and tool-level `validator_profile`
 - Local runtime timeout control through `runtime.timeout_seconds`
 - Existing Conda/micromamba environment execution through explicit `runtime.runner` plus `env_name` or `env_prefix`
+- Environment readiness checks through `env check <tool-ref>`
 
 ## Explicitly Not Supported Yet
 

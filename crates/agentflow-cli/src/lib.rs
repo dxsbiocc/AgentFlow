@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliError {
@@ -90,6 +90,8 @@ pub fn usage() -> String {
         "  agentflow run-step <step-id|flow.step|step:flow/step> [--path <path>]",
         "  agentflow report <flow-id> [--path <path>]",
         "  agentflow cache explain <flow-id|step-id> [--path <path>]",
+        "  agentflow cache list [--json] [--path <path>]",
+        "  agentflow cache prune (--all|--older-than-seconds <seconds>) [--json] [--path <path>]",
         "  agentflow retry <step-id|flow.step|step:flow/step> [--path <path>]",
         "  agentflow observe <artifact-id> [--adapter artifact_summary|marker_report] [--json] [--path <path>]",
         "  agentflow observations list [--json] [--path <path>]",
@@ -163,24 +165,12 @@ where
     let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let summary = store.run_flow(&flow_id)?;
-    let attempts = summary
-        .attempts
-        .iter()
-        .map(|attempt| {
-            format!(
-                "{} {} [{}] {}",
-                attempt.attempt_id,
-                attempt.step_id,
-                attempt.status,
-                attempt.workdir.display()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
     Ok(format!(
         "Run complete\nFlow: {}\nCompleted steps: {}\nFailed steps: {}\nAttempts:\n{}",
-        summary.flow_id, summary.completed_steps, summary.failed_steps, attempts
+        summary.flow_id,
+        summary.completed_steps,
+        summary.failed_steps,
+        format_attempts(&summary.attempts)
     ))
 }
 
@@ -195,23 +185,12 @@ where
     let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let summary = store.run_step_ref(&step_id)?;
-    let attempts = summary
-        .attempts
-        .iter()
-        .map(|attempt| {
-            format!(
-                "{} {} [{}] {}",
-                attempt.attempt_id,
-                attempt.step_id,
-                attempt.status,
-                attempt.workdir.display()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
     Ok(format!(
         "Run step complete\nFlow: {}\nCompleted steps: {}\nFailed steps: {}\nAttempts:\n{}",
-        summary.flow_id, summary.completed_steps, summary.failed_steps, attempts
+        summary.flow_id,
+        summary.completed_steps,
+        summary.failed_steps,
+        format_attempts(&summary.attempts)
     ))
 }
 
@@ -256,11 +235,13 @@ where
     let mut args = args.into_iter();
     match next_arg(&mut args)? {
         Some(command) if command == "explain" => cache_explain_command(args),
+        Some(command) if command == "list" => cache_list_command(args),
+        Some(command) if command == "prune" => cache_prune_command(args),
         Some(command) => Err(CliError::InvalidArgument(format!(
             "unknown cache command: {command}"
         ))),
         None => Err(CliError::InvalidArgument(
-            "cache requires a command: explain".to_string(),
+            "cache requires a command: explain, list, or prune".to_string(),
         )),
     }
 }
@@ -280,6 +261,60 @@ where
     Ok(format_cache_explanations(&target, &explanations))
 }
 
+fn cache_list_command<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let options = parse_project_options(args, false)?;
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
+    let entries = store.list_cache_entries()?;
+    if options.json {
+        Ok(cache_entries_json(&entries))
+    } else if entries.is_empty() {
+        Ok("Cache entries\n_none_".to_string())
+    } else {
+        Ok(format!(
+            "Cache entries\n{}",
+            entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{} {}\n  outputs: {}\n  created_at: {}\n  last_used_at: {}",
+                        entry.cache_key,
+                        entry.tool_ref,
+                        entry.output_count,
+                        entry.created_at,
+                        entry.last_used_at
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))
+    }
+}
+
+fn cache_prune_command<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let options = parse_cache_prune_options(args)?;
+    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
+    let summary = store.prune_cache_entries(options.older_than_seconds)?;
+    if options.project.json {
+        Ok(format!(
+            "{{\"schema_version\":\"agentflow.cache_prune.v0\",\"removed_entries\":{}}}",
+            summary.removed_entries
+        ))
+    } else {
+        Ok(format!(
+            "Cache prune complete\nRemoved entries: {}",
+            summary.removed_entries
+        ))
+    }
+}
+
 fn retry_command<I>(args: I) -> Result<String, CliError>
 where
     I: IntoIterator<Item = OsString>,
@@ -291,23 +326,12 @@ where
     let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let summary = store.retry_step_ref(&step_id)?;
-    let attempts = summary
-        .attempts
-        .iter()
-        .map(|attempt| {
-            format!(
-                "{} {} [{}] {}",
-                attempt.attempt_id,
-                attempt.step_id,
-                attempt.status,
-                attempt.workdir.display()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
     Ok(format!(
         "Retry complete\nFlow: {}\nCompleted steps: {}\nFailed steps: {}\nAttempts:\n{}",
-        summary.flow_id, summary.completed_steps, summary.failed_steps, attempts
+        summary.flow_id,
+        summary.completed_steps,
+        summary.failed_steps,
+        format_attempts(&summary.attempts)
     ))
 }
 
@@ -847,6 +871,7 @@ where
     let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
     let source = fs::read_to_string(&spec_path)?;
     let spec = agentflow_core::storage::ToolSpec::from_simple_yaml(&source)?;
+    let spec = resolve_tool_runtime_paths(spec, Path::new(&spec_path))?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let registration = store.register_tool(spec)?;
     let action = if registration.replaced_existing_version {
@@ -859,6 +884,31 @@ where
         "{action} tool\nRef: {}\nVersion: {}\nSpec hash: {}",
         registration.tool_ref, registration.version, registration.spec_hash
     ))
+}
+
+fn resolve_tool_runtime_paths(
+    mut spec: agentflow_core::storage::ToolSpec,
+    spec_path: &Path,
+) -> Result<agentflow_core::storage::ToolSpec, CliError> {
+    let Some(spec_dir) = spec_path.parent() else {
+        return Ok(spec);
+    };
+
+    for arg in spec.runtime.command.iter_mut().skip(1) {
+        if arg.starts_with('-') {
+            continue;
+        }
+        let path = Path::new(arg);
+        if path.is_absolute() {
+            continue;
+        }
+        let candidate = spec_dir.join(path);
+        if candidate.exists() {
+            *arg = fs::canonicalize(candidate)?.display().to_string();
+        }
+    }
+
+    Ok(spec)
 }
 
 fn tools_list_command<I>(args: I) -> Result<String, CliError>
@@ -1135,6 +1185,13 @@ struct ProjectOptions {
 struct SinglePositionalOptions {
     project: ProjectOptions,
     positional: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct CachePruneOptions {
+    project: ProjectOptions,
+    all: bool,
+    older_than_seconds: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -1537,6 +1594,63 @@ where
     Ok(options)
 }
 
+fn parse_cache_prune_options<I>(args: I) -> Result<CachePruneOptions, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut options = CachePruneOptions::default();
+    let mut args = args.into_iter();
+
+    while let Some(arg) = next_arg(&mut args)? {
+        match arg.as_str() {
+            "--path" => {
+                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
+            }
+            "--json" => {
+                options.project.json = true;
+            }
+            "--all" => {
+                options.all = true;
+            }
+            "--older-than-seconds" => {
+                let value = require_value("--older-than-seconds", &mut args)?;
+                let seconds = value.parse::<u64>().map_err(|_| {
+                    CliError::InvalidArgument(
+                        "--older-than-seconds must be a positive integer".to_string(),
+                    )
+                })?;
+                if seconds == 0 {
+                    return Err(CliError::InvalidArgument(
+                        "--older-than-seconds must be greater than zero".to_string(),
+                    ));
+                }
+                options.older_than_seconds = Some(seconds);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
+            }
+            _ => {
+                return Err(CliError::InvalidArgument(format!(
+                    "cache prune does not accept positional argument: {arg}"
+                )));
+            }
+        }
+    }
+
+    if options.all && options.older_than_seconds.is_some() {
+        return Err(CliError::InvalidArgument(
+            "use either cache prune --all or --older-than-seconds, not both".to_string(),
+        ));
+    }
+    if !options.all && options.older_than_seconds.is_none() {
+        return Err(CliError::InvalidArgument(
+            "cache prune requires --all or --older-than-seconds <seconds>".to_string(),
+        ));
+    }
+
+    Ok(options)
+}
+
 fn parse_project_options<I>(args: I, allow_name: bool) -> Result<ProjectOptions, CliError>
 where
     I: IntoIterator<Item = OsString>,
@@ -1821,6 +1935,44 @@ fn optional_json_i64(value: Option<i64>) -> String {
     value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
 
+fn cache_entries_json(entries: &[agentflow_core::runtime::CacheEntrySummary]) -> String {
+    let entries = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{{\"cache_key\":\"{}\",\"tool_ref\":\"{}\",\"output_count\":{},\"created_at\":{},\"last_used_at\":{}}}",
+                escape_json(&entry.cache_key),
+                escape_json(&entry.tool_ref),
+                entry.output_count,
+                entry.created_at,
+                entry.last_used_at
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"schema_version\":\"agentflow.cache_entries.v0\",\"entries\":[{entries}]}}")
+}
+
+fn format_attempts(attempts: &[agentflow_core::runtime::AttemptSummary]) -> String {
+    if attempts.is_empty() {
+        return "_none_".to_string();
+    }
+
+    attempts
+        .iter()
+        .map(|attempt| {
+            format!(
+                "{} {} [{}] {}",
+                attempt.attempt_id,
+                attempt.step_id,
+                attempt.status,
+                attempt.workdir.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn escape_json(input: &str) -> String {
     let mut output = String::new();
     for ch in input.chars() {
@@ -2093,6 +2245,10 @@ steps:
         let output = usage();
         assert!(output.contains("agentflow report <flow-id> [--path <path>]"));
         assert!(output.contains("agentflow cache explain <flow-id|step-id> [--path <path>]"));
+        assert!(output.contains("agentflow cache list [--json] [--path <path>]"));
+        assert!(output.contains(
+            "agentflow cache prune (--all|--older-than-seconds <seconds>) [--json] [--path <path>]"
+        ));
         assert!(output
             .contains("agentflow run-step <step-id|flow.step|step:flow/step> [--path <path>]"));
         assert!(
@@ -2192,6 +2348,68 @@ steps:
         .unwrap();
         assert!(inspect.contains("\"schema_version\":\"agentflow.tool_inspection.v0\""));
         assert!(inspect.contains("\"version\":\"0.1.0\""));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn tools_register_resolves_relative_runtime_script_args() {
+        let path = temp_project_path("tools-register-relative-script");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let tool_dir = path.join("tools");
+        fs::create_dir_all(&tool_dir).unwrap();
+        let script_path = tool_dir.join("relative_marker.sh");
+        fs::write(&script_path, "echo ok\n").unwrap();
+        let spec_path = tool_dir.join("relative_marker.tool.yaml");
+        fs::write(
+            &spec_path,
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: relative_marker
+version: 0.1.0
+maturity: wrapped
+description: Tool with a script path relative to the tool spec
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - relative_marker.sh
+"#,
+        )
+        .unwrap();
+
+        run(args(&[
+            "agentflow",
+            "tools",
+            "register",
+            spec_path.to_str().unwrap(),
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let inspect = run(args(&[
+            "agentflow",
+            "tools",
+            "inspect",
+            "marker/relative_marker",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(inspect.contains(&script_path.canonicalize().unwrap().display().to_string()));
 
         let _ = fs::remove_dir_all(path);
     }
@@ -3215,6 +3433,7 @@ steps:
         .unwrap();
         assert!(run_output.contains("Completed steps: 1"));
         assert!(run_output.contains("Failed steps: 0"));
+        assert!(run_output.contains(" [succeeded] "));
         let attempt_id = run_output
             .lines()
             .find(|line| line.starts_with("attempt_"))
@@ -3358,6 +3577,67 @@ steps:
         assert!(step_explain.contains("Cache explain"));
         assert!(step_explain.contains("Flow: marker_demo.scan"));
         assert!(step_explain.contains("step:marker_demo/scan [hit]"));
+
+        let cache_list = run(args(&[
+            "agentflow",
+            "cache",
+            "list",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(cache_list.contains("\"schema_version\":\"agentflow.cache_entries.v0\""));
+        assert!(cache_list.contains("\"tool_ref\":\"marker/marker_survival_scan\""));
+        assert!(cache_list.contains("\"output_count\":1"));
+
+        let naked_prune = run(args(&[
+            "agentflow",
+            "cache",
+            "prune",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+        assert!(naked_prune
+            .message()
+            .contains("cache prune requires --all or --older-than-seconds"));
+
+        let old_prune = run(args(&[
+            "agentflow",
+            "cache",
+            "prune",
+            "--older-than-seconds",
+            "31536000",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(old_prune.contains("\"removed_entries\":0"));
+
+        let all_prune = run(args(&[
+            "agentflow",
+            "cache",
+            "prune",
+            "--all",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(all_prune.contains("\"removed_entries\":1"));
+
+        let empty_cache = run(args(&[
+            "agentflow",
+            "cache",
+            "list",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(empty_cache.contains("\"entries\":[]"));
 
         let _ = fs::remove_dir_all(path);
     }

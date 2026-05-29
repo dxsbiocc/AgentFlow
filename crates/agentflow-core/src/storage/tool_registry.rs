@@ -45,6 +45,7 @@ pub struct ToolParamSpec {
 pub struct ToolRuntimeSpec {
     pub backend: String,
     pub command: Vec<String>,
+    pub timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +143,7 @@ impl ToolSpec {
                 "\"output_required_columns\":{},",
                 "\"runtime_backend\":\"{}\",",
                 "\"runtime_command\":{},",
+                "\"runtime_timeout_seconds\":{},",
                 "\"source_format\":\"{}\",",
                 "\"source_text\":\"{}\"",
                 "}}"
@@ -177,6 +179,7 @@ impl ToolSpec {
                     .map(String::as_str)
                     .collect::<Vec<_>>()
             ),
+            optional_u64_json(self.runtime.timeout_seconds),
             SIMPLE_YAML_SOURCE_FORMAT,
             escape_json(&self.source_text)
         )
@@ -561,6 +564,7 @@ fn parse_executable_sections(source_text: &str) -> Result<ParsedExecutableSectio
     let mut runtime = ToolRuntimeSpec {
         backend: String::new(),
         command: Vec::new(),
+        timeout_seconds: None,
     };
     let mut section: Option<String> = None;
     let mut item: Option<String> = None;
@@ -669,6 +673,13 @@ fn parse_executable_sections(source_text: &str) -> Result<ParsedExecutableSectio
                                 ));
                             }
                             in_runtime_command = true;
+                        }
+                        "timeout_seconds" => {
+                            runtime.timeout_seconds = Some(parse_u64_field(
+                                "runtime.timeout_seconds",
+                                &normalize_scalar(value.trim()),
+                            )?);
+                            in_runtime_command = false;
                         }
                         other => {
                             return Err(StorageError::InvalidInput(format!(
@@ -864,6 +875,18 @@ fn stored_columns(map: &BTreeMap<String, String>, name: &str) -> Result<Vec<Stri
         .map(Option::unwrap_or_default)
 }
 
+fn parse_u64_field(field_name: &str, value: &str) -> Result<u64, StorageError> {
+    let parsed = value.parse::<u64>().map_err(|_| {
+        StorageError::InvalidInput(format!("{field_name} must be a positive integer"))
+    })?;
+    if parsed == 0 {
+        return Err(StorageError::InvalidInput(format!(
+            "{field_name} must be greater than zero"
+        )));
+    }
+    Ok(parsed)
+}
+
 fn executable_from_stored_json(
     tool_ref: &str,
     version: &str,
@@ -887,6 +910,7 @@ fn executable_from_stored_json(
     let runtime = ToolRuntimeSpec {
         backend: extract_string_field(spec_json, "runtime_backend")?,
         command: extract_string_array(spec_json, "runtime_command")?,
+        timeout_seconds: extract_optional_u64_field(spec_json, "runtime_timeout_seconds")?,
     };
 
     let inputs = input_types
@@ -1083,6 +1107,12 @@ fn string_array_json(values: &[&str]) -> String {
     format!("[{items}]")
 }
 
+fn optional_u64_json(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
 fn extract_string_field(json: &str, field: &str) -> Result<String, StorageError> {
     let marker = format!("\"{field}\":\"");
     let start = json.find(&marker).ok_or_else(|| {
@@ -1091,6 +1121,19 @@ fn extract_string_field(json: &str, field: &str) -> Result<String, StorageError>
     let rest = &json[start..];
     let end = find_json_string_end(rest)?;
     Ok(unescape_json_string(&rest[..end]))
+}
+
+fn extract_optional_u64_field(json: &str, field: &str) -> Result<Option<u64>, StorageError> {
+    let marker = format!("\"{field}\":");
+    let Some(start) = json.find(&marker).map(|index| index + marker.len()) else {
+        return Ok(None);
+    };
+    let rest = &json[start..];
+    let value = rest.split([',', '}']).next().unwrap_or_default().trim();
+    if value.is_empty() || value == "null" {
+        return Ok(None);
+    }
+    parse_u64_field(field, value).map(Some)
 }
 
 fn extract_string_array(json: &str, field: &str) -> Result<Vec<String>, StorageError> {
@@ -1342,6 +1385,82 @@ runtime:
         assert_eq!(spec.outputs["report"].type_name, "Markdown");
         assert_eq!(spec.runtime.backend, "local");
         assert_eq!(spec.runtime.command, ["/bin/echo"]);
+    }
+
+    #[test]
+    fn parses_runtime_timeout_seconds_metadata() {
+        let spec = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: timeout_tool
+version: 0.1.0
+maturity: wrapped
+description: Tool with a local runtime timeout
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  timeout_seconds: 5
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(spec.runtime.timeout_seconds, Some(5));
+        assert!(spec.stored_json().contains("\"runtime_timeout_seconds\":5"));
+
+        let path = temp_project_path("runtime-timeout-roundtrip");
+        let store = ProjectStore::init(&path, Some("Tools")).unwrap();
+        store.register_tool(spec).unwrap();
+        let executable = store.executable_tool("local/timeout_tool").unwrap();
+        assert_eq!(executable.runtime.timeout_seconds, Some(5));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn rejects_invalid_runtime_timeout_seconds() {
+        let zero = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: bad_timeout
+version: 0.1.0
+maturity: wrapped
+description: zero timeout
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  timeout_seconds: 0
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap_err();
+        assert!(zero.to_string().contains("greater than zero"));
+
+        let non_numeric = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: bad_timeout
+version: 0.1.0
+maturity: wrapped
+description: non numeric timeout
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  timeout_seconds: soon
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap_err();
+        assert!(non_numeric.to_string().contains("positive integer"));
     }
 
     #[test]

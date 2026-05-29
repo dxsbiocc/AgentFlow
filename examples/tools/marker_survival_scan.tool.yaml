@@ -28,4 +28,4 @@ runtime:
   backend: local
   command:
     - /bin/sh
-    - /Users/dengxsh/Downloads/Work/AgentFlow/examples/tools/marker_survival_scan.sh
+    - marker_survival_scan.sh

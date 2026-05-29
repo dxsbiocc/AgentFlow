@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, OptionalExtension};
 
@@ -37,6 +39,20 @@ pub struct CacheExplanation {
     pub cache_key: String,
     pub hit: bool,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheEntrySummary {
+    pub cache_key: String,
+    pub tool_ref: String,
+    pub output_count: usize,
+    pub created_at: i64,
+    pub last_used_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachePruneSummary {
+    pub removed_entries: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +113,57 @@ impl ProjectStore {
             completed_steps,
             failed_steps,
             attempts,
+        })
+    }
+
+    pub fn list_cache_entries(&self) -> Result<Vec<CacheEntrySummary>, StorageError> {
+        let mut stmt = self.connection().prepare(
+            "SELECT cache_key, tool_ref, output_artifacts_json, created_at, last_used_at
+             FROM cache_entries
+             ORDER BY last_used_at DESC, cache_key ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let output_artifacts_json = row.get::<_, String>(2)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                output_artifacts_json,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            let (cache_key, tool_ref, output_artifacts_json, created_at, last_used_at) = row?;
+            entries.push(CacheEntrySummary {
+                cache_key,
+                tool_ref,
+                output_count: parse_json_map(&output_artifacts_json)?.len(),
+                created_at,
+                last_used_at,
+            });
+        }
+        Ok(entries)
+    }
+
+    pub fn prune_cache_entries(
+        &self,
+        older_than_seconds: Option<u64>,
+    ) -> Result<CachePruneSummary, StorageError> {
+        let removed = if let Some(seconds) = older_than_seconds {
+            let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+            let cutoff = crate::storage::now_unix_seconds().saturating_sub(seconds);
+            self.connection().execute(
+                "DELETE FROM cache_entries WHERE last_used_at < ?1",
+                params![cutoff],
+            )?
+        } else {
+            self.connection().execute("DELETE FROM cache_entries", [])?
+        };
+        self.touch_project()?;
+        Ok(CachePruneSummary {
+            removed_entries: removed,
         })
     }
 
@@ -334,7 +401,10 @@ impl ProjectStore {
         let resolved_input_paths = input_paths(&resolved_inputs);
         let params_json = string_map_json(&params_map);
         let input_hashes_json = input_hashes_json(&resolved_inputs);
-        let runtime_hash = stable_hash(&string_array_json(&tool.runtime.command));
+        let runtime_hash = stable_hash(&runtime_config_json(
+            &tool.runtime.command,
+            tool.runtime.timeout_seconds,
+        ));
         let params_hash = stable_hash(&params_json);
         let cache_key = compute_cache_key(
             tool_ref,
@@ -354,6 +424,7 @@ impl ProjectStore {
         materialize_workdir(
             &workdir,
             &tool.runtime.command,
+            tool.runtime.timeout_seconds,
             &resolved_input_paths,
             &params_map,
             resolved_outputs.as_map(),
@@ -442,7 +513,8 @@ impl ProjectStore {
             });
         }
 
-        let output = Command::new(&tool.runtime.command[0])
+        let mut command = Command::new(&tool.runtime.command[0]);
+        command
             .args(&tool.runtime.command[1..])
             .current_dir(&workdir)
             .env_clear()
@@ -455,8 +527,8 @@ impl ProjectStore {
                 &resolved_input_paths,
                 &params_map,
                 resolved_outputs.as_map(),
-            ))
-            .output();
+            ));
+        let output = run_local_command(command, tool.runtime.timeout_seconds);
 
         let (status, exit_code, error_message) = match output {
             Ok(output) => {
@@ -465,6 +537,14 @@ impl ProjectStore {
                     .and_then(|_| fs::write(&stderr_path, output.stderr))
                 {
                     (RunAttemptStatus::Failed, code, Some(error.to_string()))
+                } else if output.timed_out {
+                    let message = format!(
+                        "command timed out after {} seconds",
+                        output.timeout_seconds.unwrap_or_default()
+                    );
+                    let message =
+                        write_runtime_error(&stderr_path, &StorageError::InvalidInput(message));
+                    (RunAttemptStatus::TimedOut, code, Some(message))
                 } else if output.status.success() {
                     match validate_outputs(&resolved_outputs) {
                         Ok(()) => match validate_declared_outputs(&resolved_outputs, &tool.outputs)
@@ -614,7 +694,10 @@ impl ProjectStore {
         let resolved_inputs = self.resolve_inputs(flow_id, &inputs)?;
         let input_hashes_json = input_hashes_json(&resolved_inputs);
         let params_hash = stable_hash(&string_map_json(&params_map));
-        let runtime_hash = stable_hash(&string_array_json(&tool.runtime.command));
+        let runtime_hash = stable_hash(&runtime_config_json(
+            &tool.runtime.command,
+            tool.runtime.timeout_seconds,
+        ));
         Ok(compute_cache_key(
             tool_ref,
             &tool.version,
@@ -1037,6 +1120,14 @@ struct CacheEntryWrite {
     output_artifacts_json: String,
 }
 
+struct LocalCommandOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+    timeout_seconds: Option<u64>,
+}
+
 fn output_paths(workdir: &Path, outputs: &BTreeMap<String, String>) -> OutputPaths {
     let root = workdir.join("outputs");
     let paths = outputs
@@ -1080,6 +1171,16 @@ fn compute_cache_key(
     ))
 }
 
+fn runtime_config_json(command: &[String], timeout_seconds: Option<u64>) -> String {
+    format!(
+        "{{\"backend\":\"local\",\"command\":{},\"timeout_seconds\":{}}}",
+        string_array_json(command),
+        timeout_seconds
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string())
+    )
+}
+
 fn stable_hash(input: &str) -> String {
     stable_hash_bytes(input.as_bytes())
 }
@@ -1103,6 +1204,7 @@ fn stable_hash_bytes(bytes: &[u8]) -> String {
 fn materialize_workdir(
     workdir: &Path,
     command: &[String],
+    timeout_seconds: Option<u64>,
     inputs: &BTreeMap<String, PathBuf>,
     params: &BTreeMap<String, String>,
     outputs: &BTreeMap<String, PathBuf>,
@@ -1116,12 +1218,54 @@ fn materialize_workdir(
     fs::write(workdir.join("outputs.json"), path_map_json(outputs))?;
     fs::write(
         workdir.join("runtime.json"),
-        format!(
-            "{{\"backend\":\"local\",\"command\":{}}}",
-            string_array_json(command)
-        ),
+        runtime_config_json(command, timeout_seconds),
     )?;
     Ok(())
+}
+
+fn run_local_command(
+    mut command: Command,
+    timeout_seconds: Option<u64>,
+) -> std::io::Result<LocalCommandOutput> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let Some(timeout_seconds) = timeout_seconds else {
+        let output = command.output()?;
+        return Ok(LocalCommandOutput {
+            status: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            timed_out: false,
+            timeout_seconds: None,
+        });
+    };
+
+    let timeout = Duration::from_secs(timeout_seconds);
+    let started = Instant::now();
+    let mut child = command.spawn()?;
+    loop {
+        if child.try_wait()?.is_some() {
+            let output = child.wait_with_output()?;
+            return Ok(LocalCommandOutput {
+                status: output.status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                timed_out: false,
+                timeout_seconds: Some(timeout_seconds),
+            });
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child.wait_with_output()?;
+            return Ok(LocalCommandOutput {
+                status: output.status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                timed_out: true,
+                timeout_seconds: Some(timeout_seconds),
+            });
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn validate_outputs(outputs: &OutputPaths) -> Result<(), StorageError> {
@@ -1802,6 +1946,28 @@ steps:
                 && observation.kind == "marker_report"
         }));
 
+        let cache_entries = store.list_cache_entries().unwrap();
+        assert_eq!(cache_entries.len(), 2);
+        assert!(cache_entries.iter().any(
+            |entry| entry.tool_ref == "marker/marker_survival_scan" && entry.output_count == 1
+        ));
+        assert_eq!(
+            store
+                .prune_cache_entries(Some(31_536_000))
+                .unwrap()
+                .removed_entries,
+            0
+        );
+        assert_eq!(
+            store
+                .prune_cache_entries(Some(u64::MAX))
+                .unwrap()
+                .removed_entries,
+            0
+        );
+        assert_eq!(store.prune_cache_entries(None).unwrap().removed_entries, 2);
+        assert!(store.list_cache_entries().unwrap().is_empty());
+
         let _ = fs::remove_dir_all(path);
     }
 
@@ -2197,6 +2363,74 @@ steps:
         assert_eq!(retry.failed_steps, 1);
         assert_eq!(retry.attempts[0].status, "failed");
         assert!(store.status_json().unwrap().contains("\"run_attempts\":2"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn run_flow_marks_timed_out_attempt_and_does_not_publish_outputs() {
+        let path = temp_project_path("timeout");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Runtime Demo")).unwrap();
+
+        register_tool(
+            &store,
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: sleepy_scan
+version: 0.1.0
+maturity: wrapped
+description: Sleep longer than the configured timeout
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  timeout_seconds: 1
+  command:
+    - /bin/sleep
+    - 2
+"#
+            .to_string(),
+        );
+
+        let flow = FlowDraft::from_simple_yaml(
+            r#"
+schema_version: agentflow.flow.v0
+id: timeout_demo
+name: Timeout demo
+steps:
+  - id: scan
+    tool: marker/sleepy_scan
+    reason: Prove timeout attempts fail without publishing outputs
+    needs: []
+    outputs:
+      report: marker_report
+"#,
+        )
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+
+        let summary = store.run_flow("timeout_demo").unwrap();
+        assert_eq!(summary.completed_steps, 0);
+        assert_eq!(summary.failed_steps, 1);
+        assert_eq!(summary.attempts[0].status, "timed_out");
+        assert_eq!(
+            store.inspect_flow("timeout_demo").unwrap().steps[0].status,
+            "failed"
+        );
+
+        let logs = store.read_logs(&summary.attempts[0].attempt_id).unwrap();
+        assert!(logs.stderr.contains("command timed out after 1 seconds"));
+        let computed = store
+            .list_artifacts()
+            .unwrap()
+            .into_iter()
+            .filter(|artifact| artifact.kind == "computed")
+            .count();
+        assert_eq!(computed, 0);
+        assert!(store.list_cache_entries().unwrap().is_empty());
 
         let _ = fs::remove_dir_all(path);
     }

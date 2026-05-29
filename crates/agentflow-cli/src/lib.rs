@@ -84,6 +84,7 @@ pub fn usage() -> String {
         "  agentflow tools inspect <tool-ref> [--json] [--path <path>]",
         "  agentflow env check <tool-ref> [--json] [--path <path>]",
         "  agentflow env prepare <tool-ref> [--json] [--path <path>]",
+        "  agentflow env export <tool-ref> [--json] [--path <path>]",
         "  agentflow import <file> --type <artifact-type> [--mode reference|copy] [--path <path>]",
         "  agentflow artifacts list [--json] [--path <path>]",
         "  agentflow artifacts inspect <artifact-id> [--json] [--path <path>]",
@@ -1058,11 +1059,12 @@ where
     match next_arg(&mut args)? {
         Some(command) if command == "check" => env_check_command(args),
         Some(command) if command == "prepare" => env_prepare_command(args),
+        Some(command) if command == "export" => env_export_command(args),
         Some(command) => Err(CliError::InvalidArgument(format!(
             "unknown env command: {command}"
         ))),
         None => Err(CliError::InvalidArgument(
-            "env requires a command: check or prepare".to_string(),
+            "env requires a command: check, prepare, or export".to_string(),
         )),
     }
 }
@@ -1100,6 +1102,24 @@ where
         Ok(environment_prepare_json(&prepare))
     } else {
         Ok(format_environment_prepare(&prepare))
+    }
+}
+
+fn env_export_command<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let options = parse_single_positional_options(args, "tool ref", true)?;
+    let tool_ref = options
+        .positional
+        .ok_or_else(|| CliError::InvalidArgument("env export requires <tool-ref>".to_string()))?;
+    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
+    let export = store.export_tool_environment(&tool_ref)?;
+    if options.project.json {
+        Ok(environment_export_json(&export))
+    } else {
+        Ok(format_environment_export(&export))
     }
 }
 
@@ -2179,6 +2199,57 @@ fn environment_prepare_json(
     )
 }
 
+fn environment_export_json(export: &agentflow_core::runtime::EnvironmentExportSummary) -> String {
+    let command = json_string_array(&export.command);
+    let declared_packages = json_string_array(&export.declared_packages);
+    let exported_packages = json_string_array(&export.exported_packages);
+    let missing_packages = json_string_array(&export.missing_packages);
+    let extra_packages = json_string_array(&export.extra_packages);
+    let items = export
+        .items
+        .iter()
+        .map(environment_check_item_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        concat!(
+            "{{",
+            "\"schema_version\":\"agentflow.env_export.v0\",",
+            "\"tool_ref\":\"{}\",",
+            "\"version\":\"{}\",",
+            "\"backend\":\"{}\",",
+            "\"ok\":{},",
+            "\"status\":\"{}\",",
+            "\"command\":{},",
+            "\"exit_code\":{},",
+            "\"export_hash\":{},",
+            "\"declared_packages\":{},",
+            "\"exported_packages\":{},",
+            "\"missing_packages\":{},",
+            "\"extra_packages\":{},",
+            "\"stdout\":\"{}\",",
+            "\"stderr\":\"{}\",",
+            "\"items\":[{}]",
+            "}}"
+        ),
+        escape_json(&export.tool_ref),
+        escape_json(&export.version),
+        escape_json(&export.backend),
+        export.ok,
+        escape_json(&export.status),
+        command,
+        optional_json_i32(export.exit_code),
+        optional_json_string(export.export_hash.as_deref()),
+        declared_packages,
+        exported_packages,
+        missing_packages,
+        extra_packages,
+        escape_json(&export.stdout),
+        escape_json(&export.stderr),
+        items
+    )
+}
+
 fn json_string_array(values: &[String]) -> String {
     let items = values
         .iter()
@@ -2425,6 +2496,74 @@ fn format_environment_prepare(
     )
 }
 
+fn format_environment_export(export: &agentflow_core::runtime::EnvironmentExportSummary) -> String {
+    let items = export
+        .items
+        .iter()
+        .map(|item| {
+            let details = item
+                .details
+                .as_deref()
+                .map(|details| format!("\n  details: {details}"))
+                .unwrap_or_default();
+            format!(
+                "- {} [{}]: {}{}",
+                item.name, item.status, item.message, details
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let command = if export.command.is_empty() {
+        "none".to_string()
+    } else {
+        export.command.join(" ")
+    };
+    format!(
+        concat!(
+            "Environment export\n",
+            "Tool: {}\n",
+            "Version: {}\n",
+            "Backend: {}\n",
+            "Status: {}\n",
+            "Command: {}\n",
+            "Exit code: {}\n",
+            "Export hash: {}\n",
+            "Declared packages: {}\n",
+            "Exported packages: {}\n",
+            "Missing packages: {}\n",
+            "Extra packages: {}\n",
+            "Items:\n{}\n",
+            "Stdout:\n{}\n",
+            "Stderr:\n{}"
+        ),
+        export.tool_ref,
+        export.version,
+        export.backend,
+        export.status,
+        command,
+        export
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        export.export_hash.as_deref().unwrap_or("none"),
+        format_string_list(&export.declared_packages),
+        format_string_list(&export.exported_packages),
+        format_string_list(&export.missing_packages),
+        format_string_list(&export.extra_packages),
+        items,
+        export.stdout,
+        export.stderr
+    )
+}
+
+fn format_string_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(", ")
+    }
+}
+
 fn escape_json(input: &str) -> String {
     let mut output = String::new();
     for ch in input.chars() {
@@ -2468,6 +2607,8 @@ fn format_cache_explanations(
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn args(items: &[&str]) -> Vec<OsString> {
         items.iter().map(OsString::from).collect()
@@ -2479,6 +2620,54 @@ mod tests {
             std::process::id(),
             agentflow_core::storage::now_unix_seconds()
         ))
+    }
+
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    fn write_fake_environment_runner(path: &Path) -> PathBuf {
+        let runner_path = path.join("fake_micromamba.sh");
+        fs::write(
+            &runner_path,
+            r#"#!/bin/sh
+if [ "$1" = "env" ] && [ "$2" = "update" ]; then
+  echo "fake env update $*"
+  exit 0
+fi
+if [ "$1" = "env" ] && [ "$2" = "export" ]; then
+  printf 'name: af-test\ndependencies:\n  - python=3.11\n  - pandas\n  - scanpy\n'
+  exit 0
+fi
+if [ "$1" != "run" ]; then
+  echo "expected run, env update, or env export subcommand" >&2
+  exit 91
+fi
+shift
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --name|--prefix)
+      shift 2
+      ;;
+    --no-capture-output)
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+exec "$@"
+"#,
+        )
+        .unwrap();
+        make_executable(&runner_path);
+        runner_path
     }
 
     fn write_sample_tool(path: &std::path::Path) -> PathBuf {
@@ -2725,6 +2914,7 @@ steps:
         assert!(output.contains("agentflow runs inspect <run-or-attempt-id>"));
         assert!(output.contains("agentflow env check <tool-ref>"));
         assert!(output.contains("agentflow env prepare <tool-ref>"));
+        assert!(output.contains("agentflow env export <tool-ref>"));
     }
 
     #[test]
@@ -3055,6 +3245,87 @@ runtime:
         assert!(output.contains("\"status\":\"succeeded\""));
         assert!(output.contains("\"ok\":true"));
         assert!(output.contains("\"command\":[\"/bin/echo\",\"env\",\"update\""));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn env_export_reports_environment_lock_and_package_diff() {
+        let path = temp_project_path("env-export");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let runner_path = write_fake_environment_runner(&path);
+        let env_file = path.join("environment.yml");
+        fs::write(
+            &env_file,
+            "name: af-test\ndependencies:\n  - python=3.11\n  - pandas\n  - numpy\n",
+        )
+        .unwrap();
+        let spec_path = path.join("env_tool.tool.yaml");
+        fs::write(
+            &spec_path,
+            format!(
+                r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: env_tool
+version: 0.1.0
+maturity: wrapped
+description: Tool with an exportable environment wrapper
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: micromamba
+  runner: {}
+  env_name: af-test
+  env_file: {}
+  command:
+    - python
+    - run.py
+"#,
+                runner_path.display(),
+                env_file.display()
+            ),
+        )
+        .unwrap();
+        run(args(&[
+            "agentflow",
+            "tools",
+            "register",
+            spec_path.to_str().unwrap(),
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let output = run(args(&[
+            "agentflow",
+            "env",
+            "export",
+            "marker/env_tool",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(output.contains("\"schema_version\":\"agentflow.env_export.v0\""));
+        assert!(output.contains("\"backend\":\"micromamba\""));
+        assert!(output.contains("\"status\":\"succeeded\""));
+        assert!(output.contains("\"ok\":false"));
+        assert!(output.contains("\"export_hash\":\"fnv64:"));
+        assert!(output.contains("\"missing_packages\":[\"numpy\"]"));
+        assert!(output.contains("\"extra_packages\":[\"scanpy\"]"));
+        assert!(output.contains("\"command\":[\""));
+        assert!(output.contains("\",\"env\",\"export\""));
 
         let _ = fs::remove_dir_all(path);
     }

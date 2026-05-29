@@ -83,6 +83,7 @@ Current technical preview supports:
 - Existing Conda/micromamba environment execution through explicit `runtime.runner` plus `env_name` or `env_prefix`
 - Environment readiness checks through `env check <tool-ref>`
 - Explicit Conda/micromamba environment update through `env prepare <tool-ref>` when `runtime.env_file` is declared
+- Conda/micromamba environment export evidence through `env export <tool-ref>`, including export hash and conservative package-set diff against declared `runtime.env_file` dependencies
 - Cache-hit restore for equivalent executable flows plus `cache explain`
 - Cache inventory and explicit cache pruning through `cache list` and `cache prune`
 - Local runtime timeout control through `runtime.timeout_seconds`
@@ -97,7 +98,7 @@ This technical preview does not support:
 - autonomous planner or failure-explainer agents
 - automatic tool discovery or recommendation workflows
 - dynamic graph authoring from natural-language goals
-- implicit environment creation/package solving during `run`, environment lock/export, or remote/isolated runtime backends such as Docker, Singularity, or SLURM
+- implicit environment creation/package solving during `run`, full lockfile normalization, or remote/isolated runtime backends such as Docker, Singularity, or SLURM
 - parallel execution scheduling
 - sandboxing, container hardening, resource quotas, or redaction policy
 - rich validator families beyond line-oriented table checks
@@ -159,7 +160,7 @@ This is the intended preview narrative because it exercises tool registration, a
 ## Remaining Launch Risks
 
 - Execution hardening risk: local-process execution is intentionally narrow and not sandboxed.
-- Environment risk: Conda/micromamba can wrap, check, and explicitly update environments, but AgentFlow does not lock, export, package, or sandbox those environments yet.
+- Environment risk: Conda/micromamba can wrap, check, explicitly update, and export package evidence, but AgentFlow does not solve, sandbox, garbage-collect, or normalize manager-specific lockfiles yet.
 - Validator risk: current validators are useful but still shallow for scientific data integrity.
 - Observer risk: domain-aware output interpretation is still mostly limited to the first `marker_report` slice.
 - Cache risk: current hashing and explicit pruning are sufficient for preview demos, not long-term reproducibility or storage lifecycle guarantees.

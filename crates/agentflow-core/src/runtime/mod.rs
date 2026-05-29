@@ -88,6 +88,25 @@ pub struct EnvironmentPrepareSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentExportSummary {
+    pub tool_ref: String,
+    pub version: String,
+    pub backend: String,
+    pub ok: bool,
+    pub status: String,
+    pub command: Vec<String>,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub export_hash: Option<String>,
+    pub declared_packages: Vec<String>,
+    pub exported_packages: Vec<String>,
+    pub missing_packages: Vec<String>,
+    pub extra_packages: Vec<String>,
+    pub items: Vec<EnvironmentCheckItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunLogs {
     pub attempt_id: String,
     pub stdout_path: PathBuf,
@@ -262,6 +281,127 @@ impl ProjectStore {
             exit_code,
             stdout,
             stderr,
+            items,
+        })
+    }
+
+    pub fn export_tool_environment(
+        &self,
+        tool_ref: &str,
+    ) -> Result<EnvironmentExportSummary, StorageError> {
+        let tool = self.executable_tool(tool_ref)?;
+        let mut items = Vec::new();
+        let mut command = Vec::new();
+        let mut exit_code = None;
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut status = "failed".to_string();
+        let mut export_hash = None;
+        let mut declared_packages = Vec::new();
+        let mut exported_packages = Vec::new();
+        let mut missing_packages = Vec::new();
+        let mut extra_packages = Vec::new();
+
+        match tool.runtime.backend.as_str() {
+            "local" => {
+                items.push(EnvironmentCheckItem::failed(
+                    "backend",
+                    "local runtime does not support env export",
+                    None,
+                ));
+            }
+            "conda" | "micromamba" => {
+                check_runner(&tool.runtime, &mut items);
+                check_environment_selector(&tool.runtime, &mut items);
+                check_env_file(&tool.runtime, &mut items);
+                if items.iter().all(|item| item.status == "ok") {
+                    declared_packages = declared_environment_packages(&tool.runtime)?;
+                    let prepared = prepare_environment_export_command(&tool.runtime)?;
+                    command = prepared.argv();
+                    let mut process = Command::new(&prepared.executable);
+                    process
+                        .args(&prepared.args)
+                        .env_clear()
+                        .env("PATH", "/usr/bin:/bin");
+                    match run_local_command(process, tool.runtime.timeout_seconds) {
+                        Ok(output) => {
+                            exit_code = output.status.code();
+                            stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                            stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                            if output.timed_out {
+                                status = "timed_out".to_string();
+                                items.push(EnvironmentCheckItem::failed(
+                                    "export",
+                                    format!(
+                                        "environment export timed out after {} seconds",
+                                        output.timeout_seconds.unwrap_or_default()
+                                    ),
+                                    None,
+                                ));
+                            } else if output.status.success() {
+                                status = "succeeded".to_string();
+                                export_hash = Some(stable_hash(&stdout));
+                                exported_packages = extract_conda_dependency_packages(&stdout);
+                                let diff =
+                                    dependency_package_diff(&declared_packages, &exported_packages);
+                                missing_packages = diff.missing;
+                                extra_packages = diff.extra;
+                                items.push(EnvironmentCheckItem::ok(
+                                    "export",
+                                    "environment export command succeeded",
+                                    None,
+                                ));
+                                items.push(environment_package_diff_item(
+                                    declared_packages.len(),
+                                    exported_packages.len(),
+                                    &missing_packages,
+                                    &extra_packages,
+                                ));
+                            } else {
+                                items.push(EnvironmentCheckItem::failed(
+                                    "export",
+                                    format!(
+                                        "environment export exited with code {:?}",
+                                        output.status.code()
+                                    ),
+                                    None,
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            stderr = error.to_string();
+                            items.push(EnvironmentCheckItem::failed(
+                                "export",
+                                "environment export command could not start",
+                                Some(error.to_string()),
+                            ));
+                        }
+                    }
+                }
+            }
+            other => items.push(EnvironmentCheckItem::failed(
+                "backend",
+                format!("unsupported runtime backend {other}"),
+                None,
+            )),
+        }
+
+        let ok = status == "succeeded" && items.iter().all(|item| item.status != "failed");
+        Ok(EnvironmentExportSummary {
+            tool_ref: tool.tool_ref,
+            version: tool.version,
+            backend: tool.runtime.backend,
+            ok,
+            status,
+            command,
+            exit_code,
+            stdout,
+            stderr,
+            export_hash,
+            declared_packages,
+            exported_packages,
+            missing_packages,
+            extra_packages,
             items,
         })
     }
@@ -1414,6 +1554,11 @@ struct CacheEntryWrite {
     output_artifacts_json: String,
 }
 
+struct DependencyPackageDiff {
+    missing: Vec<String>,
+    extra: Vec<String>,
+}
+
 impl EnvironmentCheckItem {
     fn ok(name: impl Into<String>, message: impl Into<String>, details: Option<String>) -> Self {
         Self {
@@ -1897,6 +2042,180 @@ fn prepare_environment_update_command(
         executable: runner.clone(),
         args,
     })
+}
+
+fn prepare_environment_export_command(
+    runtime: &ToolRuntimeSpec,
+) -> Result<PreparedRuntimeCommand, StorageError> {
+    let runner = runtime.runner.as_ref().ok_or_else(|| {
+        StorageError::InvalidInput(
+            "environment runtime must declare absolute runner path".to_string(),
+        )
+    })?;
+    let mut args = vec!["env".to_string(), "export".to_string()];
+    match (runtime.env_name.as_deref(), runtime.env_prefix.as_deref()) {
+        (Some(env_name), None) => {
+            args.push("--name".to_string());
+            args.push(env_name.to_string());
+        }
+        (None, Some(env_prefix)) => {
+            args.push("--prefix".to_string());
+            args.push(env_prefix.to_string());
+        }
+        (Some(_), Some(_)) => {
+            return Err(StorageError::InvalidInput(
+                "environment runtime must declare only one of env_name or env_prefix".to_string(),
+            ));
+        }
+        (None, None) => {
+            return Err(StorageError::InvalidInput(
+                "environment runtime must declare env_name or env_prefix".to_string(),
+            ));
+        }
+    }
+    Ok(PreparedRuntimeCommand {
+        executable: runner.clone(),
+        args,
+    })
+}
+
+fn declared_environment_packages(runtime: &ToolRuntimeSpec) -> Result<Vec<String>, StorageError> {
+    let Some(env_file) = runtime.env_file.as_deref() else {
+        return Ok(Vec::new());
+    };
+    Ok(extract_conda_dependency_packages(&fs::read_to_string(
+        env_file,
+    )?))
+}
+
+fn extract_conda_dependency_packages(text: &str) -> Vec<String> {
+    let mut packages = BTreeSet::new();
+    let mut in_dependencies = false;
+    let mut dependency_list_indent = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len().saturating_sub(line.trim_start().len());
+        if trimmed == "dependencies:" {
+            in_dependencies = true;
+            dependency_list_indent = None;
+            continue;
+        }
+        if !in_dependencies {
+            continue;
+        }
+        if !trimmed.starts_with("- ") {
+            if indent == 0 {
+                in_dependencies = false;
+            }
+            continue;
+        }
+        if let Some(list_indent) = dependency_list_indent {
+            if indent != list_indent {
+                continue;
+            }
+        } else {
+            dependency_list_indent = Some(indent);
+        }
+        let Some(package) = normalize_dependency_package(trimmed.trim_start_matches("- ")) else {
+            continue;
+        };
+        packages.insert(package);
+    }
+    packages.into_iter().collect()
+}
+
+fn normalize_dependency_package(value: &str) -> Option<String> {
+    let value = value
+        .split_once(" #")
+        .map(|(left, _)| left)
+        .unwrap_or(value)
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'');
+    if value.is_empty() || value.ends_with(':') {
+        return None;
+    }
+    let value = value
+        .rsplit_once("::")
+        .map(|(_, name)| name)
+        .unwrap_or(value);
+    let name = value
+        .split(['=', '<', '>', '!', ' ', '\t'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_ascii_lowercase())
+    }
+}
+
+fn dependency_package_diff(
+    declared_packages: &[String],
+    exported_packages: &[String],
+) -> DependencyPackageDiff {
+    let declared = declared_packages.iter().cloned().collect::<BTreeSet<_>>();
+    let exported = exported_packages.iter().cloned().collect::<BTreeSet<_>>();
+    DependencyPackageDiff {
+        missing: declared.difference(&exported).cloned().collect(),
+        extra: exported.difference(&declared).cloned().collect(),
+    }
+}
+
+fn environment_package_diff_item(
+    declared_count: usize,
+    exported_count: usize,
+    missing_packages: &[String],
+    extra_packages: &[String],
+) -> EnvironmentCheckItem {
+    if declared_count == 0 {
+        return EnvironmentCheckItem::skipped(
+            "package_diff",
+            "no declared env_file dependencies available for package diff",
+            Some(format!("exported_packages={exported_count}")),
+        );
+    }
+    if missing_packages.is_empty() && extra_packages.is_empty() {
+        return EnvironmentCheckItem::ok(
+            "package_diff",
+            "exported package set matches declared package set",
+            Some(format!(
+                "declared_packages={declared_count}; exported_packages={exported_count}"
+            )),
+        );
+    }
+    if !missing_packages.is_empty() {
+        return EnvironmentCheckItem::failed(
+            "package_diff",
+            "exported package set is missing declared packages",
+            Some(format!(
+                "missing={}; extra={}",
+                dependency_list_details(missing_packages),
+                dependency_list_details(extra_packages)
+            )),
+        );
+    }
+    EnvironmentCheckItem::ok(
+        "package_diff",
+        "exported package set includes packages beyond the declared set",
+        Some(format!(
+            "missing={}; extra={}",
+            dependency_list_details(missing_packages),
+            dependency_list_details(extra_packages)
+        )),
+    )
+}
+
+fn dependency_list_details(packages: &[String]) -> String {
+    if packages.is_empty() {
+        "none".to_string()
+    } else {
+        packages.join(",")
+    }
 }
 
 fn prepare_environment_probe(
@@ -2542,8 +2861,12 @@ if [ "$1" = "env" ] && [ "$2" = "update" ]; then
   echo "fake env update $*"
   exit 0
 fi
+if [ "$1" = "env" ] && [ "$2" = "export" ]; then
+  printf 'name: af-test\ndependencies:\n  - python=3.11\n  - pandas\n  - scanpy\n'
+  exit 0
+fi
 if [ "$1" != "run" ]; then
-  echo "expected run or env update subcommand" >&2
+  echo "expected run, env update, or env export subcommand" >&2
   exit 91
 fi
 shift
@@ -3247,6 +3570,136 @@ runtime:
         );
         let local = store.prepare_tool_environment("marker/local_tool").unwrap();
         assert!(!local.ok);
+        assert!(local
+            .items
+            .iter()
+            .any(|item| item.name == "backend" && item.status == "failed"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn conda_dependency_parser_extracts_top_level_packages_only() {
+        let packages = extract_conda_dependency_packages(
+            r#"
+name: af-test
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - conda-forge::pandas>=2
+  - pip:
+    - scanpy==1.10
+prefix: /tmp/af-test
+"#,
+        );
+
+        assert_eq!(packages, vec!["pandas".to_string(), "python".to_string()]);
+    }
+
+    #[test]
+    fn env_export_runs_environment_export_and_diffs_declared_packages() {
+        let path = temp_project_path("env-export");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Runtime Demo")).unwrap();
+        let runner_path = write_fake_environment_runner(&path);
+        let env_file = path.join("environment.yml");
+        fs::write(
+            &env_file,
+            "name: af-test\ndependencies:\n  - python=3.11\n  - pandas\n  - numpy\n",
+        )
+        .unwrap();
+        let runner = runner_path.display();
+        let env_file = env_file.display();
+
+        register_tool(
+            &store,
+            format!(
+                r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: env_tool
+version: 0.1.0
+maturity: wrapped
+description: Environment tool
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: micromamba
+  runner: {runner}
+  env_name: af-test
+  env_file: {env_file}
+  command:
+    - python
+    - run.py
+"#
+            ),
+        );
+
+        let summary = store.export_tool_environment("marker/env_tool").unwrap();
+        assert!(!summary.ok);
+        assert_eq!(summary.status, "succeeded");
+        assert_eq!(summary.exit_code, Some(0));
+        assert!(summary.command.contains(&"env".to_string()));
+        assert!(summary.command.contains(&"export".to_string()));
+        assert!(summary.export_hash.unwrap().starts_with("fnv64:"));
+        assert_eq!(
+            summary.declared_packages,
+            vec![
+                "numpy".to_string(),
+                "pandas".to_string(),
+                "python".to_string()
+            ]
+        );
+        assert_eq!(
+            summary.exported_packages,
+            vec![
+                "pandas".to_string(),
+                "python".to_string(),
+                "scanpy".to_string()
+            ]
+        );
+        assert_eq!(summary.missing_packages, vec!["numpy".to_string()]);
+        assert_eq!(summary.extra_packages, vec!["scanpy".to_string()]);
+        assert!(summary
+            .items
+            .iter()
+            .any(|item| item.name == "package_diff" && item.status == "failed"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn env_export_rejects_local_backend() {
+        let path = temp_project_path("env-export-local");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Runtime Demo")).unwrap();
+
+        register_tool(
+            &store,
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: local_tool
+version: 0.1.0
+maturity: wrapped
+description: Local tool
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#
+            .to_string(),
+        );
+
+        let local = store.export_tool_environment("marker/local_tool").unwrap();
+        assert!(!local.ok);
+        assert!(local.command.is_empty());
+        assert!(local.export_hash.is_none());
         assert!(local
             .items
             .iter()

@@ -902,7 +902,8 @@ Recommended V1 behavior:
 - Execute with `conda run --no-capture-output` or `micromamba run` without shell interpolation.
 - Support `agentflow env check <tool-ref>` to verify runner accessibility, environment selector metadata, declared env-file hashability, and a lightweight `run true` probe before a real analysis.
 - Support `environment.yml` preparation behind an explicit `agentflow env prepare <tool-ref>` command.
-- Record env file hash and resolved package export when available.
+- Support `agentflow env export <tool-ref>` to capture Conda/micromamba export text, export hash, and a conservative package-set diff against declared env-file dependencies.
+- Record env file hash and resolved package export when available; treat full lockfile normalization and solver-aware version diffing as later hardening work.
 - Do not auto-install dependencies during normal `run` unless the user approved env preparation.
 
 ### Docker Backend
@@ -1496,6 +1497,7 @@ agentflow hypotheses inspect <hypothesis-id>
 agentflow hypotheses challenge <hypothesis-id>
 agentflow report generate <flow-id>
 agentflow env prepare <tool-ref>
+agentflow env export <tool-ref>
 agentflow cache list
 agentflow cache explain <step-id>
 agentflow cleanup --work --cache

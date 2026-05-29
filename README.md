@@ -69,12 +69,13 @@ cargo run -q -p agentflow-cli -- report marker_demo --path "$AF_DEMO"
 - Existing Conda/micromamba environment execution through explicit `runtime.runner` plus `env_name` or `env_prefix`
 - Environment readiness checks through `env check <tool-ref>`
 - Explicit Conda/micromamba environment update through `env prepare <tool-ref>` when `runtime.env_file` is declared
+- Conda/micromamba environment export evidence through `env export <tool-ref>`, including export hash and conservative package-set diff against declared `runtime.env_file` dependencies
 
 ## Explicitly Not Supported Yet
 
 - Agent planning, tool recommendation, or autonomous graph authoring
 - Implicit environment creation, solving, or package installation during `run`
-- Environment lock/export, package diffing, or environment garbage collection
+- Full lockfile normalization, dependency solving, package-manager-specific diff semantics, or environment garbage collection
 - Remote or isolated execution backends such as Docker, Singularity, or SLURM
 - Parallel scheduler execution or cancellation controls
 - Rich semantic validators such as file signatures, domain-specific QC policies, and pluggable validator registries

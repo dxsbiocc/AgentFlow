@@ -57,7 +57,7 @@ Missing behavior:
 
 Other important gaps remain:
 
-- Conda/micromamba can wrap, check, and explicitly update environments through runner/env-file metadata, but no lock/export, package diffing, or lifecycle cleanup exists yet.
+- Conda/micromamba can wrap, check, explicitly update, and export environment evidence through runner/env-file metadata, but no solver-backed lockfile normalization, sandboxing, or lifecycle cleanup exists yet.
 - No planner or failure-explainer Agent layer.
 - No general observer registry or adapter selection policy.
 - No rollback, merge, delete, branch label, decision node, or supersede semantics.
@@ -145,7 +145,7 @@ The next highest-value steps are now:
 1. Add better partial branch replay/status/report controls after graph changes.
 2. Add branch labels and explicit decision nodes around graph patches.
 3. Add richer validator profiles: file signature checks, additional schema profiles, empty-result policies, domain QC policies.
-4. Add environment lock/export and package diff reporting so prepared environments become auditable.
+4. Persist environment export snapshots and improve solver-aware package/version diff reporting so prepared environments become auditable over time.
 5. Add a small planner/failure-explainer Agent layer that only proposes graph patches from existing observations, logs, tools, and research notes.
 
 This keeps the project from drifting into fantasy autonomy. The next milestone should make AgentFlow better at seeing and recording what happened before asking it to reason more ambitiously.

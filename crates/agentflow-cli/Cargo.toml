@@ -1,0 +1,19 @@
+[package]
+name = "agentflow-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agentflow-core = { path = "../agentflow-core" }
+agentflow-schemas = { path = "../agentflow-schemas" }
+
+[[bin]]
+name = "agentflow"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

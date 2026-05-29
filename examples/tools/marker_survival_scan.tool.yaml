@@ -1,0 +1,31 @@
+schema_version: agentflow.tool.v0
+namespace: marker
+name: marker_survival_scan
+version: 0.1.0
+maturity: wrapped
+description: Scan a candidate marker against expression and survival tables.
+inputs:
+  expression_table:
+    type: TSV
+    required: true
+    required_columns: sample,TP53
+    min_rows: 1
+  survival_table:
+    type: TSV
+    required: true
+    required_columns: sample,time,status
+    min_rows: 1
+params:
+  gene:
+    type: string
+    required: true
+outputs:
+  report:
+    type: Markdown
+    observer: marker_report
+    min_rows: 3
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - /Users/dengxsh/Downloads/Work/AgentFlow/examples/tools/marker_survival_scan.sh

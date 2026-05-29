@@ -1,0 +1,15 @@
+[package]
+name = "agentflow-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agentflow-schemas = { path = "../agentflow-schemas" }
+rusqlite = "0.32"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

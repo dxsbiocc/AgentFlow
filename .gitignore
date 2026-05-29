@@ -1,0 +1,4 @@
+/target/
+/.agentflow/
+/.omx/
+*.log

@@ -1,0 +1,15 @@
+schema_version: agentflow.flow.v0
+id: marker_demo
+name: Marker demo
+steps:
+  - id: scan
+    tool: marker/marker_survival_scan
+    reason: Evaluate TP53 marker signal from an imported expression table.
+    needs: []
+    inputs:
+      expression_table: artifact_REPLACE_WITH_IMPORTED_ID
+      survival_table: artifact_REPLACE_WITH_IMPORTED_SURVIVAL_ID
+    params:
+      gene: TP53
+    outputs:
+      report: marker_report

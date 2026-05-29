@@ -1,0 +1,5 @@
+sample	TP53	TP63
+tumor_a	1.20	0.40
+tumor_b	0.95	0.52
+normal_a	0.30	0.70
+normal_b	0.28	0.66

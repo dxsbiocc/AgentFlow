@@ -76,7 +76,8 @@ Current technical preview supports:
 - Sequential local execution of approved DAGs
 - Dependency-gated targeted step execution through `run-step`
 - Failed-step retry through `retry`
-- Attempt workdirs, command materialization, stdout/stderr capture, and readable `logs`
+- Run and attempt inventory through `runs list`, `runs inspect`, and readable `logs`
+- Attempt workdirs, command materialization, and stdout/stderr capture
 - Declared output publication as artifacts
 - Input/output validation with `required_columns` and `min_rows`
 - Cache-hit restore for equivalent executable flows plus `cache explain`
@@ -126,6 +127,7 @@ Recommended demo checks:
 cargo run -q -p agentflow-cli -- flow validate "$AF_DEMO/marker_demo.flow.yaml" --json --path "$AF_DEMO"
 cargo run -q -p agentflow-cli -- run marker_demo --path "$AF_DEMO"
 cargo run -q -p agentflow-cli -- status --json --path "$AF_DEMO"
+cargo run -q -p agentflow-cli -- runs list --flow marker_demo --json --path "$AF_DEMO"
 cargo run -q -p agentflow-cli -- report marker_demo --path "$AF_DEMO"
 cargo run -q -p agentflow-cli -- cache explain marker_demo.scan --path "$AF_DEMO"
 cargo run -q -p agentflow-cli -- cache list --json --path "$AF_DEMO"
@@ -142,6 +144,7 @@ Operator-facing sample flow:
 5. Run `marker_demo`.
 6. Confirm:
    - flow run completes
+   - `runs list` and `runs inspect` expose run/attempt state
    - output artifact is registered
    - `report marker_demo` renders Markdown provenance
    - `observations list` contains the automatic `marker_report` observation

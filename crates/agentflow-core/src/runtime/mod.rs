@@ -64,6 +64,41 @@ pub struct RunLogs {
     pub stderr: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRecordSummary {
+    pub run_id: String,
+    pub flow_id: String,
+    pub step_id: String,
+    pub status: String,
+    pub attempt_count: i64,
+    pub latest_attempt_id: Option<String>,
+    pub cache_key: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunAttemptRecord {
+    pub attempt_id: String,
+    pub run_id: String,
+    pub attempt: i64,
+    pub status: String,
+    pub workdir: Option<PathBuf>,
+    pub started_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    pub exit_code: Option<i32>,
+    pub stdout_path: Option<PathBuf>,
+    pub stderr_path: Option<PathBuf>,
+    pub error_class: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunInspection {
+    pub run: RunRecordSummary,
+    pub attempts: Vec<RunAttemptRecord>,
+}
+
 impl ProjectStore {
     pub fn run_flow(&self, flow_id: &str) -> Result<FlowRunSummary, StorageError> {
         if self.inspect_flow(flow_id)?.status != "approved" {
@@ -325,6 +360,89 @@ impl ProjectStore {
             stdout_path,
             stderr_path,
         })
+    }
+
+    pub fn list_runs(&self, flow_id: Option<&str>) -> Result<Vec<RunRecordSummary>, StorageError> {
+        let sql = "SELECT id, flow_id, step_id, status, attempt_count, latest_attempt_id, cache_key, created_at, updated_at
+                   FROM runs";
+        let ordered_sql = if flow_id.is_some() {
+            format!("{sql} WHERE flow_id = ?1 ORDER BY updated_at DESC, id ASC")
+        } else {
+            format!("{sql} ORDER BY updated_at DESC, id ASC")
+        };
+        let mut stmt = self.connection().prepare(&ordered_sql)?;
+        let mut rows = if let Some(flow_id) = flow_id {
+            stmt.query(params![flow_id])?
+        } else {
+            stmt.query([])?
+        };
+
+        let mut runs = Vec::new();
+        while let Some(row) = rows.next()? {
+            runs.push(run_record_from_row(row)?);
+        }
+        Ok(runs)
+    }
+
+    pub fn inspect_run_or_attempt(&self, id: &str) -> Result<RunInspection, StorageError> {
+        let run_id = self
+            .connection()
+            .query_row("SELECT id FROM runs WHERE id = ?1", params![id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .map(Ok)
+            .unwrap_or_else(|| {
+                self.connection()
+                    .query_row(
+                        "SELECT run_id FROM run_attempts WHERE id = ?1",
+                        params![id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| StorageError::NotFound(format!("run or attempt {id}")))
+            })?;
+
+        let run = self.connection().query_row(
+            "SELECT id, flow_id, step_id, status, attempt_count, latest_attempt_id, cache_key, created_at, updated_at
+             FROM runs
+             WHERE id = ?1",
+            params![&run_id],
+            run_record_from_row,
+        )?;
+        let attempts = self.run_attempt_records(&run_id)?;
+        Ok(RunInspection { run, attempts })
+    }
+
+    fn run_attempt_records(&self, run_id: &str) -> Result<Vec<RunAttemptRecord>, StorageError> {
+        let mut stmt = self.connection().prepare(
+            "SELECT id, run_id, attempt, status, workdir, started_at, ended_at, exit_code, stdout_path, stderr_path, error_class, error_message
+             FROM run_attempts
+             WHERE run_id = ?1
+             ORDER BY attempt ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![run_id], |row| {
+            Ok(RunAttemptRecord {
+                attempt_id: row.get::<_, String>(0)?,
+                run_id: row.get::<_, String>(1)?,
+                attempt: row.get::<_, i64>(2)?,
+                status: row.get::<_, String>(3)?,
+                workdir: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+                started_at: row.get::<_, Option<i64>>(5)?,
+                ended_at: row.get::<_, Option<i64>>(6)?,
+                exit_code: row.get::<_, Option<i32>>(7)?,
+                stdout_path: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
+                stderr_path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
+                error_class: row.get::<_, Option<String>>(10)?,
+                error_message: row.get::<_, Option<String>>(11)?,
+            })
+        })?;
+
+        let mut attempts = Vec::new();
+        for row in rows {
+            attempts.push(row?);
+        }
+        Ok(attempts)
     }
 
     pub fn status_json(&self) -> Result<String, StorageError> {
@@ -1029,6 +1147,20 @@ fn ensure_step_dependencies_completed(
             missing.join(", ")
         )))
     }
+}
+
+fn run_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecordSummary> {
+    Ok(RunRecordSummary {
+        run_id: row.get::<_, String>(0)?,
+        flow_id: row.get::<_, String>(1)?,
+        step_id: row.get::<_, String>(2)?,
+        status: row.get::<_, String>(3)?,
+        attempt_count: row.get::<_, i64>(4)?,
+        latest_attempt_id: row.get::<_, Option<String>>(5)?,
+        cache_key: row.get::<_, Option<String>>(6)?,
+        created_at: row.get::<_, i64>(7)?,
+        updated_at: row.get::<_, i64>(8)?,
+    })
 }
 
 fn completed_step_ids(steps: &[StoredFlowStep]) -> BTreeSet<String> {
@@ -1847,6 +1979,19 @@ steps:
             .read_logs(&summary.attempts.last().unwrap().run_id)
             .unwrap();
         assert!(logs.stdout.contains("finalize ok"));
+        let runs = store.list_runs(Some("marker_demo")).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|run| run.status == "completed"));
+        let run_inspection = store
+            .inspect_run_or_attempt(&summary.attempts[0].run_id)
+            .unwrap();
+        assert_eq!(run_inspection.run.flow_id, "marker_demo");
+        assert_eq!(run_inspection.attempts.len(), 1);
+        assert_eq!(run_inspection.attempts[0].status, "succeeded");
+        let attempt_inspection = store
+            .inspect_run_or_attempt(&summary.attempts[0].attempt_id)
+            .unwrap();
+        assert_eq!(attempt_inspection.run.run_id, summary.attempts[0].run_id);
         assert_eq!(
             store.inspect_flow("marker_demo").unwrap().steps[0].status,
             "completed"

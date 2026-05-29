@@ -62,6 +62,7 @@ where
         Some(command) if command == "research" => research_command(args),
         Some(command) if command == "patch" => patch_command(args),
         Some(command) if command == "compare" => compare_command(args),
+        Some(command) if command == "runs" => runs_command(args),
         Some(command) if command == "logs" => logs_command(args),
         Some(command) => Err(CliError::UnknownCommand(command)),
     }
@@ -108,6 +109,8 @@ pub fn usage() -> String {
         "  agentflow compare metrics <flow-id> --baseline <step-id> --candidate <step-id> --metric <name> [--direction higher|lower] [--json] [--path <path>]",
         "  agentflow compare list <flow-id> [--json] [--path <path>]",
         "  agentflow compare inspect <comparison-id> [--json] [--path <path>]",
+        "  agentflow runs list [--flow <flow-id>] [--json] [--path <path>]",
+        "  agentflow runs inspect <run-or-attempt-id> [--json] [--path <path>]",
         "  agentflow logs <run-or-attempt-id> [--path <path>]",
         "",
         "Implementation status:",
@@ -192,6 +195,65 @@ where
         summary.failed_steps,
         format_attempts(&summary.attempts)
     ))
+}
+
+fn runs_command<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    match next_arg(&mut args)? {
+        Some(command) if command == "list" => runs_list_command(args),
+        Some(command) if command == "inspect" => runs_inspect_command(args),
+        Some(command) => Err(CliError::InvalidArgument(format!(
+            "unknown runs command: {command}"
+        ))),
+        None => Err(CliError::InvalidArgument(
+            "runs requires a command: list or inspect".to_string(),
+        )),
+    }
+}
+
+fn runs_list_command<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let options = parse_runs_list_options(args)?;
+    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
+    let runs = store.list_runs(options.flow_id.as_deref())?;
+    if options.project.json {
+        Ok(runs_json(&runs))
+    } else if runs.is_empty() {
+        Ok("Runs\n_none_".to_string())
+    } else {
+        Ok(format!("Runs\n{}", format_runs(&runs)))
+    }
+}
+
+fn runs_inspect_command<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let options = parse_single_positional_options(args, "run or attempt id", true)?;
+    let id = options.positional.ok_or_else(|| {
+        CliError::InvalidArgument("runs inspect requires <run-or-attempt-id>".to_string())
+    })?;
+    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
+    let inspection = store.inspect_run_or_attempt(&id)?;
+    if options.project.json {
+        Ok(run_inspection_json(&inspection))
+    } else {
+        Ok(format!(
+            "Run: {}\nFlow: {}\nStep: {}\nStatus: {}\nAttempts:\n{}",
+            inspection.run.run_id,
+            inspection.run.flow_id,
+            inspection.run.step_id,
+            inspection.run.status,
+            format_run_attempt_records(&inspection.attempts)
+        ))
+    }
 }
 
 fn logs_command<I>(args: I) -> Result<String, CliError>
@@ -1194,6 +1256,12 @@ struct CachePruneOptions {
     older_than_seconds: Option<u64>,
 }
 
+#[derive(Debug, Default)]
+struct RunsListOptions {
+    project: ProjectOptions,
+    flow_id: Option<String>,
+}
+
 #[derive(Debug)]
 struct ImportOptions {
     project_path: Option<PathBuf>,
@@ -1651,6 +1719,38 @@ where
     Ok(options)
 }
 
+fn parse_runs_list_options<I>(args: I) -> Result<RunsListOptions, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut options = RunsListOptions::default();
+    let mut args = args.into_iter();
+
+    while let Some(arg) = next_arg(&mut args)? {
+        match arg.as_str() {
+            "--path" => {
+                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
+            }
+            "--json" => {
+                options.project.json = true;
+            }
+            "--flow" => {
+                options.flow_id = Some(require_value("--flow", &mut args)?);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
+            }
+            _ => {
+                return Err(CliError::InvalidArgument(format!(
+                    "runs list does not accept positional argument: {arg}"
+                )));
+            }
+        }
+    }
+
+    Ok(options)
+}
+
 fn parse_project_options<I>(args: I, allow_name: bool) -> Result<ProjectOptions, CliError>
 where
     I: IntoIterator<Item = OsString>,
@@ -1935,6 +2035,17 @@ fn optional_json_i64(value: Option<i64>) -> String {
     value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
 
+fn optional_json_i32(value: Option<i32>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn optional_json_path(value: Option<&PathBuf>) -> String {
+    value.map_or_else(
+        || "null".to_string(),
+        |value| format!("\"{}\"", escape_json(&value.display().to_string())),
+    )
+}
+
 fn cache_entries_json(entries: &[agentflow_core::runtime::CacheEntrySummary]) -> String {
     let entries = entries
         .iter()
@@ -1953,6 +2064,106 @@ fn cache_entries_json(entries: &[agentflow_core::runtime::CacheEntrySummary]) ->
     format!("{{\"schema_version\":\"agentflow.cache_entries.v0\",\"entries\":[{entries}]}}")
 }
 
+fn runs_json(runs: &[agentflow_core::runtime::RunRecordSummary]) -> String {
+    let runs = runs
+        .iter()
+        .map(run_summary_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"schema_version\":\"agentflow.runs.v0\",\"runs\":[{runs}]}}")
+}
+
+fn run_inspection_json(inspection: &agentflow_core::runtime::RunInspection) -> String {
+    let attempts = inspection
+        .attempts
+        .iter()
+        .map(run_attempt_record_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"schema_version\":\"agentflow.run_inspection.v0\",\"run\":{},\"attempts\":[{}]}}",
+        run_summary_json(&inspection.run),
+        attempts
+    )
+}
+
+fn run_summary_json(run: &agentflow_core::runtime::RunRecordSummary) -> String {
+    format!(
+        "{{\"run_id\":\"{}\",\"flow_id\":\"{}\",\"step_id\":\"{}\",\"status\":\"{}\",\"attempt_count\":{},\"latest_attempt_id\":{},\"cache_key\":{},\"created_at\":{},\"updated_at\":{}}}",
+        escape_json(&run.run_id),
+        escape_json(&run.flow_id),
+        escape_json(&run.step_id),
+        escape_json(&run.status),
+        run.attempt_count,
+        optional_json_string(run.latest_attempt_id.as_deref()),
+        optional_json_string(run.cache_key.as_deref()),
+        run.created_at,
+        run.updated_at
+    )
+}
+
+fn run_attempt_record_json(attempt: &agentflow_core::runtime::RunAttemptRecord) -> String {
+    format!(
+        "{{\"attempt_id\":\"{}\",\"run_id\":\"{}\",\"attempt\":{},\"status\":\"{}\",\"workdir\":{},\"started_at\":{},\"ended_at\":{},\"exit_code\":{},\"stdout_path\":{},\"stderr_path\":{},\"error_class\":{},\"error_message\":{}}}",
+        escape_json(&attempt.attempt_id),
+        escape_json(&attempt.run_id),
+        attempt.attempt,
+        escape_json(&attempt.status),
+        optional_json_path(attempt.workdir.as_ref()),
+        optional_json_i64(attempt.started_at),
+        optional_json_i64(attempt.ended_at),
+        optional_json_i32(attempt.exit_code),
+        optional_json_path(attempt.stdout_path.as_ref()),
+        optional_json_path(attempt.stderr_path.as_ref()),
+        optional_json_string(attempt.error_class.as_deref()),
+        optional_json_string(attempt.error_message.as_deref())
+    )
+}
+
+fn format_runs(runs: &[agentflow_core::runtime::RunRecordSummary]) -> String {
+    runs.iter()
+        .map(|run| {
+            format!(
+                "{} {} {} [{}] attempts:{} latest:{}",
+                run.run_id,
+                run.flow_id,
+                run.step_id,
+                run.status,
+                run.attempt_count,
+                run.latest_attempt_id.as_deref().unwrap_or("none")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_run_attempt_records(attempts: &[agentflow_core::runtime::RunAttemptRecord]) -> String {
+    if attempts.is_empty() {
+        return "_none_".to_string();
+    }
+    attempts
+        .iter()
+        .map(|attempt| {
+            format!(
+                "{} #{} [{}] exit:{} workdir:{}",
+                attempt.attempt_id,
+                attempt.attempt,
+                attempt.status,
+                attempt
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                attempt
+                    .workdir
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn format_attempts(attempts: &[agentflow_core::runtime::AttemptSummary]) -> String {
     if attempts.is_empty() {
         return "_none_".to_string();
@@ -1962,8 +2173,9 @@ fn format_attempts(attempts: &[agentflow_core::runtime::AttemptSummary]) -> Stri
         .iter()
         .map(|attempt| {
             format!(
-                "{} {} [{}] {}",
+                "{} {} {} [{}] {}",
                 attempt.attempt_id,
+                attempt.run_id,
                 attempt.step_id,
                 attempt.status,
                 attempt.workdir.display()
@@ -2262,6 +2474,8 @@ steps:
         assert!(output.contains("agentflow patch apply <patch-id> [--json] [--path <path>]"));
         assert!(output.contains("agentflow compare steps <flow-id>"));
         assert!(output.contains("agentflow compare metrics <flow-id>"));
+        assert!(output.contains("agentflow runs list [--flow <flow-id>]"));
+        assert!(output.contains("agentflow runs inspect <run-or-attempt-id>"));
     }
 
     #[test]
@@ -3439,6 +3653,51 @@ runtime:
             .find(|line| line.starts_with("attempt_"))
             .and_then(|line| line.split_whitespace().next())
             .unwrap();
+        let run_id = run_output
+            .lines()
+            .find(|line| line.starts_with("attempt_"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap();
+
+        let runs = run(args(&[
+            "agentflow",
+            "runs",
+            "list",
+            "--flow",
+            "marker_demo",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(runs.contains("\"schema_version\":\"agentflow.runs.v0\""));
+        assert!(runs.contains("\"status\":\"completed\""));
+        assert!(runs.contains("\"attempt_count\":1"));
+
+        let run_inspect = run(args(&[
+            "agentflow",
+            "runs",
+            "inspect",
+            run_id,
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(run_inspect.contains("\"schema_version\":\"agentflow.run_inspection.v0\""));
+        assert!(run_inspect.contains("\"status\":\"succeeded\""));
+
+        let attempt_inspect = run(args(&[
+            "agentflow",
+            "runs",
+            "inspect",
+            attempt_id,
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(attempt_inspect.contains("Run: run_"));
+        assert!(attempt_inspect.contains("[succeeded]"));
 
         let logs = run(args(&[
             "agentflow",

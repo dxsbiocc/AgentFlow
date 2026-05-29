@@ -59,8 +59,9 @@ cargo run -q -p agentflow-cli -- report marker_demo --path "$AF_DEMO"
 - Execution: approved local DAG execution with `run`
 - Targeted execution: `run-step` with dependency gating
 - Retry: `retry` for failed steps while preserving attempt history
+- Run management visibility: `runs list`, `runs inspect`, and `logs`
 - Cache/resume slice: deterministic cache keys, cache-hit restore, `cache explain`, cache inventory, and explicit cache prune
-- Logs and reports: `logs`, Markdown `report`
+- Reports: Markdown `report`
 - Observation/state layer: `observe`, `observations *`, `research *`, `patch *`, `compare *`
 - Runtime-connected output observation for declared observers such as `marker_report`
 - Deterministic table-oriented validation for `required_columns` and `min_rows`
@@ -100,6 +101,7 @@ For the demo flow, also verify:
 ```bash
 cargo run -q -p agentflow-cli -- status --json --path "$AF_DEMO"
 cargo run -q -p agentflow-cli -- logs run_attempt_... --path "$AF_DEMO"
+cargo run -q -p agentflow-cli -- runs list --flow marker_demo --json --path "$AF_DEMO"
 cargo run -q -p agentflow-cli -- artifacts list --json --path "$AF_DEMO"
 cargo run -q -p agentflow-cli -- observations list --json --path "$AF_DEMO"
 cargo run -q -p agentflow-cli -- cache explain marker_demo.scan --path "$AF_DEMO"

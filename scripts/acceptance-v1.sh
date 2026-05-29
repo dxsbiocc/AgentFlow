@@ -41,8 +41,18 @@ run_output="$(cargo run -q -p agentflow-cli -- run marker_demo --path "$DEMO_DIR
 printf '%s\n' "$run_output" | grep -q 'Completed steps: 1'
 printf '%s\n' "$run_output" | grep -q 'Failed steps: 0'
 printf '%s\n' "$run_output" | grep -q ' \[succeeded\] '
+run_attempt_id="$(printf '%s\n' "$run_output" | awk '/^attempt_/ {print $1; exit}')"
+run_id="$(printf '%s\n' "$run_output" | awk '/^attempt_/ {print $2; exit}')"
+
+if [[ -z "$run_attempt_id" || -z "$run_id" ]]; then
+  echo "failed to extract run ids" >&2
+  exit 1
+fi
 
 cargo run -q -p agentflow-cli -- status --json --path "$DEMO_DIR" | grep -q '"run_attempts":1'
+cargo run -q -p agentflow-cli -- runs list --flow marker_demo --json --path "$DEMO_DIR" | grep -q '"schema_version":"agentflow.runs.v0"'
+cargo run -q -p agentflow-cli -- runs inspect "$run_id" --json --path "$DEMO_DIR" | grep -q '"schema_version":"agentflow.run_inspection.v0"'
+cargo run -q -p agentflow-cli -- runs inspect "$run_attempt_id" --path "$DEMO_DIR" | grep -q '\[succeeded\]'
 cargo run -q -p agentflow-cli -- artifacts list --json --path "$DEMO_DIR" | grep -q '"kind":"computed"'
 cargo run -q -p agentflow-cli -- observations list --json --path "$DEMO_DIR" | grep -q '"kind":"marker_report"'
 cargo run -q -p agentflow-cli -- report marker_demo --path "$DEMO_DIR" | grep -q 'marker_report'

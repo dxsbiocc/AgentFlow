@@ -64,7 +64,7 @@ cargo run -q -p agentflow-cli -- report marker_demo --path "$AF_DEMO"
 - Reports: Markdown `report`
 - Observation/state layer: `observe`, `observations *`, `research *`, `patch *`, `compare *`
 - Runtime-connected output observation for declared observers such as `marker_report`
-- Deterministic table-oriented validation for `required_columns`, `min_rows`, and cross-input `sample_id_column`
+- Deterministic table-oriented validation for `required_columns`, `min_rows`, cross-input `sample_id_column`, input `profile`, and tool-level `validator_profile`
 - Local runtime timeout control through `runtime.timeout_seconds`
 
 ## Explicitly Not Supported Yet
@@ -72,7 +72,7 @@ cargo run -q -p agentflow-cli -- report marker_demo --path "$AF_DEMO"
 - Agent planning, tool recommendation, or autonomous graph authoring
 - Remote execution backends such as Conda, Docker, Singularity, or SLURM
 - Parallel scheduler execution or cancellation controls
-- Rich semantic validators such as schema profiles, file signatures, and domain-specific QC policies
+- Rich semantic validators such as file signatures, domain-specific QC policies, and pluggable validator registries
 - Full graph-branch lifecycle such as delete, merge, rollback, supersede, or decision-node management
 - Cache eviction policy beyond explicit `--all` and `--older-than-seconds` pruning
 - JSON/HTML report export or persisted report artifacts

@@ -19,6 +19,7 @@ pub struct ToolSpec {
     pub version: String,
     pub maturity: ToolMaturity,
     pub description: String,
+    pub validator_profile: Option<String>,
     pub inputs: BTreeMap<String, ToolPortSpec>,
     pub params: BTreeMap<String, ToolParamSpec>,
     pub outputs: BTreeMap<String, ToolPortSpec>,
@@ -31,6 +32,7 @@ pub struct ToolPortSpec {
     pub type_name: String,
     pub required: bool,
     pub observer: Option<String>,
+    pub profile: Option<String>,
     pub min_rows: Option<usize>,
     pub required_columns: Vec<String>,
     pub sample_id_column: Option<String>,
@@ -87,7 +89,13 @@ impl ToolSpec {
         validate_ref_part("namespace", &namespace)?;
         validate_ref_part("name", &name)?;
         validate_ref_part("version", &version)?;
-        let executable = parse_executable_sections(source_text)?;
+        let validator_profile = fields.get("validator_profile").cloned();
+        if let Some(profile) = validator_profile.as_deref() {
+            validate_validator_profile(profile)?;
+        }
+        let mut executable = parse_executable_sections(source_text)?;
+        apply_tool_validator_profile(validator_profile.as_deref(), &mut executable.inputs)?;
+        apply_input_profiles(&mut executable.inputs)?;
         executable.validate()?;
 
         Ok(Self {
@@ -97,6 +105,7 @@ impl ToolSpec {
             version,
             maturity,
             description,
+            validator_profile,
             inputs: executable.inputs,
             params: executable.params,
             outputs: executable.outputs,
@@ -132,8 +141,10 @@ impl ToolSpec {
                 "\"version\":\"{}\",",
                 "\"maturity\":\"{}\",",
                 "\"description\":\"{}\",",
+                "\"validator_profile\":{},",
                 "\"input_types\":{},",
                 "\"required_inputs\":{},",
+                "\"input_profiles\":{},",
                 "\"param_types\":{},",
                 "\"required_params\":{},",
                 "\"output_types\":{},",
@@ -156,8 +167,10 @@ impl ToolSpec {
             escape_json(&self.version),
             self.maturity,
             escape_json(&self.description),
+            optional_string_json(self.validator_profile.as_deref()),
             type_map_json(&self.inputs),
             string_array_json(&required_inputs),
+            profile_map_json(&self.inputs),
             param_type_map_json(&self.params),
             string_array_json(
                 &self
@@ -611,6 +624,7 @@ fn parse_executable_sections(source_text: &str) -> Result<ParsedExecutableSectio
                                 type_name: String::new(),
                                 required: true,
                                 observer: None,
+                                profile: None,
                                 min_rows: None,
                                 required_columns: Vec::new(),
                                 sample_id_column: None,
@@ -621,6 +635,7 @@ fn parse_executable_sections(source_text: &str) -> Result<ParsedExecutableSectio
                                 type_name: String::new(),
                                 required: true,
                                 observer: None,
+                                profile: None,
                                 min_rows: None,
                                 required_columns: Vec::new(),
                                 sample_id_column: None,
@@ -738,6 +753,10 @@ fn set_tool_item_field(
                         "observer is only supported on output ports".to_string(),
                     ));
                 }
+                "profile" => {
+                    validate_input_profile(&value)?;
+                    port.profile = Some(value);
+                }
                 "min_rows" => port.min_rows = Some(parse_usize_field("min_rows", &value)?),
                 "required_columns" => port.required_columns = parse_columns(&value)?,
                 "sample_id_column" => port.sample_id_column = Some(parse_column_name(&value)?),
@@ -758,6 +777,11 @@ fn set_tool_item_field(
                 "observer" => {
                     validate_observer_adapter(&value)?;
                     port.observer = Some(value);
+                }
+                "profile" => {
+                    return Err(StorageError::InvalidInput(
+                        "profile is only supported on input ports".to_string(),
+                    ));
                 }
                 "min_rows" => port.min_rows = Some(parse_usize_field("min_rows", &value)?),
                 "required_columns" => port.required_columns = parse_columns(&value)?,
@@ -848,6 +872,132 @@ fn parse_column_name_with_label(label: &str, value: &str) -> Result<String, Stor
     Ok(value.to_string())
 }
 
+fn apply_tool_validator_profile(
+    profile: Option<&str>,
+    inputs: &mut BTreeMap<String, ToolPortSpec>,
+) -> Result<(), StorageError> {
+    match profile {
+        None => Ok(()),
+        Some("paired_expression_survival_v0") => {
+            let expression = inputs.get_mut("expression_table").ok_or_else(|| {
+                StorageError::InvalidInput(
+                    "validator_profile paired_expression_survival_v0 requires input expression_table"
+                        .to_string(),
+                )
+            })?;
+            ensure_profile(
+                "expression_table",
+                expression,
+                "expression_table_v0",
+                "paired_expression_survival_v0",
+            )?;
+            let survival = inputs.get_mut("survival_table").ok_or_else(|| {
+                StorageError::InvalidInput(
+                    "validator_profile paired_expression_survival_v0 requires input survival_table"
+                        .to_string(),
+                )
+            })?;
+            ensure_profile(
+                "survival_table",
+                survival,
+                "survival_table_v0",
+                "paired_expression_survival_v0",
+            )?;
+            Ok(())
+        }
+        Some(profile) => Err(StorageError::InvalidInput(format!(
+            "unsupported validator_profile {profile}"
+        ))),
+    }
+}
+
+fn ensure_profile(
+    input_name: &str,
+    port: &mut ToolPortSpec,
+    expected_profile: &str,
+    validator_profile: &str,
+) -> Result<(), StorageError> {
+    match port.profile.as_deref() {
+        Some(profile) if profile == expected_profile => Ok(()),
+        Some(profile) => Err(StorageError::InvalidInput(format!(
+            "validator_profile {validator_profile} requires input {input_name} profile {expected_profile}, got {profile}"
+        ))),
+        None => {
+            port.profile = Some(expected_profile.to_string());
+            Ok(())
+        }
+    }
+}
+
+fn apply_input_profiles(inputs: &mut BTreeMap<String, ToolPortSpec>) -> Result<(), StorageError> {
+    for port in inputs.values_mut() {
+        let Some(profile) = port.profile.clone() else {
+            continue;
+        };
+        let defaults = input_profile_defaults(&profile)?;
+        if port.type_name.trim().is_empty() {
+            port.type_name = defaults.type_name.to_string();
+        }
+        if port.min_rows.is_none() {
+            port.min_rows = Some(defaults.min_rows);
+        }
+        if port.required_columns.is_empty() {
+            port.required_columns = defaults
+                .required_columns
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect();
+        }
+        if port.sample_id_column.is_none() {
+            port.sample_id_column = Some(defaults.sample_id_column.to_string());
+        }
+    }
+    Ok(())
+}
+
+struct InputProfileDefaults {
+    type_name: &'static str,
+    min_rows: usize,
+    required_columns: &'static [&'static str],
+    sample_id_column: &'static str,
+}
+
+fn input_profile_defaults(profile: &str) -> Result<InputProfileDefaults, StorageError> {
+    match profile {
+        "expression_table_v0" => Ok(InputProfileDefaults {
+            type_name: "TSV",
+            min_rows: 1,
+            required_columns: &["sample"],
+            sample_id_column: "sample",
+        }),
+        "survival_table_v0" => Ok(InputProfileDefaults {
+            type_name: "TSV",
+            min_rows: 1,
+            required_columns: &["sample", "time", "status"],
+            sample_id_column: "sample",
+        }),
+        other => Err(StorageError::InvalidInput(format!(
+            "unsupported input profile {other}"
+        ))),
+    }
+}
+
+fn validate_validator_profile(profile: &str) -> Result<(), StorageError> {
+    validate_ref_part("validator_profile", profile)?;
+    if profile == "paired_expression_survival_v0" {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidInput(format!(
+            "unsupported validator_profile {profile}"
+        )))
+    }
+}
+
+fn validate_input_profile(profile: &str) -> Result<(), StorageError> {
+    validate_ref_part("input profile", profile)?;
+    input_profile_defaults(profile).map(|_| ())
+}
+
 fn validate_ports(label: &str, ports: &BTreeMap<String, ToolPortSpec>) -> Result<(), StorageError> {
     for (name, port) in ports {
         validate_ref_part(&format!("{label} name"), name)?;
@@ -855,6 +1005,14 @@ fn validate_ports(label: &str, ports: &BTreeMap<String, ToolPortSpec>) -> Result
             return Err(StorageError::InvalidInput(format!(
                 "{label} {name} must declare type"
             )));
+        }
+        if let Some(profile) = port.profile.as_deref() {
+            if label != "input" {
+                return Err(StorageError::InvalidInput(format!(
+                    "{label} {name} must not declare profile"
+                )));
+            }
+            validate_input_profile(profile)?;
         }
         if let Some(observer) = port.observer.as_deref() {
             if label != "output" {
@@ -929,6 +1087,7 @@ fn executable_from_stored_json(
     let required_inputs = extract_string_array(spec_json, "required_inputs")?
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
+    let input_profiles = extract_optional_string_map(spec_json, "input_profiles")?;
     let param_types = extract_string_map(spec_json, "param_types")?;
     let required_params = extract_string_array(spec_json, "required_params")?
         .into_iter()
@@ -955,12 +1114,14 @@ fn executable_from_stored_json(
             let min_rows = stored_min_rows(&input_min_rows, &name)?;
             let required_columns = stored_columns(&input_required_columns, &name)?;
             let sample_id_column = stored_sample_id_column(&input_sample_id_columns, &name)?;
+            let profile = input_profiles.get(&name).cloned();
             Ok((
                 name,
                 ToolPortSpec {
                     type_name,
                     required,
                     observer: None,
+                    profile,
                     min_rows,
                     required_columns,
                     sample_id_column,
@@ -993,6 +1154,7 @@ fn executable_from_stored_json(
                     type_name,
                     required: true,
                     observer,
+                    profile: None,
                     min_rows,
                     required_columns,
                     sample_id_column: None,
@@ -1093,6 +1255,19 @@ fn observer_map_json(map: &BTreeMap<String, ToolPortSpec>) -> String {
     format!("{{{fields}}}")
 }
 
+fn profile_map_json(map: &BTreeMap<String, ToolPortSpec>) -> String {
+    let fields = map
+        .iter()
+        .filter_map(|(name, port)| {
+            port.profile
+                .as_ref()
+                .map(|profile| format!("\"{}\":\"{}\"", escape_json(name), escape_json(profile)))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{fields}}}")
+}
+
 fn min_rows_map_json(map: &BTreeMap<String, ToolPortSpec>) -> String {
     let fields = map
         .iter()
@@ -1161,6 +1336,12 @@ fn string_array_json(values: &[&str]) -> String {
 fn optional_u64_json(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn optional_string_json(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("\"{}\"", escape_json(value)))
         .unwrap_or_else(|| "null".to_string())
 }
 
@@ -1584,6 +1765,215 @@ runtime:
         assert_eq!(spec.outputs["report"].min_rows, Some(3));
         assert!(spec.stored_json().contains("\"input_required_columns\""));
         assert!(spec.stored_json().contains("\"input_sample_id_columns\""));
+    }
+
+    #[test]
+    fn input_profile_expands_defaults_without_repeating_fields() {
+        let spec = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: profiled_expression
+version: 0.1.0
+maturity: wrapped
+description: Profile-backed expression table
+inputs:
+  expression_table:
+    profile: expression_table_v0
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap();
+
+        let input = &spec.inputs["expression_table"];
+        assert_eq!(input.profile.as_deref(), Some("expression_table_v0"));
+        assert_eq!(input.type_name, "TSV");
+        assert_eq!(input.min_rows, Some(1));
+        assert_eq!(input.required_columns, ["sample".to_string()]);
+        assert_eq!(input.sample_id_column.as_deref(), Some("sample"));
+        assert!(spec.stored_json().contains("\"input_profiles\""));
+
+        let path = temp_project_path("input-profile-roundtrip");
+        let store = ProjectStore::init(&path, Some("Tools")).unwrap();
+        store.register_tool(spec).unwrap();
+        let executable = store.executable_tool("local/profiled_expression").unwrap();
+        let input = &executable.inputs["expression_table"];
+        assert_eq!(input.profile.as_deref(), Some("expression_table_v0"));
+        assert_eq!(input.type_name, "TSV");
+        assert_eq!(input.min_rows, Some(1));
+        assert_eq!(input.required_columns, ["sample".to_string()]);
+        assert_eq!(input.sample_id_column.as_deref(), Some("sample"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn explicit_profile_fields_override_defaults() {
+        let spec = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: profiled_expression
+version: 0.1.0
+maturity: wrapped
+description: Profile-backed expression table with explicit overrides
+inputs:
+  expression_table:
+    profile: expression_table_v0
+    required_columns: sample,TP53
+    min_rows: 2
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap();
+
+        let input = &spec.inputs["expression_table"];
+        assert_eq!(input.profile.as_deref(), Some("expression_table_v0"));
+        assert_eq!(input.type_name, "TSV");
+        assert_eq!(input.min_rows, Some(2));
+        assert_eq!(
+            input.required_columns,
+            ["sample".to_string(), "TP53".to_string()]
+        );
+        assert_eq!(input.sample_id_column.as_deref(), Some("sample"));
+    }
+
+    #[test]
+    fn tool_validator_profile_applies_paired_expression_survival_defaults() {
+        let spec = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: paired_scan
+version: 0.1.0
+maturity: wrapped
+description: Paired expression and survival analysis
+validator_profile: paired_expression_survival_v0
+inputs:
+  expression_table:
+  survival_table:
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.validator_profile.as_deref(),
+            Some("paired_expression_survival_v0")
+        );
+        let expression = &spec.inputs["expression_table"];
+        assert_eq!(expression.profile.as_deref(), Some("expression_table_v0"));
+        assert_eq!(expression.type_name, "TSV");
+        assert_eq!(expression.required_columns, ["sample".to_string()]);
+        assert_eq!(expression.sample_id_column.as_deref(), Some("sample"));
+
+        let survival = &spec.inputs["survival_table"];
+        assert_eq!(survival.profile.as_deref(), Some("survival_table_v0"));
+        assert_eq!(survival.type_name, "TSV");
+        assert_eq!(
+            survival.required_columns,
+            [
+                "sample".to_string(),
+                "time".to_string(),
+                "status".to_string()
+            ]
+        );
+        assert_eq!(survival.sample_id_column.as_deref(), Some("sample"));
+    }
+
+    #[test]
+    fn rejects_unknown_input_profile() {
+        let err = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: bad_profile
+version: 0.1.0
+maturity: wrapped
+description: bad
+inputs:
+  table:
+    profile: unknown_table_v0
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unsupported input profile"));
+    }
+
+    #[test]
+    fn rejects_unknown_validator_profile() {
+        let err = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: bad_validator_profile
+version: 0.1.0
+maturity: wrapped
+description: bad
+validator_profile: magic_validator_v0
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unsupported validator_profile"));
+    }
+
+    #[test]
+    fn rejects_conflicting_input_profile_for_tool_validator_profile() {
+        let err = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: conflicting_validator_profile
+version: 0.1.0
+maturity: wrapped
+description: bad
+validator_profile: paired_expression_survival_v0
+inputs:
+  expression_table:
+    profile: survival_table_v0
+  survival_table:
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("requires input expression_table profile"));
     }
 
     #[test]

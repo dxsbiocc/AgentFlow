@@ -48,7 +48,7 @@ Manual evidence already recorded in `docs/status/v1-usable-slice-status.md`:
 | Workspace/crate foundation | Complete for MVP | 90% | Independent Rust workspace with CLI/core/schemas and no Omiga dependency. |
 | Project storage | Complete for MVP | 85% | SQLite project DB, migrations, summary, event append. |
 | CLI basics | Complete for MVP | 90% | `init`, `status`, `doctor`, help/version, path handling, observations, research notes, graph patch approvals/apply, branch comparisons. |
-| Tool registry | Partial | 70% | Registers executable tool specs, validates argv contract, and supports output observer plus simple port validator metadata. No tool search, promote, catalog, or progressive disclosure. |
+| Tool registry | Partial | 72% | Registers executable tool specs, validates argv contract, and supports output observer plus port validator metadata with built-in profile defaults. No tool search, promote, catalog, or progressive disclosure. |
 | Artifact registry | Complete for MVP | 80% | Reference/copy import, computed artifact registration, list/inspect. No semantic artifact validation yet. |
 | Static flow graph | Complete for MVP | 88% | Parse/validate/approve/inspect works for static DAGs. Approved graph patches can now materialize constrained add_step/add_edge changes and update step params in the executable DAG. |
 | Runtime scheduler | Complete for MVP | 82% | Sequential ready-step DAG execution works, targeted `run-step` execution is dependency-gated, declared validators gate inputs/outputs, and declared output observers run after successful execution or cache restore. No parallelism, cancellation, or advanced resume. |
@@ -58,7 +58,7 @@ Manual evidence already recorded in `docs/status/v1-usable-slice-status.md`:
 | Retry and partial replay | Partial | 68% | Failed-step retry works and preserves history. Targeted `run-step` can execute draft/ready/failed steps once dependencies are complete and rejects completed-step reruns. `update_params` patches invalidate the target and downstream steps for replay. No retry policy, max attempts, or richer replay policy. |
 | Logs/status | Complete for MVP | 80% | Attempt/run log reading and status counts work. Status remains coarse. |
 | Report | Baseline complete | 70% | Markdown report generated from persisted evidence, including observations, graph patches, branch comparisons, and research notes. No persisted report artifact, JSON/HTML export, citation model, or redaction. |
-| Validators | Partial | 65% | Tool port validation, required input/param checks, output non-empty/path containment, declarative `min_rows`/`required_columns` checks, and cross-input `sample_id_column` checks. No richer schema profiles, QC policy packs, or pluggable validator registry yet. |
+| Validators | Partial | 70% | Tool port validation, required input/param checks, output non-empty/path containment, declarative `min_rows`/`required_columns`, cross-input `sample_id_column`, and built-in table profile defaults. No QC policy packs, file signatures, or pluggable validator registry yet. |
 | Observer layer | Partial | 60% | Generic artifact summary observations, simple scalar metric extraction, a first `marker_report` adapter, and tool-declared postflight observation are persisted and available through CLI/runtime. No general observer registry, QC inspectors, figure/data interpretation, or adapter selection policy yet. |
 | Agent planning layer | Missing | 0% | No goal-to-draft planner, failure explainer, tool recommender, or graph patch proposer. |
 | Research Mode | Seed state only | 20% | Manual research notes with confidence and source context are persisted. No source adapters, literature search, citation tracking, tool-gap workflow, or anti-self-deception critique loop. |
@@ -96,7 +96,7 @@ Manual evidence already recorded in `docs/status/v1-usable-slice-status.md`:
    - richer computed comparison metrics from tool-specific observer summaries
 
 3. Add richer validators and observer adapters:
-   - schema profiles and domain QC validators
+   - domain QC validators, file signatures, and additional schema profiles
    - tool-specific observer adapter selection policy
    - richer report rendering for observation payloads
 

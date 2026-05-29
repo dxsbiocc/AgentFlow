@@ -18,7 +18,7 @@ Implemented foundation:
 - Targeted execution first slice: `run-step` can execute a selected draft/ready/failed step after dependency completion and rejects completed-step reruns.
 - Output interpretation first slice: generic artifact observations plus a `marker_report` adapter that extracts gene/score-style evidence.
 - Runtime-connected output observations: tool outputs can declare `observer: marker_report`, and runtime records observations after successful execution or cache restore.
-- Deterministic port validators: tool inputs and outputs can declare `min_rows` and `required_columns`; inputs can also declare `sample_id_column` for cross-input sample identity checks before command execution.
+- Deterministic port validators: tool inputs and outputs can declare `min_rows` and `required_columns`; inputs can also declare `sample_id_column` for cross-input sample identity checks, built-in input `profile` defaults, and the paired expression/survival `validator_profile` before command execution.
 
 Current verification:
 
@@ -51,7 +51,7 @@ Current behavior:
 Missing behavior:
 
 - Reports include automatic observations, but do not yet render observer payloads in a domain-specific way.
-- Validator coverage is still intentionally narrow: line-oriented `min_rows`/`required_columns` plus cross-input `sample_id_column`.
+- Validator coverage is still intentionally narrow: line-oriented `min_rows`/`required_columns`, cross-input `sample_id_column`, and built-in table profile defaults.
 - Targeted execution can now replay parameter changes after `update_params` invalidates the target and downstream steps.
 
 Other important gaps remain:
@@ -107,7 +107,8 @@ outputs:
 
 5. Added validator behavior:
 
-- Inputs can declare `required_columns`, `min_rows`, and `sample_id_column`.
+- Inputs can declare `required_columns`, `min_rows`, `sample_id_column`, and built-in table `profile` values.
+- Tools can declare `validator_profile: paired_expression_survival_v0` to apply expression/survival input defaults without repeating them.
 - Outputs can declare `required_columns` and `min_rows`.
 - Input validators run before command execution.
 - Output validators run before computed artifacts are published.
@@ -142,7 +143,7 @@ The next highest-value steps are now:
 
 1. Add better partial branch replay/status/report controls after graph changes.
 2. Add branch labels and explicit decision nodes around graph patches.
-3. Add richer validator profiles: file signature, schema profiles, empty-result policies, domain QC policies.
+3. Add richer validator profiles: file signature checks, additional schema profiles, empty-result policies, domain QC policies.
 4. Add Conda/micromamba backend for real scientific environments.
 5. Add a small planner/failure-explainer Agent layer that only proposes graph patches from existing observations, logs, tools, and research notes.
 

@@ -73,7 +73,7 @@ Observed results:
 - Phase 2 Research Mode is manual note state only; no network/literature/tool search is implemented.
 - Graph patch materialization is limited to approved `add_step`, constrained `add_edge`, and `update_params` with downstream status invalidation.
 - Branch comparisons can be recorded manually or from simple observed scalar metrics; `marker_report` adds a first domain-oriented adapter, but domain-specific statistical comparison is not implemented yet.
-- Validator metadata includes line-oriented `min_rows`/`required_columns` plus cross-input `sample_id_column`; richer schema profiles and QC policies are future work.
+- Validator metadata includes line-oriented `min_rows`/`required_columns`, cross-input `sample_id_column`, built-in input `profile` defaults, and a first paired expression/survival `validator_profile`; richer QC policies are future work.
 - Richer cache miss diagnostics and storage lifecycle policy are future work.
 - Report is Markdown-only; JSON/HTML/export artifacts are future work.
 - Execution sandboxing is still local-process based; Docker/Conda/Singularity backends are future work.

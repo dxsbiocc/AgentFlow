@@ -49,6 +49,10 @@ pub struct ToolRuntimeSpec {
     pub backend: String,
     pub command: Vec<String>,
     pub timeout_seconds: Option<u64>,
+    pub env_name: Option<String>,
+    pub env_prefix: Option<String>,
+    pub env_file: Option<String>,
+    pub runner: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +161,10 @@ impl ToolSpec {
                 "\"runtime_backend\":\"{}\",",
                 "\"runtime_command\":{},",
                 "\"runtime_timeout_seconds\":{},",
+                "\"runtime_env_name\":{},",
+                "\"runtime_env_prefix\":{},",
+                "\"runtime_env_file\":{},",
+                "\"runtime_runner\":{},",
                 "\"source_format\":\"{}\",",
                 "\"source_text\":\"{}\"",
                 "}}"
@@ -196,6 +204,10 @@ impl ToolSpec {
                     .collect::<Vec<_>>()
             ),
             optional_u64_json(self.runtime.timeout_seconds),
+            optional_string_json(self.runtime.env_name.as_deref()),
+            optional_string_json(self.runtime.env_prefix.as_deref()),
+            optional_string_json(self.runtime.env_file.as_deref()),
+            optional_string_json(self.runtime.runner.as_deref()),
             SIMPLE_YAML_SOURCE_FORMAT,
             escape_json(&self.source_text)
         )
@@ -216,18 +228,13 @@ impl ParsedExecutableSections {
                 "tool spec must declare at least one output".to_string(),
             ));
         }
-        if self.runtime.backend != "local" {
-            return Err(StorageError::InvalidInput(
-                "V0 runtime.backend must be local".to_string(),
-            ));
-        }
+        validate_runtime_backend(&self.runtime)?;
         if self.runtime.command.is_empty() {
             return Err(StorageError::InvalidInput(
                 "tool spec runtime.command must contain at least one argv entry".to_string(),
             ));
         }
-        let executable = Path::new(&self.runtime.command[0]);
-        if !executable.is_absolute() {
+        if self.runtime.backend == "local" && !Path::new(&self.runtime.command[0]).is_absolute() {
             return Err(StorageError::InvalidInput(
                 "runtime.command[0] must be an absolute executable path".to_string(),
             ));
@@ -581,6 +588,10 @@ fn parse_executable_sections(source_text: &str) -> Result<ParsedExecutableSectio
         backend: String::new(),
         command: Vec::new(),
         timeout_seconds: None,
+        env_name: None,
+        env_prefix: None,
+        env_file: None,
+        runner: None,
     };
     let mut section: Option<String> = None;
     let mut item: Option<String> = None;
@@ -699,6 +710,25 @@ fn parse_executable_sections(source_text: &str) -> Result<ParsedExecutableSectio
                                 "runtime.timeout_seconds",
                                 &normalize_scalar(value.trim()),
                             )?);
+                            in_runtime_command = false;
+                        }
+                        "env_name" => {
+                            runtime.env_name =
+                                Some(parse_runtime_string("runtime.env_name", value)?);
+                            in_runtime_command = false;
+                        }
+                        "env_prefix" => {
+                            runtime.env_prefix =
+                                Some(parse_runtime_string("runtime.env_prefix", value)?);
+                            in_runtime_command = false;
+                        }
+                        "env_file" => {
+                            runtime.env_file =
+                                Some(parse_runtime_string("runtime.env_file", value)?);
+                            in_runtime_command = false;
+                        }
+                        "runner" => {
+                            runtime.runner = Some(parse_runtime_string("runtime.runner", value)?);
                             in_runtime_command = false;
                         }
                         other => {
@@ -1078,6 +1108,80 @@ fn parse_u64_field(field_name: &str, value: &str) -> Result<u64, StorageError> {
     Ok(parsed)
 }
 
+fn parse_runtime_string(field_name: &str, value: &str) -> Result<String, StorageError> {
+    let value = normalize_scalar(value.trim());
+    if value.trim().is_empty() || value.contains('\n') || value.contains('\0') {
+        return Err(StorageError::InvalidInput(format!(
+            "{field_name} must be non-empty single-line text"
+        )));
+    }
+    Ok(value)
+}
+
+fn validate_runtime_backend(runtime: &ToolRuntimeSpec) -> Result<(), StorageError> {
+    match runtime.backend.as_str() {
+        "local" => {
+            if runtime.env_name.is_some()
+                || runtime.env_prefix.is_some()
+                || runtime.env_file.is_some()
+                || runtime.runner.is_some()
+            {
+                return Err(StorageError::InvalidInput(
+                    "local runtime must not declare env_name, env_prefix, env_file, or runner"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "conda" | "micromamba" => {
+            match (runtime.env_name.as_deref(), runtime.env_prefix.as_deref()) {
+                (Some(_), Some(_)) => {
+                    return Err(StorageError::InvalidInput(
+                        "environment runtime must declare only one of env_name or env_prefix"
+                            .to_string(),
+                    ));
+                }
+                (None, None) => {
+                    return Err(StorageError::InvalidInput(
+                        "environment runtime must declare env_name or env_prefix".to_string(),
+                    ));
+                }
+                (Some(env_name), None) => validate_ref_part("runtime.env_name", env_name)?,
+                (None, Some(env_prefix)) => {
+                    validate_runtime_path("runtime.env_prefix", env_prefix)?
+                }
+            }
+            if let Some(env_file) = runtime.env_file.as_deref() {
+                validate_runtime_path("runtime.env_file", env_file)?;
+            }
+            let runner = runtime.runner.as_deref().ok_or_else(|| {
+                StorageError::InvalidInput(
+                    "environment runtime must declare absolute runner path".to_string(),
+                )
+            })?;
+            validate_runtime_path("runtime.runner", runner)?;
+            if !Path::new(runner).is_absolute() {
+                return Err(StorageError::InvalidInput(
+                    "runtime.runner must be an absolute executable path".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        other => Err(StorageError::InvalidInput(format!(
+            "unsupported runtime.backend {other}; supported backends are local, conda, micromamba"
+        ))),
+    }
+}
+
+fn validate_runtime_path(field_name: &str, value: &str) -> Result<(), StorageError> {
+    if value.trim().is_empty() || value.contains('\n') || value.contains('\0') {
+        return Err(StorageError::InvalidInput(format!(
+            "{field_name} must be non-empty single-line text"
+        )));
+    }
+    Ok(())
+}
+
 fn executable_from_stored_json(
     tool_ref: &str,
     version: &str,
@@ -1105,6 +1209,10 @@ fn executable_from_stored_json(
         backend: extract_string_field(spec_json, "runtime_backend")?,
         command: extract_string_array(spec_json, "runtime_command")?,
         timeout_seconds: extract_optional_u64_field(spec_json, "runtime_timeout_seconds")?,
+        env_name: extract_optional_string_field(spec_json, "runtime_env_name")?,
+        env_prefix: extract_optional_string_field(spec_json, "runtime_env_prefix")?,
+        env_file: extract_optional_string_field(spec_json, "runtime_env_file")?,
+        runner: extract_optional_string_field(spec_json, "runtime_runner")?,
     };
 
     let inputs = input_types
@@ -1366,6 +1474,25 @@ fn extract_optional_u64_field(json: &str, field: &str) -> Result<Option<u64>, St
         return Ok(None);
     }
     parse_u64_field(field, value).map(Some)
+}
+
+fn extract_optional_string_field(json: &str, field: &str) -> Result<Option<String>, StorageError> {
+    let marker = format!("\"{field}\":");
+    let Some(start) = json.find(&marker).map(|index| index + marker.len()) else {
+        return Ok(None);
+    };
+    let rest = &json[start..];
+    let rest = rest.trim_start();
+    if rest.starts_with("null") {
+        return Ok(None);
+    }
+    let Some(after_quote) = rest.strip_prefix('"') else {
+        return Err(StorageError::InvalidInput(format!(
+            "stored tool spec optional string field {field} is malformed"
+        )));
+    };
+    let end = find_json_string_end(after_quote)?;
+    Ok(Some(unescape_json_string(&after_quote[..end])))
 }
 
 fn extract_string_array(json: &str, field: &str) -> Result<Vec<String>, StorageError> {
@@ -1693,6 +1820,119 @@ runtime:
         )
         .unwrap_err();
         assert!(non_numeric.to_string().contains("positive integer"));
+    }
+
+    #[test]
+    fn parses_conda_runtime_metadata() {
+        let spec = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: conda_tool
+version: 0.1.0
+maturity: wrapped
+description: Tool with a conda runtime wrapper
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: conda
+  runner: /opt/conda/bin/conda
+  env_name: af-test
+  env_file: envs/analysis.yml
+  timeout_seconds: 5
+  command:
+    - python
+    - tools/run.py
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(spec.runtime.backend, "conda");
+        assert_eq!(spec.runtime.runner.as_deref(), Some("/opt/conda/bin/conda"));
+        assert_eq!(spec.runtime.env_name.as_deref(), Some("af-test"));
+        assert_eq!(spec.runtime.env_file.as_deref(), Some("envs/analysis.yml"));
+        assert_eq!(spec.runtime.command, ["python", "tools/run.py"]);
+        assert!(spec.stored_json().contains("\"runtime_env_name\""));
+
+        let path = temp_project_path("conda-runtime-roundtrip");
+        let store = ProjectStore::init(&path, Some("Tools")).unwrap();
+        store.register_tool(spec).unwrap();
+        let executable = store.executable_tool("local/conda_tool").unwrap();
+        assert_eq!(executable.runtime.backend, "conda");
+        assert_eq!(executable.runtime.env_name.as_deref(), Some("af-test"));
+        assert_eq!(
+            executable.runtime.runner.as_deref(),
+            Some("/opt/conda/bin/conda")
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn rejects_environment_runtime_without_runner_or_env_selector() {
+        let missing_env = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: bad_conda
+version: 0.1.0
+maturity: wrapped
+description: bad
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: conda
+  runner: /opt/conda/bin/conda
+  command:
+    - python
+"#,
+        )
+        .unwrap_err();
+        assert!(missing_env.to_string().contains("env_name or env_prefix"));
+
+        let missing_runner = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: bad_conda
+version: 0.1.0
+maturity: wrapped
+description: bad
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: micromamba
+  env_name: af-test
+  command:
+    - python
+"#,
+        )
+        .unwrap_err();
+        assert!(missing_runner.to_string().contains("runner"));
+    }
+
+    #[test]
+    fn rejects_local_runtime_environment_fields() {
+        let err = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: bad_local_env
+version: 0.1.0
+maturity: wrapped
+description: bad
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  env_name: af-test
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("local runtime must not declare"));
     }
 
     #[test]

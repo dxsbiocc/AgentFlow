@@ -15,8 +15,9 @@ Scope: CLI-first AgentFlow runtime usable without Omiga integration
 - Cache explanation: flow-level and step-level `cache explain` targets
 - Retry and partial replay: targeted execution through `run-step <flow.step|flow/step|step:flow/step|unique-step>` and failed-step retry through `retry <flow.step|flow/step|step:flow/step|unique-step>`
 - Report: Markdown provenance report from persisted flow, step, run, attempt, and artifact state
+- Environment execution: local backend plus existing Conda/micromamba wrappers through explicit runner/env metadata
 - Phase 2/3 state primitives: artifact observations with simple metric extraction, first `marker_report` observer adapter, automatic postflight observation for declared outputs, research notes, graph patch proposal/approval/apply records, approved `add_step`/`add_edge`/`update_params` materialization, downstream invalidation after parameter changes, and branch comparisons
-- Security hardening: absolute executable requirement, inline shell/interpreter command rejection, cleared child environment, output path escape rejection, runtime input re-hashing
+- Security hardening: absolute local executable or environment runner requirement, inline shell/interpreter command rejection, cleared child environment, output path escape rejection, runtime input re-hashing
 
 ## Automated Evidence
 
@@ -76,5 +77,5 @@ Observed results:
 - Validator metadata includes line-oriented `min_rows`/`required_columns`, cross-input `sample_id_column`, built-in input `profile` defaults, and a first paired expression/survival `validator_profile`; richer QC policies are future work.
 - Richer cache miss diagnostics and storage lifecycle policy are future work.
 - Report is Markdown-only; JSON/HTML/export artifacts are future work.
-- Execution sandboxing is still local-process based; Docker/Conda/Singularity backends are future work.
+- Execution sandboxing is still local-process based; Conda/micromamba can wrap existing environments, while Docker/Singularity and automatic environment preparation are future work.
 - Log/report redaction policy is not implemented yet.

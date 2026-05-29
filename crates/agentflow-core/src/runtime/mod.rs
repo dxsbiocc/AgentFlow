@@ -10,6 +10,7 @@ use rusqlite::{params, OptionalExtension};
 use crate::domain::{RunAttemptStatus, StepStatus};
 use crate::storage::{
     project_dir, ComputedArtifactRequest, ProjectStore, StorageError, StoredFlowStep,
+    ToolRuntimeSpec,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,10 +520,8 @@ impl ProjectStore {
         let resolved_input_paths = input_paths(&resolved_inputs);
         let params_json = string_map_json(&params_map);
         let input_hashes_json = input_hashes_json(&resolved_inputs);
-        let runtime_hash = stable_hash(&runtime_config_json(
-            &tool.runtime.command,
-            tool.runtime.timeout_seconds,
-        ));
+        let runtime_config = runtime_config_json(&tool.runtime)?;
+        let runtime_hash = stable_hash(&runtime_config);
         let params_hash = stable_hash(&params_json);
         let cache_key = compute_cache_key(
             tool_ref,
@@ -539,10 +538,11 @@ impl ProjectStore {
         let resolved_outputs = output_paths(&workdir, &outputs);
         fs::create_dir_all(resolved_outputs.root())?;
 
+        let prepared_command = prepare_runtime_command(&tool.runtime)?;
         materialize_workdir(
             &workdir,
-            &tool.runtime.command,
-            tool.runtime.timeout_seconds,
+            &prepared_command.argv(),
+            &runtime_config,
             &resolved_input_paths,
             &params_map,
             resolved_outputs.as_map(),
@@ -631,9 +631,9 @@ impl ProjectStore {
             });
         }
 
-        let mut command = Command::new(&tool.runtime.command[0]);
+        let mut command = Command::new(&prepared_command.executable);
         command
-            .args(&tool.runtime.command[1..])
+            .args(&prepared_command.args)
             .current_dir(&workdir)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -812,10 +812,7 @@ impl ProjectStore {
         let resolved_inputs = self.resolve_inputs(flow_id, &inputs)?;
         let input_hashes_json = input_hashes_json(&resolved_inputs);
         let params_hash = stable_hash(&string_map_json(&params_map));
-        let runtime_hash = stable_hash(&runtime_config_json(
-            &tool.runtime.command,
-            tool.runtime.timeout_seconds,
-        ));
+        let runtime_hash = stable_hash(&runtime_config_json(&tool.runtime)?);
         Ok(compute_cache_key(
             tool_ref,
             &tool.version,
@@ -1260,6 +1257,21 @@ struct LocalCommandOutput {
     timeout_seconds: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedRuntimeCommand {
+    executable: String,
+    args: Vec<String>,
+}
+
+impl PreparedRuntimeCommand {
+    fn argv(&self) -> Vec<String> {
+        let mut argv = Vec::with_capacity(self.args.len() + 1);
+        argv.push(self.executable.clone());
+        argv.extend(self.args.clone());
+        argv
+    }
+}
+
 fn output_paths(workdir: &Path, outputs: &BTreeMap<String, String>) -> OutputPaths {
     let root = workdir.join("outputs");
     let paths = outputs
@@ -1303,14 +1315,43 @@ fn compute_cache_key(
     ))
 }
 
-fn runtime_config_json(command: &[String], timeout_seconds: Option<u64>) -> String {
-    format!(
-        "{{\"backend\":\"local\",\"command\":{},\"timeout_seconds\":{}}}",
-        string_array_json(command),
-        timeout_seconds
+fn runtime_config_json(runtime: &ToolRuntimeSpec) -> Result<String, StorageError> {
+    let env_file_hash = runtime
+        .env_file
+        .as_deref()
+        .map(|path| file_hash_fnv64(Path::new(path)))
+        .transpose()?;
+    Ok(format!(
+        concat!(
+            "{{",
+            "\"backend\":\"{}\",",
+            "\"command\":{},",
+            "\"timeout_seconds\":{},",
+            "\"env_name\":{},",
+            "\"env_prefix\":{},",
+            "\"env_file\":{},",
+            "\"env_file_hash\":{},",
+            "\"runner\":{}",
+            "}}"
+        ),
+        escape_json(&runtime.backend),
+        string_array_json(&runtime.command),
+        runtime
+            .timeout_seconds
             .map(|value| value.to_string())
-            .unwrap_or_else(|| "null".to_string())
-    )
+            .unwrap_or_else(|| "null".to_string()),
+        optional_json_string(runtime.env_name.as_deref()),
+        optional_json_string(runtime.env_prefix.as_deref()),
+        optional_json_string(runtime.env_file.as_deref()),
+        optional_json_string(env_file_hash.as_deref()),
+        optional_json_string(runtime.runner.as_deref())
+    ))
+}
+
+fn optional_json_string(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".to_string())
 }
 
 fn stable_hash(input: &str) -> String {
@@ -1336,7 +1377,7 @@ fn stable_hash_bytes(bytes: &[u8]) -> String {
 fn materialize_workdir(
     workdir: &Path,
     command: &[String],
-    timeout_seconds: Option<u64>,
+    runtime_config_json: &str,
     inputs: &BTreeMap<String, PathBuf>,
     params: &BTreeMap<String, String>,
     outputs: &BTreeMap<String, PathBuf>,
@@ -1348,11 +1389,64 @@ fn materialize_workdir(
     fs::write(workdir.join("inputs.json"), path_map_json(inputs))?;
     fs::write(workdir.join("params.json"), string_map_json(params))?;
     fs::write(workdir.join("outputs.json"), path_map_json(outputs))?;
-    fs::write(
-        workdir.join("runtime.json"),
-        runtime_config_json(command, timeout_seconds),
-    )?;
+    fs::write(workdir.join("runtime.json"), runtime_config_json)?;
     Ok(())
+}
+
+fn prepare_runtime_command(
+    runtime: &ToolRuntimeSpec,
+) -> Result<PreparedRuntimeCommand, StorageError> {
+    match runtime.backend.as_str() {
+        "local" => {
+            let executable = runtime.command.first().ok_or_else(|| {
+                StorageError::InvalidInput("runtime.command must not be empty".to_string())
+            })?;
+            Ok(PreparedRuntimeCommand {
+                executable: executable.clone(),
+                args: runtime.command.iter().skip(1).cloned().collect(),
+            })
+        }
+        "conda" | "micromamba" => {
+            let runner = runtime.runner.as_ref().ok_or_else(|| {
+                StorageError::InvalidInput(
+                    "environment runtime must declare absolute runner path".to_string(),
+                )
+            })?;
+            let mut args = vec!["run".to_string()];
+            if runtime.backend == "conda" {
+                args.push("--no-capture-output".to_string());
+            }
+            match (runtime.env_name.as_deref(), runtime.env_prefix.as_deref()) {
+                (Some(env_name), None) => {
+                    args.push("--name".to_string());
+                    args.push(env_name.to_string());
+                }
+                (None, Some(env_prefix)) => {
+                    args.push("--prefix".to_string());
+                    args.push(env_prefix.to_string());
+                }
+                (Some(_), Some(_)) => {
+                    return Err(StorageError::InvalidInput(
+                        "environment runtime must declare only one of env_name or env_prefix"
+                            .to_string(),
+                    ));
+                }
+                (None, None) => {
+                    return Err(StorageError::InvalidInput(
+                        "environment runtime must declare env_name or env_prefix".to_string(),
+                    ));
+                }
+            }
+            args.extend(runtime.command.iter().cloned());
+            Ok(PreparedRuntimeCommand {
+                executable: runner.clone(),
+                args,
+            })
+        }
+        other => Err(StorageError::InvalidInput(format!(
+            "unsupported runtime.backend {other}"
+        ))),
+    }
 }
 
 fn run_local_command(
@@ -1913,6 +2007,8 @@ mod tests {
     use crate::storage::{
         ArtifactImportMode, ArtifactImportRequest, FlowDraft, ProjectStore, ToolSpec,
     };
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn temp_project_path(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1941,6 +2037,46 @@ fi
         )
         .unwrap();
         script_path
+    }
+
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    fn write_fake_environment_runner(path: &Path) -> PathBuf {
+        let runner_path = path.join("fake_micromamba.sh");
+        fs::write(
+            &runner_path,
+            r#"#!/bin/sh
+if [ "$1" != "run" ]; then
+  echo "expected run subcommand" >&2
+  exit 91
+fi
+shift
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --name|--prefix)
+      shift 2
+      ;;
+    --no-capture-output)
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+exec "$@"
+"#,
+        )
+        .unwrap();
+        make_executable(&runner_path);
+        runner_path
     }
 
     fn register_tool(store: &ProjectStore, source: String) {
@@ -2279,6 +2415,121 @@ steps:
         );
         assert_eq!(store.prune_cache_entries(None).unwrap().removed_entries, 2);
         assert!(store.list_cache_entries().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn environment_backend_wraps_command_and_records_runtime_config() {
+        let path = temp_project_path("micromamba-runtime");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Runtime Demo")).unwrap();
+        let script_path = write_script(&path);
+        let runner_path = write_fake_environment_runner(&path);
+        let command = script_path.display();
+        let runner = runner_path.display();
+
+        register_tool(
+            &store,
+            format!(
+                r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: marker_survival_scan
+version: 0.1.0
+maturity: wrapped
+description: Scan a candidate marker through an environment backend
+inputs:
+  expression_table:
+    type: TSV
+    required: true
+  survival_table:
+    type: TSV
+    required: true
+params:
+  gene:
+    type: string
+    required: true
+outputs:
+  marker_report:
+    type: Markdown
+runtime:
+  backend: micromamba
+  runner: {runner}
+  env_name: af-test
+  command:
+    - /bin/sh
+    - {command}
+"#
+            ),
+        );
+
+        let expression_path = path.join("expression.tsv");
+        fs::write(&expression_path, "sample\tTP53\nA\t1.2\n").unwrap();
+        let survival_path = path.join("survival.tsv");
+        fs::write(&survival_path, "sample\ttime\tstatus\nA\t10\t1\n").unwrap();
+        let expression_id = import_artifact(&store, expression_path);
+        let survival_id = import_artifact(&store, survival_path);
+        let flow = FlowDraft::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.flow.v0
+id: marker_demo
+name: Marker demo
+steps:
+  - id: scan
+    tool: marker/marker_survival_scan
+    reason: Evaluate TP53 marker signal
+    needs: []
+    inputs:
+      expression_table: {expression_id}
+      survival_table: {survival_id}
+    params:
+      gene: TP53
+    outputs:
+      marker_report: marker_report
+"#
+        ))
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+
+        let summary = store.run_flow("marker_demo").unwrap();
+        assert_eq!(summary.completed_steps, 1);
+        assert_eq!(summary.failed_steps, 0);
+        let logs = store.read_logs(&summary.attempts[0].attempt_id).unwrap();
+        assert!(logs.stdout.contains("scan ok"));
+        let command_text = fs::read_to_string(summary.attempts[0].workdir.join("command.sh"))
+            .expect("command script");
+        assert!(command_text.contains("fake_micromamba.sh"));
+        assert!(command_text.contains("--name af-test"));
+        let runtime_text = fs::read_to_string(summary.attempts[0].workdir.join("runtime.json"))
+            .expect("runtime json");
+        assert!(runtime_text.contains("\"backend\":\"micromamba\""));
+        assert!(runtime_text.contains("\"env_name\":\"af-test\""));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn runtime_config_hash_includes_environment_file_contents() {
+        let path = temp_project_path("runtime-env-file-hash");
+        fs::create_dir_all(&path).unwrap();
+        let env_file = path.join("environment.yml");
+        fs::write(&env_file, "name: af-test\ndependencies:\n  - python=3.11\n").unwrap();
+
+        let runtime = ToolRuntimeSpec {
+            backend: "conda".to_string(),
+            command: vec!["python".to_string(), "run.py".to_string()],
+            timeout_seconds: None,
+            env_name: Some("af-test".to_string()),
+            env_prefix: None,
+            env_file: Some(env_file.display().to_string()),
+            runner: Some("/opt/conda/bin/conda".to_string()),
+        };
+        let first = runtime_config_json(&runtime).unwrap();
+        fs::write(&env_file, "name: af-test\ndependencies:\n  - python=3.12\n").unwrap();
+        let second = runtime_config_json(&runtime).unwrap();
+        assert_ne!(first, second);
+        assert!(first.contains("\"env_file_hash\":\"fnv64:"));
 
         let _ = fs::remove_dir_all(path);
     }

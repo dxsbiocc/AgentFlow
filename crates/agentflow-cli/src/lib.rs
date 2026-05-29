@@ -969,8 +969,25 @@ fn resolve_tool_runtime_paths(
             *arg = fs::canonicalize(candidate)?.display().to_string();
         }
     }
+    resolve_runtime_path_field(&mut spec.runtime.env_file, spec_dir)?;
+    resolve_runtime_path_field(&mut spec.runtime.env_prefix, spec_dir)?;
 
     Ok(spec)
+}
+
+fn resolve_runtime_path_field(value: &mut Option<String>, spec_dir: &Path) -> Result<(), CliError> {
+    let Some(current) = value.as_deref() else {
+        return Ok(());
+    };
+    let path = Path::new(current);
+    if path.is_absolute() {
+        return Ok(());
+    }
+    let candidate = spec_dir.join(path);
+    if candidate.exists() {
+        *value = Some(fs::canonicalize(candidate)?.display().to_string());
+    }
+    Ok(())
 }
 
 fn tools_list_command<I>(args: I) -> Result<String, CliError>
@@ -2631,6 +2648,53 @@ runtime:
         ]))
         .unwrap();
         assert!(inspect.contains(&script_path.canonicalize().unwrap().display().to_string()));
+
+        let env_file = tool_dir.join("environment.yml");
+        fs::write(&env_file, "name: relative-env\n").unwrap();
+        let env_spec_path = tool_dir.join("relative_env.tool.yaml");
+        fs::write(
+            &env_spec_path,
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: relative_env
+version: 0.1.0
+maturity: wrapped
+description: Tool with an env file relative to the tool spec
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: conda
+  runner: /bin/echo
+  env_name: relative-env
+  env_file: environment.yml
+  command:
+    - python
+    - run.py
+"#,
+        )
+        .unwrap();
+        run(args(&[
+            "agentflow",
+            "tools",
+            "register",
+            env_spec_path.to_str().unwrap(),
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let env_inspect = run(args(&[
+            "agentflow",
+            "tools",
+            "inspect",
+            "marker/relative_env",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(env_inspect.contains(&env_file.canonicalize().unwrap().display().to_string()));
 
         let _ = fs::remove_dir_all(path);
     }

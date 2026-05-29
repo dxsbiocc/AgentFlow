@@ -636,6 +636,8 @@ outputs:
 
 runtime:
   backend: conda
+  runner: /opt/conda/bin/conda
+  env_name: marker-analysis
   env_file: envs/marker-analysis.yml
   command:
     - python
@@ -896,6 +898,8 @@ Modes:
 Recommended V1 behavior:
 
 - Support existing env or prefix first.
+- Require an explicit runner path such as `/opt/conda/bin/conda` or `/opt/homebrew/bin/micromamba` for deterministic execution.
+- Execute with `conda run --no-capture-output` or `micromamba run` without shell interpolation.
 - Support `environment.yml` preparation behind an explicit `agentflow env prepare` command.
 - Record env file hash and resolved package export when available.
 - Do not auto-install dependencies during normal `run` unless the user approved env preparation.

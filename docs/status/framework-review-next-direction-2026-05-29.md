@@ -19,6 +19,7 @@ Implemented foundation:
 - Output interpretation first slice: generic artifact observations plus a `marker_report` adapter that extracts gene/score-style evidence.
 - Runtime-connected output observations: tool outputs can declare `observer: marker_report`, and runtime records observations after successful execution or cache restore.
 - Deterministic port validators: tool inputs and outputs can declare `min_rows` and `required_columns`; inputs can also declare `sample_id_column` for cross-input sample identity checks, built-in input `profile` defaults, and the paired expression/survival `validator_profile` before command execution.
+- Environment execution first slice: `local`, `conda`, and `micromamba` runtime backends share the same workdir/log/cache path; Conda/micromamba wrap existing environments with explicit runner/env metadata.
 
 Current verification:
 
@@ -56,7 +57,7 @@ Missing behavior:
 
 Other important gaps remain:
 
-- Local backend only; no Conda/micromamba backend.
+- Conda/micromamba can wrap existing environments through explicit runner/env selection, but no environment creation or package solving exists yet.
 - No planner or failure-explainer Agent layer.
 - No general observer registry or adapter selection policy.
 - No rollback, merge, delete, branch label, decision node, or supersede semantics.
@@ -144,7 +145,7 @@ The next highest-value steps are now:
 1. Add better partial branch replay/status/report controls after graph changes.
 2. Add branch labels and explicit decision nodes around graph patches.
 3. Add richer validator profiles: file signature checks, additional schema profiles, empty-result policies, domain QC policies.
-4. Add Conda/micromamba backend for real scientific environments.
+4. Add `agentflow env check/prepare` so Conda/micromamba environments can be verified or created explicitly before runs.
 5. Add a small planner/failure-explainer Agent layer that only proposes graph patches from existing observations, logs, tools, and research notes.
 
 This keeps the project from drifting into fantasy autonomy. The next milestone should make AgentFlow better at seeing and recording what happened before asking it to reason more ambitiously.

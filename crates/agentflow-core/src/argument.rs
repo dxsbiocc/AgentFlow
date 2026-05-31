@@ -112,6 +112,50 @@ pub struct EvidenceLink {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClaimBasis {
+    Observed,
+    StatisticallyInferred,
+    Speculative,
+}
+
+impl ClaimBasis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::StatisticallyInferred => "statistically_inferred",
+            Self::Speculative => "speculative",
+        }
+    }
+
+    pub fn parse(input: &str) -> Option<Self> {
+        match input {
+            "observed" => Some(Self::Observed),
+            "statistically_inferred" => Some(Self::StatisticallyInferred),
+            "speculative" => Some(Self::Speculative),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ClaimBasis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfDeceptionGate {
+    pub supports: String,
+    pub against: String,
+    pub alternatives: String,
+    pub data_quality_risks: String,
+    pub assumptions: String,
+    pub falsifier: String,
+    pub claim_basis: ClaimBasis,
+    pub not_yet_claimable: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InconclusiveKind {
     Provisional { missing: Vec<String> },
@@ -413,15 +457,17 @@ impl ProjectStore {
         &self,
         hypothesis_id: &str,
         engine: &dyn ArgumentEngine,
+        gate: Option<SelfDeceptionGate>,
     ) -> Result<VerdictReport, StorageError> {
         let evidence = self.evidence_for(hypothesis_id)?;
         let report = engine.render(hypothesis_id, &evidence);
+        validate_self_deception_gate(&report.verdict, gate.as_ref())?;
         self.append_event(EventRecord {
             flow_id: None,
             step_id: None,
             run_id: None,
             event_type: VERDICT_RENDERED_EVENT.to_string(),
-            payload_json: verdict_rendered_payload_json(&report),
+            payload_json: verdict_rendered_payload_json(&report, gate.as_ref()),
         })?;
         self.touch_project()?;
         Ok(report)
@@ -529,6 +575,40 @@ fn validate_evidence_link_request(request: &EvidenceLinkRequest) -> Result<(), S
     Ok(())
 }
 
+fn validate_self_deception_gate(
+    verdict: &Verdict,
+    gate: Option<&SelfDeceptionGate>,
+) -> Result<(), StorageError> {
+    if !requires_self_deception_gate(verdict) {
+        return Ok(());
+    }
+
+    let gate = gate.ok_or_else(|| {
+        StorageError::InvalidInput("strong verdict requires self-deception gate".to_string())
+    })?;
+    if gate.against.trim().is_empty() || gate.alternatives.trim().is_empty() {
+        return Err(StorageError::InvalidInput(
+            "self-deception gate requires against and alternatives".to_string(),
+        ));
+    }
+    if matches!(verdict, Verdict::Affirmed) && gate.claim_basis == ClaimBasis::Speculative {
+        return Err(StorageError::InvalidInput(
+            "speculative basis cannot affirm".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn requires_self_deception_gate(verdict: &Verdict) -> bool {
+    matches!(
+        verdict,
+        Verdict::Affirmed
+            | Verdict::Refuted
+            | Verdict::Inconclusive(InconclusiveKind::Fundamental { .. })
+    )
+}
+
 fn validate_non_empty(label: &str, value: &str) -> Result<(), StorageError> {
     if value.trim().is_empty() {
         Err(StorageError::InvalidInput(format!(
@@ -577,20 +657,25 @@ fn evidence_from_event(
     })
 }
 
-fn verdict_rendered_payload_json(report: &VerdictReport) -> String {
+fn verdict_rendered_payload_json(
+    report: &VerdictReport,
+    gate: Option<&SelfDeceptionGate>,
+) -> String {
     format!(
         concat!(
             "{{",
             "\"hypothesis_id\":\"{}\",",
             "\"verdict\":\"{}\",",
             "\"confidence\":\"{}\",",
-            "\"rationale\":\"{}\"",
+            "\"rationale\":\"{}\",",
+            "\"gate\":{}",
             "}}"
         ),
         escape_json(&report.hypothesis_id),
         escape_json(&verdict_payload_text(&report.verdict)),
         report.confidence.as_str(),
-        escape_json(&report.rationale)
+        escape_json(&report.rationale),
+        self_deception_gate_json(gate)
     )
 }
 
@@ -599,6 +684,36 @@ fn verdict_payload_text(verdict: &Verdict) -> String {
         Verdict::Affirmed | Verdict::Refuted => verdict.as_str().to_string(),
         Verdict::Inconclusive(kind) => format!("inconclusive_{}", kind.as_str()),
     }
+}
+
+fn self_deception_gate_json(gate: Option<&SelfDeceptionGate>) -> String {
+    gate.map_or_else(
+        || "null".to_string(),
+        |gate| {
+            format!(
+                concat!(
+                    "{{",
+                    "\"supports\":\"{}\",",
+                    "\"against\":\"{}\",",
+                    "\"alternatives\":\"{}\",",
+                    "\"data_quality_risks\":\"{}\",",
+                    "\"assumptions\":\"{}\",",
+                    "\"falsifier\":\"{}\",",
+                    "\"claim_basis\":\"{}\",",
+                    "\"not_yet_claimable\":\"{}\"",
+                    "}}"
+                ),
+                escape_json(gate.supports.trim()),
+                escape_json(gate.against.trim()),
+                escape_json(gate.alternatives.trim()),
+                escape_json(gate.data_quality_risks.trim()),
+                escape_json(gate.assumptions.trim()),
+                escape_json(gate.falsifier.trim()),
+                gate.claim_basis.as_str(),
+                escape_json(gate.not_yet_claimable.trim())
+            )
+        },
+    )
 }
 
 fn required_json_string(
@@ -795,8 +910,9 @@ mod tests {
     use crate::storage::{now_unix_seconds, ProjectStore};
 
     use super::{
-        ArgumentEngine, EvidenceGrade, EvidenceLink, EvidenceLinkRequest, InconclusiveKind,
-        RuleBasedEngine, Stance, Verdict, VerdictReport, VerdictTag,
+        ArgumentEngine, ClaimBasis, EvidenceGrade, EvidenceLink, EvidenceLinkRequest,
+        InconclusiveKind, RuleBasedEngine, SelfDeceptionGate, Stance, Verdict, VerdictReport,
+        VerdictTag,
     };
 
     fn temp_project_path(test_name: &str) -> PathBuf {
@@ -829,6 +945,34 @@ mod tests {
             note: format!("{stance} via {grade}"),
             created_at: 1,
         }
+    }
+
+    fn valid_gate() -> SelfDeceptionGate {
+        gate_with_basis(ClaimBasis::Observed)
+    }
+
+    fn gate_with_basis(claim_basis: ClaimBasis) -> SelfDeceptionGate {
+        SelfDeceptionGate {
+            supports: "Observed evidence supports the claim".to_string(),
+            against: "Contradictory evidence has been checked".to_string(),
+            alternatives: "Alternative explanations remain less consistent".to_string(),
+            data_quality_risks: "Sampling bias is limited by replication".to_string(),
+            assumptions: "Measurements are comparable across runs".to_string(),
+            falsifier: "A replicated contradiction would overturn this claim".to_string(),
+            claim_basis,
+            not_yet_claimable: "No causal mechanism is claimed yet".to_string(),
+        }
+    }
+
+    fn rendered_event_count(store: &ProjectStore) -> i64 {
+        store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'argument.verdict_rendered'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[derive(Debug, Clone)]
@@ -929,6 +1073,19 @@ mod tests {
         assert!(error.to_string().contains("argument evidence note"));
 
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn claim_basis_round_trips_payload_text() {
+        for basis in [
+            ClaimBasis::Observed,
+            ClaimBasis::StatisticallyInferred,
+            ClaimBasis::Speculative,
+        ] {
+            assert_eq!(ClaimBasis::parse(basis.as_str()), Some(basis));
+            assert_eq!(basis.to_string(), basis.as_str());
+        }
+        assert_eq!(ClaimBasis::parse("inferred"), None);
     }
 
     #[test]
@@ -1050,7 +1207,7 @@ mod tests {
             .unwrap();
 
         let report = store
-            .render_verdict(&hypothesis_id, &RuleBasedEngine)
+            .render_verdict(&hypothesis_id, &RuleBasedEngine, Some(valid_gate()))
             .unwrap();
 
         assert_eq!(report.verdict, Verdict::Affirmed);
@@ -1058,15 +1215,220 @@ mod tests {
             store.inspect_hypothesis(&hypothesis_id).unwrap().status,
             HypothesisStatus::Proposed
         );
-        let count: i64 = store
+        assert_eq!(rendered_event_count(&store), 1);
+        let payload: String = store
             .connection()
             .query_row(
-                "SELECT COUNT(*) FROM events WHERE event_type = 'argument.verdict_rendered'",
+                "SELECT payload_json FROM events WHERE event_type = 'argument.verdict_rendered'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1);
+        assert!(payload.contains("\"gate\":{"));
+        assert!(payload.contains("\"claim_basis\":\"observed\""));
+        assert!(payload.contains("\"against\":\"Contradictory evidence has been checked\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn strong_verdicts_accept_valid_self_deception_gate() {
+        let path = temp_project_path("valid-gates");
+        let store = ProjectStore::init(&path, Some("Argument Demo")).unwrap();
+        let cases = vec![
+            ("Affirmed gate", Verdict::Affirmed, Confidence::High),
+            ("Refuted gate", Verdict::Refuted, Confidence::Medium),
+            (
+                "Fundamental gate",
+                Verdict::Inconclusive(InconclusiveKind::Fundamental {
+                    frontier: "requires external replication".to_string(),
+                }),
+                Confidence::Low,
+            ),
+        ];
+
+        for (statement, verdict, confidence) in cases {
+            let hypothesis_id = store
+                .record_hypothesis(HypothesisRequest {
+                    statement: statement.to_string(),
+                    origin: "agent".to_string(),
+                    related_goal_id: "goal_argument".to_string(),
+                })
+                .unwrap()
+                .id;
+            let report = store
+                .render_verdict(
+                    &hypothesis_id,
+                    &FixedEngine {
+                        verdict: verdict.clone(),
+                        confidence,
+                    },
+                    Some(valid_gate()),
+                )
+                .unwrap();
+
+            assert_eq!(report.verdict, verdict);
+        }
+        assert_eq!(rendered_event_count(&store), 3);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn strong_verdict_rejects_missing_self_deception_gate() {
+        let path = temp_project_path("missing-gate");
+        let store = ProjectStore::init(&path, Some("Argument Demo")).unwrap();
+        let hypothesis_id = record_hypothesis(&store);
+
+        let error = store
+            .render_verdict(
+                &hypothesis_id,
+                &FixedEngine {
+                    verdict: Verdict::Affirmed,
+                    confidence: Confidence::High,
+                },
+                None,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "strong verdict requires self-deception gate"
+        );
+        assert_eq!(rendered_event_count(&store), 0);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn strong_verdict_rejects_empty_against_or_alternatives() {
+        let path = temp_project_path("empty-gate-core");
+        let store = ProjectStore::init(&path, Some("Argument Demo")).unwrap();
+        let refuted_id = record_hypothesis(&store);
+        let fundamental_id = store
+            .record_hypothesis(HypothesisRequest {
+                statement: "Fundamental needs gate".to_string(),
+                origin: "agent".to_string(),
+                related_goal_id: "goal_argument".to_string(),
+            })
+            .unwrap()
+            .id;
+        let mut missing_against = valid_gate();
+        missing_against.against = " ".to_string();
+        let mut missing_alternatives = valid_gate();
+        missing_alternatives.alternatives = " ".to_string();
+
+        let error = store
+            .render_verdict(
+                &refuted_id,
+                &FixedEngine {
+                    verdict: Verdict::Refuted,
+                    confidence: Confidence::Medium,
+                },
+                Some(missing_against),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("against and alternatives"));
+
+        let error = store
+            .render_verdict(
+                &fundamental_id,
+                &FixedEngine {
+                    verdict: Verdict::Inconclusive(InconclusiveKind::Fundamental {
+                        frontier: "external replication".to_string(),
+                    }),
+                    confidence: Confidence::Low,
+                },
+                Some(missing_alternatives),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("against and alternatives"));
+        assert_eq!(rendered_event_count(&store), 0);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn affirmed_verdict_rejects_speculative_gate() {
+        let path = temp_project_path("speculative-affirm");
+        let store = ProjectStore::init(&path, Some("Argument Demo")).unwrap();
+        let hypothesis_id = record_hypothesis(&store);
+
+        let error = store
+            .render_verdict(
+                &hypothesis_id,
+                &FixedEngine {
+                    verdict: Verdict::Affirmed,
+                    confidence: Confidence::High,
+                },
+                Some(gate_with_basis(ClaimBasis::Speculative)),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "speculative basis cannot affirm");
+        assert_eq!(rendered_event_count(&store), 0);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn provisional_verdict_accepts_missing_or_optional_gate() {
+        let path = temp_project_path("provisional-gate");
+        let store = ProjectStore::init(&path, Some("Argument Demo")).unwrap();
+        let first_id = record_hypothesis(&store);
+        let second_id = store
+            .record_hypothesis(HypothesisRequest {
+                statement: "Optional gate is stored".to_string(),
+                origin: "agent".to_string(),
+                related_goal_id: "goal_argument".to_string(),
+            })
+            .unwrap()
+            .id;
+        let provisional = Verdict::Inconclusive(InconclusiveKind::Provisional {
+            missing: vec!["more evidence".to_string()],
+        });
+        let mut optional_gate = gate_with_basis(ClaimBasis::Speculative);
+        optional_gate.against.clear();
+        optional_gate.alternatives.clear();
+
+        store
+            .render_verdict(
+                &first_id,
+                &FixedEngine {
+                    verdict: provisional.clone(),
+                    confidence: Confidence::Low,
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .render_verdict(
+                &second_id,
+                &FixedEngine {
+                    verdict: provisional,
+                    confidence: Confidence::Low,
+                },
+                Some(optional_gate),
+            )
+            .unwrap();
+
+        let mut stmt = store
+            .connection()
+            .prepare(
+                "SELECT payload_json FROM events
+                 WHERE event_type = 'argument.verdict_rendered'
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .unwrap();
+        let payloads = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(payloads.len(), 2);
+        assert!(payloads[0].contains("\"gate\":null"));
+        assert!(payloads[1].contains("\"claim_basis\":\"speculative\""));
 
         let _ = std::fs::remove_dir_all(path);
     }
@@ -1111,6 +1473,7 @@ mod tests {
                     verdict: Verdict::Refuted,
                     confidence: Confidence::Medium,
                 },
+                Some(valid_gate()),
             )
             .unwrap();
         store
@@ -1122,6 +1485,7 @@ mod tests {
                     }),
                     confidence: Confidence::Low,
                 },
+                Some(valid_gate()),
             )
             .unwrap();
 

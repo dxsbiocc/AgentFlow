@@ -363,8 +363,8 @@ mod tests {
     use rusqlite::params;
 
     use crate::argument::{
-        ArgumentEngine, EvidenceGrade, EvidenceLink, EvidenceLinkRequest, InconclusiveKind, Stance,
-        Verdict, VerdictReport,
+        ArgumentEngine, ClaimBasis, EvidenceGrade, EvidenceLink, EvidenceLinkRequest,
+        InconclusiveKind, SelfDeceptionGate, Stance, Verdict, VerdictReport,
     };
     use crate::hypothesis::{Confidence, Hypothesis, HypothesisRequest};
     use crate::storage::{now_unix_seconds, ProjectStore};
@@ -418,6 +418,7 @@ mod tests {
         confidence: Confidence,
     ) -> Hypothesis {
         let hypothesis = record_hypothesis(store, statement);
+        let gate = self_deception_gate_for(&verdict);
         store
             .render_verdict(
                 &hypothesis.id,
@@ -425,9 +426,30 @@ mod tests {
                     verdict,
                     confidence,
                 },
+                gate,
             )
             .unwrap();
         hypothesis
+    }
+
+    fn self_deception_gate_for(verdict: &Verdict) -> Option<SelfDeceptionGate> {
+        match verdict {
+            Verdict::Inconclusive(InconclusiveKind::Provisional { .. }) => None,
+            Verdict::Affirmed
+            | Verdict::Refuted
+            | Verdict::Inconclusive(InconclusiveKind::Fundamental { .. }) => {
+                Some(SelfDeceptionGate {
+                    supports: "Branch test support".to_string(),
+                    against: "Branch test contradiction checked".to_string(),
+                    alternatives: "Branch test alternative checked".to_string(),
+                    data_quality_risks: "Branch test data quality risk".to_string(),
+                    assumptions: "Branch test assumption".to_string(),
+                    falsifier: "Branch test falsifier".to_string(),
+                    claim_basis: ClaimBasis::Observed,
+                    not_yet_claimable: "Branch test limitation".to_string(),
+                })
+            }
+        }
     }
 
     fn add_evidence(store: &ProjectStore, hypothesis_id: &str, note: &str) {

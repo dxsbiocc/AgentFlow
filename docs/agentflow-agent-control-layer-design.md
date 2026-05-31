@@ -449,7 +449,7 @@ pub fn run_cycle(store: &ProjectStore, goal: &Goal) -> Result<LoopOutcome, Agent
 2. **H2 智能分支选择 + 动态图提议** ✅ **已实现并验收（2026-05-31，见 `status/h2-branch-selection-plan.md`）**：`branch.rs` —— Agent 用 `Verdict` 自主选「深入/派生/放弃/保持」+ 确定性评分排序 + 探索提升 + `propose_branch_patch`（复用现有 `graph_patch`）。core 测试 109→116。
    - **工程裁决**：H2 **只提议、不自动应用**（`apply_graph_patch` 留到 H7），Abandon 只出建议不自动改状态（A2）。**自主 apply 默认开启**需 H3（刹车）+ H4（轨迹回退）就位才安全（A4：默认自治须可见可回退）——这是诚实的安全排序，非退回保守。
 3. **H3 交接引擎** ✅ **已实现并验收（2026-05-31，见 `status/h3-handoff-engine-plan.md`）**：`handoff.rs` —— `DefaultPolicy` 刹车策略（优先级 goal→premise→budget→贵/不可逆/分叉）+ 决策点提出/解决（事件溯源）+ 决策/体力活分类器；强制 A3（digest 非空、必带推荐、选项非空）。core 测试 116→129。CLI 暴露决策点与 resolve **延后到统一 CLI 里程碑**（H1–H3 均暂未做 CLI）。
-4. **H4 轨迹安全垫**：`trace_guard.rs` checkpoint / drift / revert——让 H2 的默认自治**可回退**。
+4. **H4 轨迹安全垫** ✅ **已实现并验收（2026-05-31，见 `status/h4-trace-guard-plan.md`）**：`trace_guard.rs` checkpoint / `detect_drift` / `revert_to`（只记录不物删）+ `reverted_event_ids`。core 测试 129→135。让域投影真正尊重回退区间的接线放到 H7（此前无不可逆自主写入）。
 5. **H5 防自欺闸门**：`verdict_rendered` 落库强制带 `SelfDeceptionGate`，仅卡高风险声明（改假设/Affirmed/Fundamental），不拖慢推进；报告区分 Evidence Grade。
 6. **H6 觅食引擎**：`forage.rs` 采纳 §15 `ResearchSource` 接口 + `AccessStatus` + 挥发/ε 探索（先 1 个来源，如 PubMed `ReadMap`），喂证据账本。
 7. **H7 控制主循环**：`agent/mod.rs` 串起来，单 Agent 闭环跑通一个真实科研目标。

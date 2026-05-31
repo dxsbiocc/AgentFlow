@@ -446,7 +446,8 @@ pub fn run_cycle(store: &ProjectStore, goal: &Goal) -> Result<LoopOutcome, Agent
 接在现状（M6 报告核心 / v1 可用切片）之后。**自动化推进是主线，不后置**（§1.5）；安全由「交接 + 轨迹」保证，而非由「默认审批」保证：
 
 1. **H1 假设与证据账本** ✅ **已实现并验收（2026-05-31，见 `status/h1-hypothesis-argument-plan.md`）**：`hypothesis.rs`（7 态生命周期 + 状态机）+ `argument.rs`（证据账本 + `RuleBasedEngine` 规则版三态判决）。core 测试 95→109，质量门全绿。——这是分支选择的**依据**，故排第一。（证据与现有 `observation` 的打通在 H6 觅食阶段完善。）
-2. **H2 智能分支选择 + 动态图自主推进（中心）**：Agent 用 `Verdict` + 探索/利用**自主选/比较分支**、**自主 apply** `add_step`/`add_edge`/`update_params`（复用现有 `graph_patch` / `comparison` 原语），安全信封内默认执行、不逐步等批。**这是"自动化科研推进"的核心切片，紧随依据层之后，不再后置。**
+2. **H2 智能分支选择 + 动态图提议** ✅ **已实现并验收（2026-05-31，见 `status/h2-branch-selection-plan.md`）**：`branch.rs` —— Agent 用 `Verdict` 自主选「深入/派生/放弃/保持」+ 确定性评分排序 + 探索提升 + `propose_branch_patch`（复用现有 `graph_patch`）。core 测试 109→116。
+   - **工程裁决**：H2 **只提议、不自动应用**（`apply_graph_patch` 留到 H7），Abandon 只出建议不自动改状态（A2）。**自主 apply 默认开启**需 H3（刹车）+ H4（轨迹回退）就位才安全（A4：默认自治须可见可回退）——这是诚实的安全排序，非退回保守。
 3. **H3 交接引擎**：`handoff.rs` + `InterventionPolicy` 默认实现 + 决策/体力活分类器；在 `GoalMutation`/不可逆/高代价处刹车——让 H2 的自动推进**安全**。CLI 暴露决策点与 resolve。
 4. **H4 轨迹安全垫**：`trace_guard.rs` checkpoint / drift / revert——让 H2 的默认自治**可回退**。
 5. **H5 防自欺闸门**：`verdict_rendered` 落库强制带 `SelfDeceptionGate`，仅卡高风险声明（改假设/Affirmed/Fundamental），不拖慢推进；报告区分 Evidence Grade。

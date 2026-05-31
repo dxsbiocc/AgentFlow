@@ -199,6 +199,49 @@ pub struct VerdictReport {
     pub rationale: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VerdictTag {
+    Affirmed,
+    Refuted,
+    InconclusiveProvisional,
+    InconclusiveFundamental,
+}
+
+impl VerdictTag {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Affirmed => "affirmed",
+            Self::Refuted => "refuted",
+            Self::InconclusiveProvisional => "inconclusive_provisional",
+            Self::InconclusiveFundamental => "inconclusive_fundamental",
+        }
+    }
+
+    pub fn parse(input: &str) -> Option<Self> {
+        match input {
+            "affirmed" => Some(Self::Affirmed),
+            "refuted" => Some(Self::Refuted),
+            "inconclusive_provisional" => Some(Self::InconclusiveProvisional),
+            "inconclusive_fundamental" => Some(Self::InconclusiveFundamental),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for VerdictTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerdictSummary {
+    pub hypothesis_id: String,
+    pub tag: VerdictTag,
+    pub confidence: Confidence,
+    pub created_at: i64,
+}
+
 pub trait ArgumentEngine {
     fn render(&self, hypothesis_id: &str, evidence: &[EvidenceLink]) -> VerdictReport;
 }
@@ -383,6 +426,42 @@ impl ProjectStore {
         self.touch_project()?;
         Ok(report)
     }
+
+    pub fn latest_verdict_for(
+        &self,
+        hypothesis_id: &str,
+    ) -> Result<Option<VerdictSummary>, StorageError> {
+        validate_non_empty("hypothesis id", hypothesis_id)?;
+        let hypothesis_id = hypothesis_id.trim();
+        self.inspect_hypothesis(hypothesis_id)?;
+
+        let mut stmt = self.connection().prepare(
+            "SELECT id, payload_json, created_at
+             FROM events
+             WHERE event_type = ?1
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![VERDICT_RENDERED_EVENT], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        for row in rows {
+            let (event_id, payload_json, created_at) = row?;
+            if json_string_field(&payload_json, "hypothesis_id").as_deref() == Some(hypothesis_id) {
+                return Ok(Some(verdict_summary_from_event(
+                    event_id,
+                    &payload_json,
+                    created_at,
+                )?));
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 fn evidence_by_stance(evidence: &[EvidenceLink], stance: Stance) -> Vec<EvidenceLink> {
@@ -554,6 +633,33 @@ fn parse_stance(event_id: &str, payload_json: &str, field: &str) -> Result<Stanc
     })
 }
 
+fn verdict_summary_from_event(
+    event_id: String,
+    payload_json: &str,
+    created_at: i64,
+) -> Result<VerdictSummary, StorageError> {
+    let hypothesis_id = required_json_string(&event_id, payload_json, "hypothesis_id")?;
+    let verdict = required_json_string(&event_id, payload_json, "verdict")?;
+    let confidence = required_json_string(&event_id, payload_json, "confidence")?;
+    let tag = VerdictTag::parse(&verdict).ok_or_else(|| {
+        StorageError::InvalidInput(format!(
+            "argument event {event_id} has invalid verdict {verdict}"
+        ))
+    })?;
+    let confidence = Confidence::parse(&confidence).ok_or_else(|| {
+        StorageError::InvalidInput(format!(
+            "argument event {event_id} has invalid confidence {confidence}"
+        ))
+    })?;
+
+    Ok(VerdictSummary {
+        hypothesis_id,
+        tag,
+        confidence,
+        created_at,
+    })
+}
+
 fn optional_json_string(value: Option<&str>) -> String {
     value.filter(|inner| !inner.trim().is_empty()).map_or_else(
         || "null".to_string(),
@@ -685,12 +791,12 @@ fn escape_json(input: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::hypothesis::{HypothesisRequest, HypothesisStatus};
+    use crate::hypothesis::{Confidence, HypothesisRequest, HypothesisStatus};
     use crate::storage::{now_unix_seconds, ProjectStore};
 
     use super::{
         ArgumentEngine, EvidenceGrade, EvidenceLink, EvidenceLinkRequest, InconclusiveKind,
-        RuleBasedEngine, Stance, Verdict,
+        RuleBasedEngine, Stance, Verdict, VerdictReport, VerdictTag,
     };
 
     fn temp_project_path(test_name: &str) -> PathBuf {
@@ -722,6 +828,25 @@ mod tests {
             stance,
             note: format!("{stance} via {grade}"),
             created_at: 1,
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FixedEngine {
+        verdict: Verdict,
+        confidence: Confidence,
+    }
+
+    impl ArgumentEngine for FixedEngine {
+        fn render(&self, hypothesis_id: &str, _evidence: &[EvidenceLink]) -> VerdictReport {
+            VerdictReport {
+                hypothesis_id: hypothesis_id.to_string(),
+                verdict: self.verdict.clone(),
+                confidence: self.confidence,
+                supporting: Vec::new(),
+                contradicting: Vec::new(),
+                rationale: "fixed test verdict".to_string(),
+            }
         }
     }
 
@@ -942,6 +1067,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn verdict_tag_round_trips_payload_text() {
+        for tag in [
+            VerdictTag::Affirmed,
+            VerdictTag::Refuted,
+            VerdictTag::InconclusiveProvisional,
+            VerdictTag::InconclusiveFundamental,
+        ] {
+            assert_eq!(VerdictTag::parse(tag.as_str()), Some(tag));
+            assert_eq!(tag.to_string(), tag.as_str());
+        }
+        assert_eq!(VerdictTag::parse("inconclusive"), None);
+    }
+
+    #[test]
+    fn latest_verdict_for_returns_newest_summary_or_none() {
+        let path = temp_project_path("latest-verdict");
+        let store = ProjectStore::init(&path, Some("Argument Demo")).unwrap();
+        let hypothesis_id = record_hypothesis(&store);
+        let empty_hypothesis_id = store
+            .record_hypothesis(HypothesisRequest {
+                statement: "No verdict yet".to_string(),
+                origin: "agent".to_string(),
+                related_goal_id: "goal_argument".to_string(),
+            })
+            .unwrap()
+            .id;
+
+        assert!(store
+            .latest_verdict_for(&empty_hypothesis_id)
+            .unwrap()
+            .is_none());
+
+        store
+            .render_verdict(
+                &hypothesis_id,
+                &FixedEngine {
+                    verdict: Verdict::Refuted,
+                    confidence: Confidence::Medium,
+                },
+            )
+            .unwrap();
+        store
+            .render_verdict(
+                &hypothesis_id,
+                &FixedEngine {
+                    verdict: Verdict::Inconclusive(InconclusiveKind::Fundamental {
+                        frontier: "requires external replication".to_string(),
+                    }),
+                    confidence: Confidence::Low,
+                },
+            )
+            .unwrap();
+
+        let summary = store.latest_verdict_for(&hypothesis_id).unwrap().unwrap();
+        assert_eq!(summary.hypothesis_id, hypothesis_id);
+        assert_eq!(summary.tag, VerdictTag::InconclusiveFundamental);
+        assert_eq!(summary.confidence, Confidence::Low);
+        assert!(summary.created_at > 0);
 
         let _ = std::fs::remove_dir_all(path);
     }

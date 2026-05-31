@@ -5,6 +5,7 @@
 //! code.
 
 pub mod argument;
+pub mod branch;
 pub mod comparison;
 pub mod domain;
 pub mod graph_patch;

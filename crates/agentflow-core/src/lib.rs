@@ -4,9 +4,11 @@
 //! and reporting will grow behind this crate without depending on Omiga or UI
 //! code.
 
+pub mod argument;
 pub mod comparison;
 pub mod domain;
 pub mod graph_patch;
+pub mod hypothesis;
 pub mod observer;
 pub mod report;
 pub mod research;

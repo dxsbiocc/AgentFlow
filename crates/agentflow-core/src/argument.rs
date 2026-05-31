@@ -112,6 +112,33 @@ pub struct EvidenceLink {
     pub created_at: i64,
 }
 
+impl EvidenceLink {
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"id\":\"{}\",",
+                "\"hypothesis_id\":\"{}\",",
+                "\"observation_id\":{},",
+                "\"source\":{},",
+                "\"grade\":\"{}\",",
+                "\"stance\":\"{}\",",
+                "\"note\":\"{}\",",
+                "\"created_at\":{}",
+                "}}"
+            ),
+            escape_json(&self.id),
+            escape_json(&self.hypothesis_id),
+            optional_json_string(self.observation_id.as_deref()),
+            optional_json_string(self.source.as_deref()),
+            self.grade.as_str(),
+            self.stance.as_str(),
+            escape_json(&self.note),
+            self.created_at
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClaimBasis {
     Observed,
@@ -243,6 +270,59 @@ pub struct VerdictReport {
     pub rationale: String,
 }
 
+impl VerdictReport {
+    pub fn to_json(&self) -> String {
+        let (inconclusive_kind, missing, frontier) = match &self.verdict {
+            Verdict::Inconclusive(InconclusiveKind::Provisional { missing }) => {
+                (Some("provisional"), json_string_array(missing), None)
+            }
+            Verdict::Inconclusive(InconclusiveKind::Fundamental { frontier }) => (
+                Some("fundamental"),
+                "[]".to_string(),
+                Some(frontier.as_str()),
+            ),
+            Verdict::Affirmed | Verdict::Refuted => (None, "[]".to_string(), None),
+        };
+        let supporting = self
+            .supporting
+            .iter()
+            .map(EvidenceLink::to_json)
+            .collect::<Vec<_>>()
+            .join(",");
+        let contradicting = self
+            .contradicting
+            .iter()
+            .map(EvidenceLink::to_json)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!(
+            concat!(
+                "{{",
+                "\"hypothesis_id\":\"{}\",",
+                "\"verdict\":\"{}\",",
+                "\"inconclusive_kind\":{},",
+                "\"missing\":{},",
+                "\"frontier\":{},",
+                "\"confidence\":\"{}\",",
+                "\"rationale\":\"{}\",",
+                "\"supporting\":[{}],",
+                "\"contradicting\":[{}]",
+                "}}"
+            ),
+            escape_json(&self.hypothesis_id),
+            self.verdict.as_str(),
+            optional_json_string(inconclusive_kind),
+            missing,
+            optional_json_string(frontier),
+            self.confidence.as_str(),
+            escape_json(&self.rationale),
+            supporting,
+            contradicting
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VerdictTag {
     Affirmed,
@@ -284,6 +364,25 @@ pub struct VerdictSummary {
     pub tag: VerdictTag,
     pub confidence: Confidence,
     pub created_at: i64,
+}
+
+impl VerdictSummary {
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"hypothesis_id\":\"{}\",",
+                "\"tag\":\"{}\",",
+                "\"confidence\":\"{}\",",
+                "\"created_at\":{}",
+                "}}"
+            ),
+            escape_json(&self.hypothesis_id),
+            self.tag.as_str(),
+            self.confidence.as_str(),
+            self.created_at
+        )
+    }
 }
 
 pub trait ArgumentEngine {

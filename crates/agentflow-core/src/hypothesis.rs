@@ -117,6 +117,33 @@ pub struct Hypothesis {
     pub updated_at: i64,
 }
 
+impl Hypothesis {
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"id\":\"{}\",",
+                "\"statement\":\"{}\",",
+                "\"origin\":\"{}\",",
+                "\"related_goal_id\":\"{}\",",
+                "\"status\":\"{}\",",
+                "\"confidence\":\"{}\",",
+                "\"created_at\":{},",
+                "\"updated_at\":{}",
+                "}}"
+            ),
+            escape_json(&self.id),
+            escape_json(&self.statement),
+            escape_json(&self.origin),
+            escape_json(&self.related_goal_id),
+            self.status.as_str(),
+            self.confidence.as_str(),
+            self.created_at,
+            self.updated_at
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HypothesisRequest {
     pub statement: String,

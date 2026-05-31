@@ -8,6 +8,7 @@ pub mod argument;
 pub mod branch;
 pub mod comparison;
 pub mod domain;
+pub mod forage;
 pub mod graph_patch;
 pub mod handoff;
 pub mod hypothesis;

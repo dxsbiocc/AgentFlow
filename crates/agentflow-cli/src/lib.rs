@@ -93,6 +93,8 @@ pub fn usage() -> String {
         "  agentflow tools register <tool.yaml> [--path <path>]",
         "  agentflow tools list [--json] [--path <path>]",
         "  agentflow tools inspect <tool-ref> [--json] [--path <path>]",
+        "  agentflow tools match [--output <type>] [--input <type>]... [--keyword <kw>]... [--json] [--path <path>]",
+        "  agentflow tools draft-step <tool-ref> [--input <type>:<artifact-id>]... [--json] [--path <path>]",
         "  agentflow env check <tool-ref> [--json] [--path <path>]",
         "  agentflow env prepare <tool-ref> [--json] [--path <path>]",
         "  agentflow env export <tool-ref> [--json] [--path <path>]",
@@ -951,11 +953,13 @@ where
         Some(command) if command == "register" => tools_register_command(args),
         Some(command) if command == "list" => tools_list_command(args),
         Some(command) if command == "inspect" => tools_inspect_command(args),
+        Some(command) if command == "match" => tools_match_command(args),
+        Some(command) if command == "draft-step" => tools_draft_step_command(args),
         Some(command) => Err(CliError::InvalidArgument(format!(
             "unknown tools command: {command}"
         ))),
         None => Err(CliError::InvalidArgument(
-            "tools requires a command: register, list, or inspect".to_string(),
+            "tools requires a command: register, list, inspect, match, or draft-step".to_string(),
         )),
     }
 }
@@ -1082,6 +1086,45 @@ where
             inspection.created_at,
             inspection.spec_json
         ))
+    }
+}
+
+fn tools_match_command<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let options = parse_tools_match_options(args)?;
+    let path = options.project.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&path)?;
+    let candidates = store.match_tools(&agentflow_core::tool_select::CapabilityQuery {
+        desired_output_type: options.output,
+        available_input_types: options.inputs,
+        keywords: options.keywords,
+    })?;
+
+    if options.project.json {
+        Ok(tool_candidates_json(&candidates))
+    } else {
+        Ok(format_tool_candidates(&candidates))
+    }
+}
+
+fn tools_draft_step_command<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let options = parse_tools_draft_step_options(args)?;
+    let tool_ref = options.tool_ref.ok_or_else(|| {
+        CliError::InvalidArgument("tools draft-step requires <tool-ref>".to_string())
+    })?;
+    let path = options.project.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&path)?;
+    let step = store.draft_step_for(&tool_ref, &options.inputs)?;
+
+    if options.project.json {
+        Ok(proposed_step_json(&step))
+    } else {
+        Ok(format_proposed_step(&step))
     }
 }
 
@@ -1374,6 +1417,21 @@ struct ProjectOptions {
 struct SinglePositionalOptions {
     project: ProjectOptions,
     positional: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ToolsMatchOptions {
+    project: ProjectOptions,
+    output: Option<String>,
+    inputs: Vec<String>,
+    keywords: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct ToolsDraftStepOptions {
+    project: ProjectOptions,
+    tool_ref: Option<String>,
+    inputs: Vec<(String, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -1789,6 +1847,101 @@ where
     Ok(options)
 }
 
+fn parse_tools_match_options<I>(args: I) -> Result<ToolsMatchOptions, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut options = ToolsMatchOptions::default();
+    let mut args = args.into_iter();
+
+    while let Some(arg) = next_arg(&mut args)? {
+        match arg.as_str() {
+            "--path" => {
+                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
+            }
+            "--json" => {
+                options.project.json = true;
+            }
+            "--output" => {
+                if options.output.is_some() {
+                    return Err(CliError::InvalidArgument(
+                        "--output may only be provided once".to_string(),
+                    ));
+                }
+                options.output = Some(require_value("--output", &mut args)?);
+            }
+            "--input" => {
+                options.inputs.push(require_value("--input", &mut args)?);
+            }
+            "--keyword" => {
+                options
+                    .keywords
+                    .push(require_value("--keyword", &mut args)?);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
+            }
+            _ => {
+                return Err(CliError::InvalidArgument(format!(
+                    "tools match does not accept positional argument: {arg}"
+                )));
+            }
+        }
+    }
+
+    Ok(options)
+}
+
+fn parse_tools_draft_step_options<I>(args: I) -> Result<ToolsDraftStepOptions, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut options = ToolsDraftStepOptions::default();
+    let mut args = args.into_iter();
+
+    while let Some(arg) = next_arg(&mut args)? {
+        match arg.as_str() {
+            "--path" => {
+                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
+            }
+            "--json" => {
+                options.project.json = true;
+            }
+            "--input" => {
+                let input = require_value("--input", &mut args)?;
+                options.inputs.push(parse_draft_step_input(&input)?);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
+            }
+            _ => {
+                if options.tool_ref.is_some() {
+                    return Err(CliError::InvalidArgument(format!(
+                        "expected one tool ref, got extra argument: {arg}"
+                    )));
+                }
+                options.tool_ref = Some(arg);
+            }
+        }
+    }
+
+    Ok(options)
+}
+
+fn parse_draft_step_input(value: &str) -> Result<(String, String), CliError> {
+    let Some((type_name, artifact_id)) = value.split_once(':') else {
+        return Err(CliError::InvalidArgument(
+            "--input must use <type>:<artifact-id>".to_string(),
+        ));
+    };
+    if type_name.trim().is_empty() || artifact_id.trim().is_empty() {
+        return Err(CliError::InvalidArgument(
+            "--input must use non-empty <type>:<artifact-id>".to_string(),
+        ));
+    }
+    Ok((type_name.to_string(), artifact_id.to_string()))
+}
+
 fn parse_cache_prune_options<I>(args: I) -> Result<CachePruneOptions, CliError>
 where
     I: IntoIterator<Item = OsString>,
@@ -2140,6 +2293,113 @@ fn tools_list_json(tools: &[agentflow_core::storage::ToolSummary]) -> String {
         agentflow_schemas::TOOL_LIST_JSON_SCHEMA_V0,
         items
     )
+}
+
+fn format_tool_candidates(candidates: &[agentflow_core::tool_select::ToolCandidate]) -> String {
+    if candidates.is_empty() {
+        return "No matching tools".to_string();
+    }
+
+    candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{} [{}] score={} reason={}",
+                candidate.tool_ref,
+                candidate.fit.as_str(),
+                candidate.score,
+                candidate.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn tool_candidates_json(candidates: &[agentflow_core::tool_select::ToolCandidate]) -> String {
+    let items = candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                concat!(
+                    "{{",
+                    "\"tool_ref\":\"{}\",",
+                    "\"fit\":\"{}\",",
+                    "\"score\":{},",
+                    "\"reason\":\"{}\"",
+                    "}}"
+                ),
+                escape_json(&candidate.tool_ref),
+                candidate.fit.as_str(),
+                candidate.score,
+                escape_json(&candidate.reason)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+fn format_proposed_step(step: &agentflow_core::branch::ProposedStep) -> String {
+    format!(
+        "Step: {}\nTool: {}\nNeeds: {}\nInputs:\n{}\nParams:\n{}\nOutputs:\n{}",
+        step.id,
+        step.tool,
+        format_string_list(&step.needs),
+        format_pairs(&step.inputs),
+        format_pairs(&step.params),
+        format_pairs(&step.outputs)
+    )
+}
+
+fn format_pairs(pairs: &[(String, String)]) -> String {
+    if pairs.is_empty() {
+        return "  none".to_string();
+    }
+
+    pairs
+        .iter()
+        .map(|(key, value)| format!("  {key}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn proposed_step_json(step: &agentflow_core::branch::ProposedStep) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"id\":\"{}\",",
+            "\"tool\":\"{}\",",
+            "\"needs\":{},",
+            "\"inputs\":{},",
+            "\"params\":{},",
+            "\"outputs\":{}",
+            "}}"
+        ),
+        escape_json(&step.id),
+        escape_json(&step.tool),
+        string_list_json(&step.needs),
+        pairs_object_json(&step.inputs),
+        pairs_object_json(&step.params),
+        pairs_object_json(&step.outputs)
+    )
+}
+
+fn string_list_json(values: &[String]) -> String {
+    let items = values
+        .iter()
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+fn pairs_object_json(pairs: &[(String, String)]) -> String {
+    let fields = pairs
+        .iter()
+        .map(|(key, value)| format!("\"{}\":\"{}\"", escape_json(key), escape_json(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{fields}}}")
 }
 
 fn research_notes_json(notes: &[agentflow_core::research::ResearchNote]) -> String {
@@ -3036,6 +3296,154 @@ steps:
         assert!(inspect.contains("\"schema_version\":\"agentflow.tool_inspection.v0\""));
         assert!(inspect.contains("\"version\":\"0.1.0\""));
 
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn tools_match_and_draft_step_json_work_with_registered_tool() {
+        let path = temp_project_path("tools-match-draft-json");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let spec_path = write_sample_tool(&path);
+        run(args(&[
+            "agentflow",
+            "tools",
+            "register",
+            spec_path.to_str().unwrap(),
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let matches = run(args(&[
+            "agentflow",
+            "tools",
+            "match",
+            "--output",
+            "Markdown",
+            "--input",
+            "TSV",
+            "--keyword",
+            "survival",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(matches.starts_with('['));
+        assert!(matches.contains("\"tool_ref\":\"marker/marker_survival_scan\""));
+        assert!(matches.contains("\"fit\":\"high\""));
+        assert!(matches.contains("\"score\":23"));
+
+        let draft = run(args(&[
+            "agentflow",
+            "tools",
+            "draft-step",
+            "marker/marker_survival_scan",
+            "--input",
+            "TSV:artifact_table",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(draft.contains("\"id\":\"step_marker_survival_scan\""));
+        assert!(draft.contains("\"tool\":\"marker/marker_survival_scan\""));
+        assert!(draft.contains("\"expression_table\":\"artifact_table\""));
+        assert!(draft.contains("\"survival_table\":\"artifact_table\""));
+        assert!(draft.contains("\"gene\":\"REPLACE_gene\""));
+        assert!(draft.contains("\"report\":\"step_marker_survival_scan_report\""));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn tools_match_and_draft_step_human_output_work() {
+        let path = temp_project_path("tools-match-draft-human");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let spec_path = write_sample_tool(&path);
+        run(args(&[
+            "agentflow",
+            "tools",
+            "register",
+            spec_path.to_str().unwrap(),
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let matches = run(args(&[
+            "agentflow",
+            "tools",
+            "match",
+            "--output",
+            "Markdown",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(matches.contains("marker/marker_survival_scan [medium] score=11"));
+        assert!(matches.contains("reason=output:Markdown, maturity:wrapped"));
+
+        let draft = run(args(&[
+            "agentflow",
+            "tools",
+            "draft-step",
+            "marker/marker_survival_scan",
+            "--input",
+            "TSV:artifact_table",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(draft.contains("Step: step_marker_survival_scan"));
+        assert!(draft.contains("Tool: marker/marker_survival_scan"));
+        assert!(draft.contains("expression_table: artifact_table"));
+        assert!(draft.contains("gene: REPLACE_gene"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn tools_draft_step_propagates_missing_tool_error() {
+        let path = temp_project_path("tools-draft-missing");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let error = run(args(&[
+            "agentflow",
+            "tools",
+            "draft-step",
+            "missing/tool",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+
+        assert!(error.message().contains("not found: tool missing/tool"));
         let _ = fs::remove_dir_all(path);
     }
 

@@ -1,3 +1,6 @@
+mod agent_commands;
+mod agent_ops_commands;
+
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,6 +64,14 @@ where
         Some(command) if command == "observe" => observe_command(args),
         Some(command) if command == "observations" => observations_command(args),
         Some(command) if command == "research" => research_command(args),
+        Some(command) if command == "agent" => agent_ops_commands::agent_command(args),
+        Some(command) if command == "hypothesis" => agent_commands::hypothesis_command(args),
+        Some(command) if command == "evidence" => agent_commands::evidence_command(args),
+        Some(command) if command == "verdict" => agent_commands::verdict_command(args),
+        Some(command) if command == "branch" => agent_ops_commands::branch_command(args),
+        Some(command) if command == "decision" => agent_ops_commands::decision_command(args),
+        Some(command) if command == "forage" => agent_ops_commands::forage_command(args),
+        Some(command) if command == "trace" => agent_ops_commands::trace_command(args),
         Some(command) if command == "patch" => patch_command(args),
         Some(command) if command == "compare" => compare_command(args),
         Some(command) if command == "runs" => runs_command(args),
@@ -104,6 +115,29 @@ pub fn usage() -> String {
         "  agentflow research note --problem <text> --question <text> --finding <text> [--confidence low|medium|high] [--source <text>] [--path <path>]",
         "  agentflow research list [--json] [--path <path>]",
         "  agentflow research inspect <note-id> [--json] [--path <path>]",
+        "  agentflow hypothesis create --statement <text> --origin <text> --goal <goal-id> [--json] [--path <path>]",
+        "  agentflow hypothesis list [--json] [--path <path>]",
+        "  agentflow hypothesis show <hypothesis-id> [--json] [--path <path>]",
+        "  agentflow hypothesis transition <hypothesis-id> --to <status> [--confidence low|medium|high] [--json] [--path <path>]",
+        "  agentflow evidence link --hypothesis <id> --grade observed|inferred|literature_supported|hypothesis|unsupported --stance supports|contradicts|neutral --note <text> [--observation <obs-id>] [--source <text>] [--json] [--path <path>]",
+        "  agentflow evidence list --hypothesis <id> [--json] [--path <path>]",
+        "  agentflow verdict render --hypothesis <id> [--json] [--path <path>] [--gate-supports <text> --gate-against <text> --gate-alternatives <text> --gate-data-risks <text> --gate-assumptions <text> --gate-falsifier <text> --gate-claim-basis observed|inferred|speculative --gate-not-yet <text>]",
+        "  agentflow verdict show --hypothesis <id> [--json] [--path <path>]",
+        "  agentflow agent run [--json] [--path <path>]",
+        "  agentflow branch candidates [--json] [--path <path>]",
+        "  agentflow branch select [--explore] [--json] [--path <path>]",
+        "  agentflow decision list [--json] [--path <path>]",
+        "  agentflow decision pending [--json] [--path <path>]",
+        "  agentflow decision show <decision-id> [--json] [--path <path>]",
+        "  agentflow decision resolve <decision-id> --choose <index> --note <text> [--json] [--path <path>]",
+        "  agentflow forage observe --source <source> --external-id <external-id> --title <title> --access metadata_only|abstract_available|open_access_full_text|user_provided_full_text|subscription_connector_full_text|full_text_unavailable|retrieval_failed [--json] [--path <path>]",
+        "  agentflow forage list [--json] [--path <path>]",
+        "  agentflow forage show <forage-obs-id> [--json] [--path <path>]",
+        "  agentflow forage link --hypothesis <id> --observation <forage-obs-id> --stance supports|contradicts|neutral --note <text> [--json] [--path <path>]",
+        "  agentflow trace checkpoint --label <text> [--json] [--path <path>]",
+        "  agentflow trace list [--json] [--path <path>]",
+        "  agentflow trace drift <checkpoint-id> [--json] [--path <path>]",
+        "  agentflow trace revert <checkpoint-id> [--json] [--path <path>]",
         "  agentflow patch propose <flow-id> --title <text> --reason <text> (--patch-json <json>|--patch-file <file>) [--json] [--path <path>]",
         "  agentflow patch list <flow-id> [--json] [--path <path>]",
         "  agentflow patch approve <patch-id> [--json] [--path <path>]",
@@ -1876,14 +1910,14 @@ where
     Ok(options)
 }
 
-fn require_value<I>(flag: &str, args: &mut I) -> Result<String, CliError>
+pub(crate) fn require_value<I>(flag: &str, args: &mut I) -> Result<String, CliError>
 where
     I: Iterator<Item = OsString>,
 {
     next_arg(args)?.ok_or_else(|| CliError::InvalidArgument(format!("{flag} requires a value")))
 }
 
-fn next_arg<I>(args: &mut I) -> Result<Option<String>, CliError>
+pub(crate) fn next_arg<I>(args: &mut I) -> Result<Option<String>, CliError>
 where
     I: Iterator<Item = OsString>,
 {

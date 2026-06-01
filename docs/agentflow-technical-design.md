@@ -1057,6 +1057,8 @@ Observation should not require the Agent to parse raw large files.
 
 ## 15. Agent Layer
 
+> **优先级注记（2026-05-30）**：本节关于**自治姿态**的保守表述（"should be constrained"、Approval Policy 默认审批、Research Mode propose-only）已被 [`agentflow-agent-control-layer-design.md`](agentflow-agent-control-layer-design.md) §1.5 **重定调**。冲突处以控制层文档为准：自动化科研推进、动态图、智能分支选择为默认自治主线。本节仍有效的部分是：**硬禁止清单**（不直接操作 DB/shell、不绕过 registry）、检索合规（Research Source / Literature Retrieval Policy）、防自欺与 Evidence Grade、Hypothesis Lifecycle（其中 `inconclusive` 需带 `InconclusiveKind{Provisional|Fundamental}`，见控制层 §4.4）。下方 Approval Policy 清单不再表示"默认等批"，而是控制层"统一动作表"中**需交接/需强制论证**的那批高代价动作。
+
 The Agent Layer should be constrained.
 
 ### Agent Responsibilities

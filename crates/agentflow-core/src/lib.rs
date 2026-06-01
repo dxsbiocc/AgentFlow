@@ -4,14 +4,21 @@
 //! and reporting will grow behind this crate without depending on Omiga or UI
 //! code.
 
+pub mod agent;
+pub mod argument;
+pub mod branch;
 pub mod comparison;
 pub mod domain;
+pub mod forage;
 pub mod graph_patch;
+pub mod handoff;
+pub mod hypothesis;
 pub mod observer;
 pub mod report;
 pub mod research;
 pub mod runtime;
 pub mod storage;
+pub mod trace_guard;
 
 pub use observer::ObservationRecord;
 

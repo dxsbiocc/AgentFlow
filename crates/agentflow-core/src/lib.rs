@@ -18,6 +18,7 @@ pub mod report;
 pub mod research;
 pub mod runtime;
 pub mod storage;
+pub mod tool_select;
 pub mod trace_guard;
 
 pub use observer::ObservationRecord;

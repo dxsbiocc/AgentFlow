@@ -146,6 +146,33 @@ pub struct Resolution {
     pub resolved_at: i64,
 }
 
+impl DecisionPoint {
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"id\":\"{}\",",
+                "\"kind\":\"{}\",",
+                "\"digest\":\"{}\",",
+                "\"options\":{},",
+                "\"recommendation\":{},",
+                "\"status\":\"{}\",",
+                "\"resolution\":{},",
+                "\"created_at\":{}",
+                "}}"
+            ),
+            escape_json(&self.id),
+            self.kind.as_str(),
+            escape_json(&self.digest),
+            handoff_options_json(&self.options),
+            self.recommendation,
+            decision_status_as_str(self.status),
+            resolution_json(self.resolution.as_ref()),
+            self.created_at
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StepContext {
     pub cost: Cost,
@@ -376,6 +403,61 @@ fn resolution_payload_json(decision_point_id: &str, chosen_index: usize, note: &
         escape_json(decision_point_id),
         chosen_index,
         escape_json(note)
+    )
+}
+
+fn decision_status_as_str(status: DecisionStatus) -> &'static str {
+    match status {
+        DecisionStatus::Pending => "pending",
+        DecisionStatus::Resolved => "resolved",
+    }
+}
+
+fn handoff_options_json(options: &[HandoffOption]) -> String {
+    let items = options
+        .iter()
+        .map(handoff_option_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+fn handoff_option_json(option: &HandoffOption) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"label\":\"{}\",",
+            "\"direction\":\"{}\",",
+            "\"cost\":\"{}\",",
+            "\"risk\":\"{}\",",
+            "\"reversible\":{}",
+            "}}"
+        ),
+        escape_json(&option.label),
+        escape_json(&option.direction),
+        option.cost.as_str(),
+        option.risk.as_str(),
+        option.reversible
+    )
+}
+
+fn resolution_json(resolution: Option<&Resolution>) -> String {
+    resolution.map_or_else(
+        || "null".to_string(),
+        |resolution| {
+            format!(
+                concat!(
+                    "{{",
+                    "\"chosen_index\":{},",
+                    "\"note\":\"{}\",",
+                    "\"resolved_at\":{}",
+                    "}}"
+                ),
+                resolution.chosen_index,
+                escape_json(&resolution.note),
+                resolution.resolved_at
+            )
+        },
     )
 }
 

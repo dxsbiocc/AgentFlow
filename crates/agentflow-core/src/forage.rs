@@ -94,6 +94,29 @@ pub struct ForageObservation {
     pub retrieved_at: i64,
 }
 
+impl ForageObservation {
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"id\":\"{}\",",
+                "\"source_id\":\"{}\",",
+                "\"external_id\":\"{}\",",
+                "\"title\":\"{}\",",
+                "\"access_status\":\"{}\",",
+                "\"retrieved_at\":{}",
+                "}}"
+            ),
+            escape_json(&self.id),
+            escape_json(&self.source_id),
+            escape_json(&self.external_id),
+            escape_json(&self.title),
+            self.access_status.as_str(),
+            self.retrieved_at
+        )
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ForagePolicy {
     pub explore_enabled: bool,

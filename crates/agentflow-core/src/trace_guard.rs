@@ -40,6 +40,63 @@ pub struct RevertRecord {
     pub created_at: i64,
 }
 
+impl Checkpoint {
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"id\":\"{}\",",
+                "\"horizon_event_id\":{},",
+                "\"label\":\"{}\",",
+                "\"created_at\":{}",
+                "}}"
+            ),
+            escape_json(&self.id),
+            optional_json_string(self.horizon_event_id.as_deref()),
+            escape_json(&self.label),
+            self.created_at
+        )
+    }
+}
+
+impl DriftReport {
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"from_checkpoint\":\"{}\",",
+                "\"net_goal_delta\":\"{}\",",
+                "\"autonomous_steps\":{},",
+                "\"should_surface\":{}",
+                "}}"
+            ),
+            escape_json(&self.from_checkpoint),
+            escape_json(&self.net_goal_delta),
+            self.autonomous_steps,
+            self.should_surface
+        )
+    }
+}
+
+impl RevertRecord {
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"id\":\"{}\",",
+                "\"checkpoint_id\":\"{}\",",
+                "\"reverted_event_ids\":{},",
+                "\"created_at\":{}",
+                "}}"
+            ),
+            escape_json(&self.id),
+            escape_json(&self.checkpoint_id),
+            json_string_array(&self.reverted_event_ids),
+            self.created_at
+        )
+    }
+}
+
 impl ProjectStore {
     pub fn create_checkpoint(&self, label: &str) -> Result<Checkpoint, StorageError> {
         let label = validate_non_empty("checkpoint label", label)?;

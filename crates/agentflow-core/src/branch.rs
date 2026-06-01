@@ -62,6 +62,46 @@ pub struct BranchDecision {
     pub selected_by: SelectionMode,
 }
 
+impl BranchCandidate {
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"hypothesis_id\":\"{}\",",
+                "\"statement\":\"{}\",",
+                "\"verdict\":{},",
+                "\"confidence\":{},",
+                "\"kind\":\"{}\",",
+                "\"evidence_count\":{},",
+                "\"score\":{}",
+                "}}"
+            ),
+            escape_json(&self.hypothesis_id),
+            escape_json(&self.statement),
+            self.verdict
+                .map(|verdict| format!("\"{}\"", verdict.as_str()))
+                .unwrap_or_else(|| "null".to_string()),
+            self.confidence
+                .map(|confidence| format!("\"{}\"", confidence.as_str()))
+                .unwrap_or_else(|| "null".to_string()),
+            candidate_kind_as_str(self.kind),
+            self.evidence_count,
+            self.score
+        )
+    }
+}
+
+impl BranchDecision {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"candidate\":{},\"action\":{},\"selected_by\":\"{}\"}}",
+            self.candidate.to_json(),
+            branch_action_json(&self.action),
+            selection_mode_as_str(self.selected_by)
+        )
+    }
+}
+
 pub trait BranchSelector {
     fn rank(&self, candidates: Vec<BranchCandidate>) -> Vec<BranchCandidate>;
 }
@@ -261,6 +301,55 @@ fn action_reason(action: &BranchAction) -> &str {
         | BranchAction::Spawn { reason }
         | BranchAction::Abandon { reason, .. }
         | BranchAction::Hold { reason } => reason,
+    }
+}
+
+fn candidate_kind_as_str(kind: CandidateKind) -> &'static str {
+    match kind {
+        CandidateKind::Deepen => "deepen",
+        CandidateKind::Spawn => "spawn",
+        CandidateKind::Abandon => "abandon",
+        CandidateKind::Hold => "hold",
+    }
+}
+
+fn selection_mode_as_str(mode: SelectionMode) -> &'static str {
+    match mode {
+        SelectionMode::Exploit => "exploit",
+        SelectionMode::Explore => "explore",
+    }
+}
+
+fn branch_action_json(action: &BranchAction) -> String {
+    match action {
+        BranchAction::Deepen { reason } => format!(
+            "{{\"kind\":\"deepen\",\"reason\":\"{}\"}}",
+            escape_json(reason)
+        ),
+        BranchAction::Spawn { reason } => format!(
+            "{{\"kind\":\"spawn\",\"reason\":\"{}\"}}",
+            escape_json(reason)
+        ),
+        BranchAction::Abandon {
+            reason,
+            recommend_status,
+        } => format!(
+            concat!(
+                "{{",
+                "\"kind\":\"abandon\",",
+                "\"reason\":\"{}\",",
+                "\"recommend_status\":\"{}\"",
+                "}}"
+            ),
+            escape_json(reason),
+            recommend_status.as_str()
+        ),
+        BranchAction::Hold { reason } => {
+            format!(
+                "{{\"kind\":\"hold\",\"reason\":\"{}\"}}",
+                escape_json(reason)
+            )
+        }
     }
 }
 

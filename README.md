@@ -9,13 +9,14 @@ Posture as of 2026-06-01:
 - The runtime slice (tool/artifact/flow/run/cache/env) and the agent control layer
   (four engines + propose-mode control loop + literature retrieval) are implemented and
   green on the workspace baseline.
-- The control loop runs in **propose mode**: it advances autonomously but proposes graph
-  changes and raises decision points rather than auto-applying — autonomous apply is gated
-  pending explicit enablement (see "Explicitly Not Supported Yet").
+- The control loop defaults to **propose mode** (advances autonomously, proposes changes,
+  raises decision points). Autonomous apply is available **opt-in and OFF by default** via
+  `agent run --apply`: applies only inside a brake-gated, capped, revertable safe envelope,
+  and never auto-affirms a strong verdict — those always hand off to the user.
 - Repo-local and Rust-workspace driven; no packaged binary release yet.
 
 See [docs/agentflow-agent-control-layer-design.md](docs/agentflow-agent-control-layer-design.md)
-for the control-layer architecture (engines, control constitution A1–A4, milestones H1–H7a),
+for the control-layer architecture (engines, control constitution A1–A4, milestones H1–H7b),
 and [launch-readiness-2026-05-29.md](docs/status/launch-readiness-2026-05-29.md) for the
 runtime-slice launch status.
 
@@ -95,6 +96,9 @@ the database or shell directly, and the loop never auto-applies graph changes.
 - **Branch engine** — verdict-driven branch selection (deepen / spawn / abandon / hold) with
   deterministic scoring; proposes graph patches through the approval-gated patch flow only.
   - `branch candidates|select`
+- **Tool selection** — matches the tool registry against a capability query (desired output type,
+  available input types, keywords, maturity) and drafts a concrete `ProposedStep` for the top tool.
+  - `tools match`, `tools draft-step`
 - **Handoff engine** — brake policy that hands control back to the user at high-cost / irreversible /
   goal-mutating forks; decision points carry a digest, options, and a recommendation.
   - `decision list|pending|show|resolve`
@@ -106,8 +110,11 @@ the database or shell directly, and the loop never auto-applies graph changes.
   make autonomous advancement auditable and reversible.
   - `trace checkpoint|list|drift|revert`
 - **Control loop** — `agent run` orchestrates the engines for one cycle: previews verdicts, persists
-  provisional ones, and raises a decision point (instead of fabricating a claim) whenever the evidence
-  would imply a strong verdict that needs a human self-deception gate.
+  provisional ones, enriches deepen/spawn proposals with a matched tool + drafted step, and raises a
+  decision point (instead of fabricating a claim) whenever the evidence would imply a strong verdict
+  that needs a human self-deception gate.
+  - `agent run` (propose mode, default) · `agent run --apply [--flow <id>] [--max-apply <n>]` (opt-in
+    autonomous apply: brake-gated, capped, revertable; strong verdicts and abandons still hand off)
 
 End-to-end research loop:
 
@@ -116,14 +123,17 @@ agentflow forage fetch --query "KRAS G12C resistance" --max 10 --path "$AF_DEMO"
 agentflow hypothesis create --statement "KRAS G12C resistance is adaptive" --origin user_goal --goal g1 --path "$AF_DEMO"
 agentflow forage list --json --path "$AF_DEMO"            # copy a forage observation id
 agentflow forage link --hypothesis <hyp-id> --observation <forage-obs-id> --stance supports --note "PubMed" --path "$AF_DEMO"
-agentflow agent run --path "$AF_DEMO"                     # autonomous cycle; hands off on strong verdicts
+agentflow agent run --path "$AF_DEMO"                     # propose mode (default); hands off on strong verdicts
+agentflow agent run --apply --path "$AF_DEMO"             # opt-in autonomous apply (safe envelope; off by default)
 agentflow decision pending --path "$AF_DEMO"              # resolve raised decisions
+agentflow trace revert <checkpoint-id> --path "$AF_DEMO"  # roll back auto-applied state if needed
 ```
 
 ## Explicitly Not Supported Yet
 
-- Autonomous graph mutation: the control loop (`agent run`) proposes branch patches and raises decision points but does **not** auto-apply graph changes or auto-transition hypotheses; auto-apply within a safe envelope (and revert-horizon-aware projections) is gated pending explicit enablement
-- Automatic tool recommendation/selection driven by forage results
+- Default-on autonomy: autonomous apply is **off by default** and only runs when the operator passes `agent run --apply`; there is no always-on/unattended autonomous mode
+- Autonomous dependency wiring: applied steps are added without inferred `needs` edges; cross-step graph wiring, multi-flow orchestration, and auto-forage (deepen → fetch evidence) are not yet wired into the loop
+- Tool promotion pipeline and capability tagging: tool matching uses description/port-type/maturity heuristics, not a curated capability index or exploratory→verified promotion flow
 - Implicit environment creation, solving, or package installation during `run`
 - Full lockfile normalization, dependency solving, package-manager-specific diff semantics, or environment garbage collection
 - Remote or isolated execution backends such as Docker, Singularity, or SLURM

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentflow_core::agent::{CycleReport, EnrichedProposal};
+use agentflow_core::agent::{AppliedAction, ApplyConfig, CycleReport, EnrichedProposal};
 use agentflow_core::argument::{EvidenceLink, Stance};
 use agentflow_core::branch::{
     BranchAction, BranchCandidate, BranchDecision, BranchPolicy, CandidateKind, RuleBasedSelector,
@@ -19,6 +19,25 @@ use crate::{next_arg, require_value, CliError};
 struct PathJsonOptions {
     path: Option<PathBuf>,
     json: bool,
+}
+
+#[derive(Debug)]
+struct AgentRunOptions {
+    project: PathJsonOptions,
+    apply: bool,
+    flow: Option<String>,
+    max_apply: u32,
+}
+
+impl Default for AgentRunOptions {
+    fn default() -> Self {
+        Self {
+            project: PathJsonOptions::default(),
+            apply: false,
+            flow: None,
+            max_apply: 5,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -183,12 +202,16 @@ fn agent_run_command<I>(args: I) -> Result<String, CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let options = parse_path_json_options(args, "agent run")?;
-    let path = options.path.unwrap_or(std::env::current_dir()?);
+    let options = parse_agent_run_options(args)?;
+    let path = options.project.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
-    let report = store.run_cycle()?;
+    let report = store.run_cycle_with_apply_config(ApplyConfig {
+        apply: options.apply,
+        flow: options.flow,
+        max_apply: options.max_apply,
+    })?;
 
-    if options.json {
+    if options.project.json {
         Ok(report.to_json())
     } else {
         Ok(format_cycle_report(&report))
@@ -652,6 +675,49 @@ where
     Ok(options)
 }
 
+fn parse_agent_run_options<I>(args: I) -> Result<AgentRunOptions, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut options = AgentRunOptions::default();
+    let mut args = args.into_iter();
+
+    while let Some(arg) = next_arg(&mut args)? {
+        match arg.as_str() {
+            "--path" => {
+                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
+            }
+            "--json" => {
+                options.project.json = true;
+            }
+            "--apply" => {
+                options.apply = true;
+            }
+            "--flow" => {
+                options.flow = Some(require_value("--flow", &mut args)?);
+            }
+            "--max-apply" => {
+                let max_apply = parse_usize_flag("--max-apply", &mut args)?;
+                options.max_apply = u32::try_from(max_apply).map_err(|_| {
+                    CliError::InvalidArgument(
+                        "--max-apply must fit in an unsigned 32-bit integer".to_string(),
+                    )
+                })?;
+            }
+            _ if arg.starts_with('-') => {
+                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
+            }
+            _ => {
+                return Err(CliError::InvalidArgument(format!(
+                    "agent run does not accept positional argument: {arg}"
+                )));
+            }
+        }
+    }
+
+    Ok(options)
+}
+
 fn parse_branch_select_options<I>(args: I) -> Result<BranchSelectOptions, CliError>
 where
     I: IntoIterator<Item = OsString>,
@@ -1034,7 +1100,7 @@ fn forage_ingest_summary_json(observations: &[ForageObservation]) -> String {
 }
 
 fn format_cycle_report(report: &CycleReport) -> String {
-    format!(
+    let base = format!(
         "Agent cycle complete\nCheckpoint: {}\nProvisional verdicts: {}\nStrong candidates: {}\nRaised decisions: {}\nBranch proposals: {}\nOutcome: {}\nDecision points:\n{}\nBranch proposal details:\n{}",
         report.checkpoint_id,
         report.provisional_verdicts.len(),
@@ -1044,7 +1110,15 @@ fn format_cycle_report(report: &CycleReport) -> String {
         report.outcome.as_str(),
         format_cycle_decision_summaries(&report.raised_decisions),
         format_cycle_branch_summaries(&report.branch_proposals)
-    )
+    );
+    if report.applied.is_empty() {
+        base
+    } else {
+        format!(
+            "{base}\nApplied:\n{}",
+            format_applied_actions(&report.applied)
+        )
+    }
 }
 
 fn format_cycle_decision_summaries(points: &[DecisionPoint]) -> String {
@@ -1075,6 +1149,26 @@ fn format_cycle_branch_summaries(proposals: &[EnrichedProposal]) -> String {
                 branch_action_reason(&proposal.decision.action),
                 branch_match_summary(proposal)
             )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_applied_actions(actions: &[AppliedAction]) -> String {
+    actions
+        .iter()
+        .map(|action| match action {
+            AppliedAction::LifecycleTransition { hypothesis_id, to } => {
+                format!("  lifecycle {} -> {}", hypothesis_id, to)
+            }
+            AppliedAction::GraphPatchApplied {
+                flow_id,
+                patch_id,
+                step_id,
+            } => format!(
+                "  graph patch {} applied to {} step {}",
+                patch_id, flow_id, step_id
+            ),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1465,7 +1559,7 @@ mod tests {
     use crate::run;
     use agentflow_core::argument::{EvidenceGrade, EvidenceLinkRequest};
     use agentflow_core::handoff::{Cost, DecisionKind, HandoffOption, Risk};
-    use agentflow_core::hypothesis::HypothesisRequest;
+    use agentflow_core::hypothesis::{HypothesisRequest, HypothesisStatus};
     use agentflow_core::storage::{EventRecord, ProjectStore};
 
     fn args(items: &[&str]) -> Vec<OsString> {
@@ -1562,6 +1656,36 @@ mod tests {
         assert!(json.contains("\"outcome\":\"advanced\""));
         assert!(json.contains("\"matched_tool\":null"));
         assert!(json.contains(&hypothesis_id));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn agent_run_apply_flag_autolands_lifecycle_and_reports_applied_json() {
+        let path = temp_project_path("agent-run-apply");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis(&store);
+        link_weak_evidence(&store, &hypothesis_id);
+
+        let json = run(args(&[
+            "agentflow",
+            "agent",
+            "run",
+            "--apply",
+            "--max-apply",
+            "1",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(json.contains("\"applied\":[{"));
+        assert!(json.contains("\"type\":\"lifecycle_transition\""));
+        assert_eq!(
+            store.inspect_hypothesis(&hypothesis_id).unwrap().status,
+            HypothesisStatus::UnderTest
+        );
 
         let _ = std::fs::remove_dir_all(path);
     }

@@ -1,13 +1,23 @@
 # AgentFlow
 
-AgentFlow is a CLI-first local workflow runtime for scientific task graphs.
+AgentFlow is a CLI-first local workflow runtime for scientific task graphs, with an
+**agent control layer** that drives the research loop: hypothesis → evidence → three-state
+verdict → branch selection → human handoff, with a full audit trail.
 
-Technical preview posture as of 2026-05-29:
+Posture as of 2026-06-01:
 
-- Scope is ready for local, operator-driven demos of the usable CLI runtime slice on a green workspace baseline.
-- Not ready to be positioned as a full autonomous research workflow system.
-- Current implementation is repo-local and Rust-workspace driven; there is no packaged binary release yet.
-- This branch should only be published after the Rust workspace gates below are green.
+- The runtime slice (tool/artifact/flow/run/cache/env) and the agent control layer
+  (four engines + propose-mode control loop + literature retrieval) are implemented and
+  green on the workspace baseline.
+- The control loop runs in **propose mode**: it advances autonomously but proposes graph
+  changes and raises decision points rather than auto-applying — autonomous apply is gated
+  pending explicit enablement (see "Explicitly Not Supported Yet").
+- Repo-local and Rust-workspace driven; no packaged binary release yet.
+
+See [docs/agentflow-agent-control-layer-design.md](docs/agentflow-agent-control-layer-design.md)
+for the control-layer architecture (engines, control constitution A1–A4, milestones H1–H7a),
+and [launch-readiness-2026-05-29.md](docs/status/launch-readiness-2026-05-29.md) for the
+runtime-slice launch status.
 
 See [launch-readiness-2026-05-29.md](docs/status/launch-readiness-2026-05-29.md) for the launch-facing status, known gaps, and residual risks.
 
@@ -71,9 +81,49 @@ cargo run -q -p agentflow-cli -- report marker_demo --path "$AF_DEMO"
 - Explicit Conda/micromamba environment update through `env prepare <tool-ref>` when `runtime.env_file` is declared
 - Conda/micromamba environment export evidence through `env export <tool-ref>`, including export hash and conservative package-set diff against declared `runtime.env_file` dependencies
 
+## Agent Control Layer
+
+The control layer turns the runtime into a research-reasoning loop. All state is event-sourced
+into the same project-local `.agentflow/` store; engines never bypass the runtime, never mutate
+the database or shell directly, and the loop never auto-applies graph changes.
+
+- **Argument engine** — hypotheses as first-class objects with a 7-state lifecycle, an evidence
+  ledger graded by evidence quality, and a rule-based three-state verdict (`affirmed` / `refuted` /
+  `inconclusive`, the latter split into provisional vs fundamental). Strong verdicts require a
+  self-deception gate (against + alternatives + non-speculative basis) before they can be recorded.
+  - `hypothesis create|list|show|transition`, `evidence link|list`, `verdict render|show`
+- **Branch engine** — verdict-driven branch selection (deepen / spawn / abandon / hold) with
+  deterministic scoring; proposes graph patches through the approval-gated patch flow only.
+  - `branch candidates|select`
+- **Handoff engine** — brake policy that hands control back to the user at high-cost / irreversible /
+  goal-mutating forks; decision points carry a digest, options, and a recommendation.
+  - `decision list|pending|show|resolve`
+- **Forage engine** — literature retrieval with §15 access-status compliance (abstract-only evidence
+  cannot drive an `affirmed` verdict); freshness/evaporation modelling. Retrieval runs as an external
+  process so the Rust core stays HTTP/dependency-free.
+  - `forage fetch|ingest|observe|list|show|link` (real PubMed via `examples/tools/pubmed_search.py`)
+- **Trace safety net** — checkpoints, cumulative-drift detection, and append-only revert records that
+  make autonomous advancement auditable and reversible.
+  - `trace checkpoint|list|drift|revert`
+- **Control loop** — `agent run` orchestrates the engines for one cycle: previews verdicts, persists
+  provisional ones, and raises a decision point (instead of fabricating a claim) whenever the evidence
+  would imply a strong verdict that needs a human self-deception gate.
+
+End-to-end research loop:
+
+```bash
+agentflow forage fetch --query "KRAS G12C resistance" --max 10 --path "$AF_DEMO"
+agentflow hypothesis create --statement "KRAS G12C resistance is adaptive" --origin user_goal --goal g1 --path "$AF_DEMO"
+agentflow forage list --json --path "$AF_DEMO"            # copy a forage observation id
+agentflow forage link --hypothesis <hyp-id> --observation <forage-obs-id> --stance supports --note "PubMed" --path "$AF_DEMO"
+agentflow agent run --path "$AF_DEMO"                     # autonomous cycle; hands off on strong verdicts
+agentflow decision pending --path "$AF_DEMO"              # resolve raised decisions
+```
+
 ## Explicitly Not Supported Yet
 
-- Agent planning, tool recommendation, or autonomous graph authoring
+- Autonomous graph mutation: the control loop (`agent run`) proposes branch patches and raises decision points but does **not** auto-apply graph changes or auto-transition hypotheses; auto-apply within a safe envelope (and revert-horizon-aware projections) is gated pending explicit enablement
+- Automatic tool recommendation/selection driven by forage results
 - Implicit environment creation, solving, or package installation during `run`
 - Full lockfile normalization, dependency solving, package-manager-specific diff semantics, or environment garbage collection
 - Remote or isolated execution backends such as Docker, Singularity, or SLURM
@@ -82,7 +132,7 @@ cargo run -q -p agentflow-cli -- report marker_demo --path "$AF_DEMO"
 - Full graph-branch lifecycle such as delete, merge, rollback, supersede, or decision-node management
 - Cache eviction policy beyond explicit `--all` and `--older-than-seconds` pruning
 - JSON/HTML report export or persisted report artifacts
-- Literature search, citation tracking, or networked Research Mode
+- Full-text retrieval, citation graphs, Unpaywall resolution, or non-PubMed literature sources (forage currently covers PubMed metadata/abstracts via an external script)
 - Security sandboxing, container isolation, redaction policy, or resource quotas
 
 ## Verification Commands

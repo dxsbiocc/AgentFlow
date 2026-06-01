@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use agentflow_core::agent::CycleReport;
 use agentflow_core::argument::{EvidenceLink, Stance};
 use agentflow_core::branch::{
     BranchAction, BranchCandidate, BranchDecision, BranchPolicy, CandidateKind, RuleBasedSelector,
@@ -60,6 +61,22 @@ struct ForageLinkOptions {
 struct TraceCheckpointOptions {
     project: PathJsonOptions,
     label: Option<String>,
+}
+
+pub(crate) fn agent_command<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    match next_arg(&mut args)? {
+        Some(command) if command == "run" => agent_run_command(args),
+        Some(command) => Err(CliError::InvalidArgument(format!(
+            "unknown agent command: {command}"
+        ))),
+        None => Err(CliError::InvalidArgument(
+            "agent requires a command: run".to_string(),
+        )),
+    }
 }
 
 pub(crate) fn branch_command<I>(args: I) -> Result<String, CliError>
@@ -133,6 +150,22 @@ where
         None => Err(CliError::InvalidArgument(
             "trace requires a command: checkpoint, list, drift, or revert".to_string(),
         )),
+    }
+}
+
+fn agent_run_command<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let options = parse_path_json_options(args, "agent run")?;
+    let path = options.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&path)?;
+    let report = store.run_cycle()?;
+
+    if options.json {
+        Ok(report.to_json())
+    } else {
+        Ok(format_cycle_report(&report))
     }
 }
 
@@ -781,6 +814,31 @@ fn checkpoints_json(checkpoints: &[Checkpoint]) -> String {
     format!("{{\"schema_version\":\"agentflow.checkpoints.v0\",\"checkpoints\":[{items}]}}")
 }
 
+fn format_cycle_report(report: &CycleReport) -> String {
+    format!(
+        "Agent cycle complete\nCheckpoint: {}\nProvisional verdicts: {}\nStrong candidates: {}\nRaised decisions: {}\nBranch proposals: {}\nOutcome: {}\nDecision points:\n{}",
+        report.checkpoint_id,
+        report.provisional_verdicts.len(),
+        report.strong_candidates.len(),
+        report.raised_decisions.len(),
+        report.branch_proposals.len(),
+        report.outcome.as_str(),
+        format_cycle_decision_summaries(&report.raised_decisions)
+    )
+}
+
+fn format_cycle_decision_summaries(points: &[DecisionPoint]) -> String {
+    if points.is_empty() {
+        return "  none".to_string();
+    }
+
+    points
+        .iter()
+        .map(|point| format!("  {} [{}] {}", point.id, point.kind.as_str(), point.digest))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn format_branch_candidate(candidate: &BranchCandidate) -> String {
     format!(
         "{} [{}/score {}] {}\n  verdict: {}\n  confidence: {}\n  evidence: {}",
@@ -976,6 +1034,7 @@ fn decision_status_as_str(status: DecisionStatus) -> &'static str {
 mod tests {
     use super::*;
     use crate::run;
+    use agentflow_core::argument::{EvidenceGrade, EvidenceLinkRequest};
     use agentflow_core::handoff::{Cost, DecisionKind, HandoffOption, Risk};
     use agentflow_core::hypothesis::HypothesisRequest;
     use agentflow_core::storage::{EventRecord, ProjectStore};
@@ -1008,6 +1067,19 @@ mod tests {
             .id
     }
 
+    fn link_weak_evidence(store: &ProjectStore, hypothesis_id: &str) {
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis_id.to_string(),
+                observation_id: None,
+                source: None,
+                grade: EvidenceGrade::LiteratureSupported,
+                stance: Stance::Supports,
+                note: "Literature support remains provisional.".to_string(),
+            })
+            .unwrap();
+    }
+
     fn option(label: &str) -> HandoffOption {
         HandoffOption {
             label: label.to_string(),
@@ -1025,6 +1097,41 @@ mod tests {
             .and_then(|rest| rest.split('"').next())
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn agent_run_works_with_human_and_json_output() {
+        let path = temp_project_path("agent-run-happy");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis(&store);
+        link_weak_evidence(&store, &hypothesis_id);
+
+        let human = run(args(&[
+            "agentflow",
+            "agent",
+            "run",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(human.contains("Agent cycle complete"));
+        assert!(human.contains("Outcome: advanced"));
+        assert!(human.contains("Provisional verdicts: 1"));
+
+        let json = run(args(&[
+            "agentflow",
+            "agent",
+            "run",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(json.contains("\"schema_version\":\"agentflow.agent_cycle.v0\""));
+        assert!(json.contains("\"outcome\":\"advanced\""));
+        assert!(json.contains(&hypothesis_id));
+
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! and reporting will grow behind this crate without depending on Omiga or UI
 //! code.
 
+pub mod agent;
 pub mod argument;
 pub mod branch;
 pub mod comparison;

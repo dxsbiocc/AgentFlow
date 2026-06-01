@@ -170,6 +170,7 @@ impl ProjectStore {
     }
 
     pub fn list_hypotheses(&self) -> Result<Vec<Hypothesis>, StorageError> {
+        let reverted = self.reverted_event_id_set()?;
         let mut stmt = self.connection().prepare(
             "SELECT id, event_type, payload_json, created_at
              FROM events
@@ -191,6 +192,9 @@ impl ProjectStore {
         let mut hypotheses = Vec::new();
         for row in rows {
             let (event_id, event_type, payload_json, created_at) = row?;
+            if reverted.contains(&event_id) {
+                continue;
+            }
             match event_type.as_str() {
                 HYPOTHESIS_CREATED_EVENT => {
                     hypotheses.push(hypothesis_from_created_event(
@@ -507,6 +511,48 @@ mod tests {
 
         let hypotheses = store.list_hypotheses().unwrap();
         assert_eq!(hypotheses[0].status, HypothesisStatus::Supported);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn reverted_transition_event_restores_previous_projection_state() {
+        let path = temp_project_path("reverted-transition");
+        let store = ProjectStore::init(&path, Some("Hypothesis Demo")).unwrap();
+        let hypothesis = store
+            .record_hypothesis(HypothesisRequest {
+                statement: "Candidate pathway is enriched".to_string(),
+                origin: "agent".to_string(),
+                related_goal_id: "goal_revert".to_string(),
+            })
+            .unwrap();
+        store
+            .transition_hypothesis(
+                &hypothesis.id,
+                HypothesisStatus::UnderTest,
+                Confidence::Medium,
+            )
+            .unwrap();
+        let checkpoint = store.create_checkpoint("before-supported").unwrap();
+        store
+            .transition_hypothesis(
+                &hypothesis.id,
+                HypothesisStatus::Supported,
+                Confidence::High,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.inspect_hypothesis(&hypothesis.id).unwrap().status,
+            HypothesisStatus::Supported
+        );
+
+        store.revert_to(&checkpoint.id).unwrap();
+
+        let inspected = store.inspect_hypothesis(&hypothesis.id).unwrap();
+        assert_eq!(inspected.status, HypothesisStatus::UnderTest);
+        assert_eq!(inspected.confidence, Confidence::Medium);
+        assert_eq!(store.list_hypotheses().unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(path);
     }

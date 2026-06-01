@@ -236,6 +236,7 @@ impl ProjectStore {
     }
 
     pub fn list_decision_points(&self) -> Result<Vec<DecisionPoint>, StorageError> {
+        let reverted = self.reverted_event_id_set()?;
         let mut stmt = self.connection().prepare(
             "SELECT id, event_type, payload_json, created_at
              FROM events
@@ -257,6 +258,9 @@ impl ProjectStore {
         let mut points = Vec::new();
         for row in rows {
             let (event_id, event_type, payload_json, created_at) = row?;
+            if reverted.contains(&event_id) {
+                continue;
+            }
             match event_type.as_str() {
                 DECISION_POINT_RAISED_EVENT => {
                     points.push(decision_point_from_raised_event(
@@ -977,6 +981,47 @@ mod tests {
                 "handoff.user_resolved".to_string()
             ]
         );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn reverted_handoff_events_restore_pending_state_and_hide_later_points() {
+        let path = temp_project_path("reverted-events");
+        let store = ProjectStore::init(&path, Some("Handoff Demo")).unwrap();
+        let kept_id = raise_demo_point(&store);
+        let checkpoint = store.create_checkpoint("before-resolution").unwrap();
+        store
+            .resolve_decision_point(&kept_id, 0, "continue")
+            .unwrap();
+        let removed_id = store
+            .raise_decision_point(
+                DecisionKind::BudgetThreshold,
+                "later budget threshold",
+                vec![option("pause"), option("continue")],
+                0,
+            )
+            .unwrap()
+            .id;
+
+        assert_eq!(
+            store.inspect_decision_point(&kept_id).unwrap().status,
+            DecisionStatus::Resolved
+        );
+        assert_eq!(store.list_decision_points().unwrap().len(), 2);
+
+        store.revert_to(&checkpoint.id).unwrap();
+
+        let points = store.list_decision_points().unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].id, kept_id);
+        assert_eq!(points[0].status, DecisionStatus::Pending);
+        assert!(points[0].resolution.is_none());
+        assert_eq!(store.pending_decision_points().unwrap().len(), 1);
+        assert!(matches!(
+            store.inspect_decision_point(&removed_id).unwrap_err(),
+            StorageError::NotFound(_)
+        ));
 
         let _ = std::fs::remove_dir_all(path);
     }

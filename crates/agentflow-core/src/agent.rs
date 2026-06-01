@@ -2,9 +2,13 @@ use std::collections::BTreeSet;
 
 use crate::argument::{ArgumentEngine, InconclusiveKind, RuleBasedEngine, Verdict, VerdictReport};
 use crate::branch::{BranchAction, BranchDecision, BranchPolicy, ProposedStep, RuleBasedSelector};
-use crate::handoff::{Cost, DecisionKind, DecisionPoint, HandoffOption, Risk};
+use crate::handoff::{
+    Cost, DecisionKind, DecisionPoint, DefaultPolicy, HandoffOption, InterventionPolicy, Risk,
+    StepContext,
+};
+use crate::hypothesis::HypothesisStatus;
 use crate::storage::{ArtifactSummary, EventRecord, ProjectStore, StorageError};
-use crate::tool_select::CapabilityQuery;
+use crate::tool_select::{CapabilityQuery, Fit};
 
 const AGENT_CYCLE_COMPLETED_EVENT: &str = "agent.cycle_completed";
 
@@ -59,12 +63,78 @@ impl EnrichedProposal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyConfig {
+    pub apply: bool,
+    pub flow: Option<String>,
+    pub max_apply: u32,
+}
+
+impl Default for ApplyConfig {
+    fn default() -> Self {
+        Self {
+            apply: false,
+            flow: None,
+            max_apply: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppliedAction {
+    LifecycleTransition {
+        hypothesis_id: String,
+        to: String,
+    },
+    GraphPatchApplied {
+        flow_id: String,
+        patch_id: String,
+        step_id: String,
+    },
+}
+
+impl AppliedAction {
+    pub fn to_json(&self) -> String {
+        match self {
+            Self::LifecycleTransition { hypothesis_id, to } => format!(
+                concat!(
+                    "{{",
+                    "\"type\":\"lifecycle_transition\",",
+                    "\"hypothesis_id\":\"{}\",",
+                    "\"to\":\"{}\"",
+                    "}}"
+                ),
+                escape_json(hypothesis_id),
+                escape_json(to)
+            ),
+            Self::GraphPatchApplied {
+                flow_id,
+                patch_id,
+                step_id,
+            } => format!(
+                concat!(
+                    "{{",
+                    "\"type\":\"graph_patch_applied\",",
+                    "\"flow_id\":\"{}\",",
+                    "\"patch_id\":\"{}\",",
+                    "\"step_id\":\"{}\"",
+                    "}}"
+                ),
+                escape_json(flow_id),
+                escape_json(patch_id),
+                escape_json(step_id)
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CycleReport {
     pub checkpoint_id: String,
     pub provisional_verdicts: Vec<String>,
     pub strong_candidates: Vec<String>,
     pub raised_decisions: Vec<DecisionPoint>,
     pub branch_proposals: Vec<EnrichedProposal>,
+    pub applied: Vec<AppliedAction>,
     pub outcome: CycleOutcome,
 }
 
@@ -82,6 +152,17 @@ impl CycleReport {
             .map(EnrichedProposal::to_json)
             .collect::<Vec<_>>()
             .join(",");
+        let applied = self
+            .applied
+            .iter()
+            .map(AppliedAction::to_json)
+            .collect::<Vec<_>>()
+            .join(",");
+        let applied_field = if self.applied.is_empty() {
+            String::new()
+        } else {
+            format!("\"applied\":[{applied}],")
+        };
 
         format!(
             concat!(
@@ -92,6 +173,7 @@ impl CycleReport {
                 "\"strong_candidates\":{},",
                 "\"raised_decisions\":[{}],",
                 "\"branch_proposals\":[{}],",
+                "{}",
                 "\"outcome\":\"{}\"",
                 "}}"
             ),
@@ -100,6 +182,7 @@ impl CycleReport {
             json_string_array(&self.strong_candidates),
             decisions,
             branch_proposals,
+            applied_field,
             self.outcome.as_str()
         )
     }
@@ -107,12 +190,21 @@ impl CycleReport {
 
 impl ProjectStore {
     pub fn run_cycle(&self) -> Result<CycleReport, StorageError> {
+        self.run_cycle_with_apply_config(ApplyConfig::default())
+    }
+
+    pub fn run_cycle_with_apply_config(
+        &self,
+        config: ApplyConfig,
+    ) -> Result<CycleReport, StorageError> {
         let checkpoint = self.create_checkpoint("agent_cycle")?;
         let engine = RuleBasedEngine;
+        let policy = DefaultPolicy;
         let mut provisional_verdicts = Vec::new();
         let mut strong_candidates = Vec::new();
         let mut raised_decisions = Vec::new();
         let mut branch_proposals = Vec::new();
+        let mut applied = Vec::new();
 
         for hypothesis in self.list_hypotheses()? {
             let evidence = self.evidence_for(&hypothesis.id)?;
@@ -120,7 +212,36 @@ impl ProjectStore {
             match &preview.verdict {
                 Verdict::Inconclusive(InconclusiveKind::Provisional { .. }) => {
                     self.render_verdict(&hypothesis.id, &engine, None)?;
-                    provisional_verdicts.push(hypothesis.id);
+                    provisional_verdicts.push(hypothesis.id.clone());
+                    if config.apply && hypothesis.status == HypothesisStatus::Proposed {
+                        let ctx = StepContext {
+                            cost: Cost::Cheap,
+                            reversible: true,
+                            equivalent_branches: false,
+                            conflicts_user_premise: false,
+                            mutates_goal: false,
+                            near_budget: applied.len() as u32 >= config.max_apply,
+                        };
+                        if let Some(kind) = policy.assess(&ctx) {
+                            let point = self.raise_decision_point(
+                                kind,
+                                &lifecycle_apply_digest(&hypothesis.id),
+                                lifecycle_apply_options(&hypothesis.id),
+                                0,
+                            )?;
+                            raised_decisions.push(point);
+                        } else {
+                            self.transition_hypothesis(
+                                &hypothesis.id,
+                                HypothesisStatus::UnderTest,
+                                hypothesis.confidence,
+                            )?;
+                            applied.push(AppliedAction::LifecycleTransition {
+                                hypothesis_id: hypothesis.id,
+                                to: HypothesisStatus::UnderTest.as_str().to_string(),
+                            });
+                        }
+                    }
                 }
                 Verdict::Affirmed
                 | Verdict::Refuted
@@ -161,18 +282,58 @@ impl ProjectStore {
                     raised_decisions.push(point);
                 }
                 BranchAction::Deepen { .. } | BranchAction::Spawn { .. } => {
-                    branch_proposals.push(self.enrich_branch_proposal(
-                        decision,
-                        &available_input_types,
-                        &available,
-                    )?);
+                    let proposal =
+                        self.enrich_branch_proposal(decision, &available_input_types, &available)?;
+                    if config.apply {
+                        if let (Some(flow_id), Some(step)) =
+                            (config.flow.as_deref(), proposal.drafted_step.as_ref())
+                        {
+                            let ctx = StepContext {
+                                cost: Cost::Moderate,
+                                reversible: true,
+                                equivalent_branches: self.has_equivalent_tool_branches(
+                                    &proposal.decision,
+                                    &available_input_types,
+                                )?,
+                                conflicts_user_premise: false,
+                                mutates_goal: false,
+                                near_budget: applied.len() as u32 >= config.max_apply,
+                            };
+                            if let Some(kind) = policy.assess(&ctx) {
+                                let point = self.raise_decision_point(
+                                    kind,
+                                    &graph_patch_apply_digest(&proposal.decision, flow_id),
+                                    graph_patch_apply_options(
+                                        &proposal.decision.candidate.hypothesis_id,
+                                        flow_id,
+                                    ),
+                                    0,
+                                )?;
+                                raised_decisions.push(point);
+                            } else {
+                                let patch =
+                                    self.propose_branch_patch(flow_id, &proposal.decision, step)?;
+                                self.approve_graph_patch(&patch.id)?;
+                                let application = self.apply_graph_patch(&patch.id)?;
+                                for step_id in application.applied_steps {
+                                    applied.push(AppliedAction::GraphPatchApplied {
+                                        flow_id: flow_id.to_string(),
+                                        patch_id: patch.id.clone(),
+                                        step_id,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    branch_proposals.push(proposal);
                 }
                 BranchAction::Hold { .. } => {}
             }
         }
 
         let outcome = if raised_decisions.is_empty() {
-            if provisional_verdicts.is_empty() && branch_proposals.is_empty() {
+            if provisional_verdicts.is_empty() && branch_proposals.is_empty() && applied.is_empty()
+            {
                 CycleOutcome::Idle
             } else {
                 CycleOutcome::Advanced
@@ -187,6 +348,7 @@ impl ProjectStore {
             strong_candidates,
             raised_decisions,
             branch_proposals,
+            applied,
             outcome,
         };
         self.append_event(EventRecord {
@@ -234,6 +396,25 @@ impl ProjectStore {
             match_reason: Some(candidate.reason),
             drafted_step: Some(drafted_step),
         })
+    }
+
+    fn has_equivalent_tool_branches(
+        &self,
+        decision: &BranchDecision,
+        available_input_types: &[String],
+    ) -> Result<bool, StorageError> {
+        let query = CapabilityQuery {
+            desired_output_type: None,
+            available_input_types: available_input_types.to_vec(),
+            keywords: proposal_keywords(&decision.candidate.statement),
+        };
+        let candidate_count = self
+            .match_tools(&query)?
+            .into_iter()
+            .filter(|candidate| matches!(candidate.fit, Fit::High | Fit::Medium))
+            .take(2)
+            .count();
+        Ok(candidate_count > 1)
     }
 }
 
@@ -341,6 +522,57 @@ fn abandon_branch_options(hypothesis_id: &str) -> Vec<HandoffOption> {
             label: "再查".to_string(),
             direction: format!("继续调查分支 {hypothesis_id} 再决定是否停止"),
             cost: Cost::Moderate,
+            risk: Risk::Low,
+            reversible: true,
+        },
+    ]
+}
+
+fn lifecycle_apply_digest(hypothesis_id: &str) -> String {
+    format!(
+        "假设 {hypothesis_id} 已产生 provisional 判决，自动推进到 under_test 前触发刹车，需要人类确认"
+    )
+}
+
+fn lifecycle_apply_options(hypothesis_id: &str) -> Vec<HandoffOption> {
+    vec![
+        HandoffOption {
+            label: "推进".to_string(),
+            direction: format!("将假设 {hypothesis_id} 推进到 under_test"),
+            cost: Cost::Cheap,
+            risk: Risk::Low,
+            reversible: true,
+        },
+        HandoffOption {
+            label: "暂停".to_string(),
+            direction: format!("保持假设 {hypothesis_id} 当前状态并等待人工处理"),
+            cost: Cost::Cheap,
+            risk: Risk::Low,
+            reversible: true,
+        },
+    ]
+}
+
+fn graph_patch_apply_digest(decision: &BranchDecision, flow_id: &str) -> String {
+    format!(
+        "分支 {} 已产生可落地步骤，自动应用到 flow {flow_id} 前触发刹车，需要人类确认",
+        decision.candidate.hypothesis_id
+    )
+}
+
+fn graph_patch_apply_options(hypothesis_id: &str, flow_id: &str) -> Vec<HandoffOption> {
+    vec![
+        HandoffOption {
+            label: "应用补丁".to_string(),
+            direction: format!("将分支 {hypothesis_id} 的新步骤应用到 flow {flow_id}"),
+            cost: Cost::Moderate,
+            risk: Risk::Low,
+            reversible: true,
+        },
+        HandoffOption {
+            label: "仅保留提议".to_string(),
+            direction: format!("不修改 flow {flow_id}，仅保留分支 {hypothesis_id} 的提议"),
+            cost: Cost::Cheap,
             risk: Risk::Low,
             reversible: true,
         },
@@ -459,12 +691,13 @@ mod tests {
     use crate::argument::{EvidenceGrade, EvidenceLinkRequest, Stance};
     use crate::branch::BranchAction;
     use crate::handoff::DecisionKind;
-    use crate::hypothesis::HypothesisRequest;
+    use crate::hypothesis::{Confidence, HypothesisRequest, HypothesisStatus};
     use crate::storage::{
-        now_unix_seconds, ArtifactImportMode, ArtifactImportRequest, ProjectStore, ToolSpec,
+        now_unix_seconds, ArtifactImportMode, ArtifactImportRequest, FlowDraft, ProjectStore,
+        ToolSpec,
     };
 
-    use super::{proposal_keywords, CycleOutcome};
+    use super::{proposal_keywords, AppliedAction, ApplyConfig, CycleOutcome};
 
     fn temp_project_path(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -555,6 +788,31 @@ runtime:
             .id
     }
 
+    fn approve_marker_flow(store: &ProjectStore, artifact_id: &str) {
+        store
+            .approve_flow(
+                FlowDraft::from_simple_yaml(&format!(
+                    r#"
+schema_version: agentflow.flow.v0
+id: auto_flow
+name: Auto apply flow
+steps:
+  - id: seed
+    tool: analysis/marker_deepen
+    reason: Existing seed analysis
+    needs: []
+    inputs:
+      expression_table: {artifact_id}
+    outputs:
+      report: seed_report
+"#
+                ))
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+    }
+
     fn event_count(store: &ProjectStore, event_type: &str) -> i64 {
         store
             .connection()
@@ -564,6 +822,222 @@ runtime:
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn apply_lifecycle_transitions_provisional_proposed_to_under_test() {
+        let (path, store) = init_project("apply-lifecycle");
+        let hypothesis_id = record_hypothesis(&store, "Weak support enters testing");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: true,
+                flow: None,
+                max_apply: 5,
+            })
+            .unwrap();
+
+        assert_eq!(report.outcome, CycleOutcome::Advanced);
+        assert_eq!(report.raised_decisions.len(), 0);
+        assert_eq!(
+            report.applied,
+            vec![AppliedAction::LifecycleTransition {
+                hypothesis_id: hypothesis_id.clone(),
+                to: "under_test".to_string(),
+            }]
+        );
+        let hypothesis = store.inspect_hypothesis(&hypothesis_id).unwrap();
+        assert_eq!(hypothesis.status, HypothesisStatus::UnderTest);
+        assert_eq!(hypothesis.confidence, Confidence::Low);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn apply_with_flow_applies_deepen_graph_patch() {
+        let (path, store) = init_project("apply-graph-patch");
+        register_marker_tool(&store);
+        let artifact_id = import_expression_artifact(&store, &path);
+        approve_marker_flow(&store, &artifact_id);
+        let hypothesis_id = record_hypothesis(&store, "Marker evidence needs deeper validation");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: true,
+                flow: Some("auto_flow".to_string()),
+                max_apply: 5,
+            })
+            .unwrap();
+
+        assert!(report.applied.iter().any(|action| matches!(
+            action,
+            AppliedAction::LifecycleTransition { hypothesis_id: id, .. } if id == &hypothesis_id
+        )));
+        let graph_action = report
+            .applied
+            .iter()
+            .find_map(|action| match action {
+                AppliedAction::GraphPatchApplied {
+                    flow_id,
+                    patch_id,
+                    step_id,
+                } => Some((flow_id, patch_id, step_id)),
+                AppliedAction::LifecycleTransition { .. } => None,
+            })
+            .unwrap();
+        assert_eq!(graph_action.0, "auto_flow");
+        assert_eq!(graph_action.2, "step_marker_deepen");
+
+        let flow = store.inspect_flow("auto_flow").unwrap();
+        assert!(flow
+            .steps
+            .iter()
+            .any(|step| step.local_id == "step_marker_deepen"));
+        let patches = store.list_graph_patches("auto_flow").unwrap();
+        assert!(patches
+            .iter()
+            .any(|patch| patch.id == *graph_action.1 && patch.status == "applied"));
+        assert!(report
+            .to_json()
+            .contains("\"type\":\"graph_patch_applied\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn apply_does_not_auto_land_strong_or_abandon_decisions() {
+        let (path, store) = init_project("apply-strong-abandon");
+        let hypothesis_id = record_hypothesis(&store, "Observed contradiction should stop branch");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::Observed,
+            Stance::Contradicts,
+            "Observed contradiction reaches the rule margin.",
+        );
+        store
+            .render_verdict(
+                &hypothesis_id,
+                &crate::argument::RuleBasedEngine,
+                Some(gate()),
+            )
+            .unwrap();
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: true,
+                flow: Some("unused_flow".to_string()),
+                max_apply: 5,
+            })
+            .unwrap();
+
+        assert_eq!(report.outcome, CycleOutcome::HandedOff);
+        assert!(report.applied.is_empty());
+        assert!(report
+            .raised_decisions
+            .iter()
+            .any(|point| point.kind == DecisionKind::DeepenOrStop));
+        assert!(report
+            .raised_decisions
+            .iter()
+            .any(|point| point.kind == DecisionKind::GoalMutation));
+        assert_eq!(
+            store.inspect_hypothesis(&hypothesis_id).unwrap().status,
+            HypothesisStatus::Proposed
+        );
+        assert_eq!(event_count(&store, "hypothesis.transitioned"), 0);
+        assert_eq!(event_count(&store, "graph_patch_proposed"), 0);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn max_apply_one_raises_second_candidate_through_budget_policy() {
+        let (path, store) = init_project("apply-max-one");
+        let first = record_hypothesis(&store, "First weak support");
+        let second = record_hypothesis(&store, "Second weak support");
+        for hypothesis_id in [&first, &second] {
+            link_evidence(
+                &store,
+                hypothesis_id,
+                EvidenceGrade::LiteratureSupported,
+                Stance::Supports,
+                "Literature support alone is provisional.",
+            );
+        }
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: true,
+                flow: None,
+                max_apply: 1,
+            })
+            .unwrap();
+
+        assert_eq!(report.outcome, CycleOutcome::HandedOff);
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(
+            store.inspect_hypothesis(&first).unwrap().status,
+            HypothesisStatus::UnderTest
+        );
+        assert_eq!(
+            store.inspect_hypothesis(&second).unwrap().status,
+            HypothesisStatus::Proposed
+        );
+        assert!(report
+            .raised_decisions
+            .iter()
+            .any(|point| point.kind == DecisionKind::BudgetThreshold
+                && point.digest.contains(&second)));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn trace_revert_to_cycle_checkpoint_rolls_back_auto_apply() {
+        let (path, store) = init_project("apply-revert");
+        let hypothesis_id = record_hypothesis(&store, "Weak support can be reverted");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: true,
+                flow: None,
+                max_apply: 5,
+            })
+            .unwrap();
+        assert_eq!(
+            store.inspect_hypothesis(&hypothesis_id).unwrap().status,
+            HypothesisStatus::UnderTest
+        );
+
+        store.revert_to(&report.checkpoint_id).unwrap();
+
+        let reverted = store.inspect_hypothesis(&hypothesis_id).unwrap();
+        assert_eq!(reverted.status, HypothesisStatus::Proposed);
+        assert!(store.latest_verdict_for(&hypothesis_id).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]

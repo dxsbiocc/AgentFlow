@@ -1,5 +1,7 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentflow_core::agent::CycleReport;
 use agentflow_core::argument::{EvidenceLink, Stance};
@@ -49,6 +51,23 @@ struct ForageObserveOptions {
 }
 
 #[derive(Debug, Default)]
+struct ForageIngestOptions {
+    project: PathJsonOptions,
+    source: Option<String>,
+    hits_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Default)]
+struct ForageFetchOptions {
+    project: PathJsonOptions,
+    query: Option<String>,
+    source: Option<String>,
+    script: Option<PathBuf>,
+    max: Option<usize>,
+    python: Option<String>,
+}
+
+#[derive(Debug, Default)]
 struct ForageLinkOptions {
     project: PathJsonOptions,
     hypothesis_id: Option<String>,
@@ -62,6 +81,11 @@ struct TraceCheckpointOptions {
     project: PathJsonOptions,
     label: Option<String>,
 }
+
+const DEFAULT_FORAGE_SOURCE: &str = "pubmed";
+const DEFAULT_PUBMED_SCRIPT: &str = "examples/tools/pubmed_search.py";
+const DEFAULT_PUBMED_MAX: usize = 10;
+const DEFAULT_PYTHON: &str = "python3";
 
 pub(crate) fn agent_command<I>(args: I) -> Result<String, CliError>
 where
@@ -122,6 +146,8 @@ where
     let mut args = args.into_iter();
     match next_arg(&mut args)? {
         Some(command) if command == "observe" => forage_observe_command(args),
+        Some(command) if command == "ingest" => forage_ingest_command(args),
+        Some(command) if command == "fetch" => forage_fetch_command(args),
         Some(command) if command == "list" => forage_list_command(args),
         Some(command) if command == "show" => forage_show_command(args),
         Some(command) if command == "link" => forage_link_command(args),
@@ -341,6 +367,108 @@ where
             "Recorded forage observation",
             &observation,
         ))
+    }
+}
+
+fn forage_ingest_command<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let options = parse_forage_ingest_options(args)?;
+    let hits_file = options.hits_file.ok_or_else(|| {
+        CliError::InvalidArgument("forage ingest requires <hits-file>".to_string())
+    })?;
+    let source = options
+        .source
+        .unwrap_or_else(|| DEFAULT_FORAGE_SOURCE.to_string());
+    let path = options.project.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&path)?;
+    let observations = ingest_forage_hits(&store, &hits_file, &source)?;
+
+    if options.project.json {
+        Ok(forage_ingest_summary_json(&observations))
+    } else {
+        Ok(format_forage_ingest_summary(&observations))
+    }
+}
+
+fn forage_fetch_command<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let options = parse_forage_fetch_options(args)?;
+    let query = options
+        .query
+        .ok_or_else(|| CliError::InvalidArgument("forage fetch requires --query".to_string()))?;
+    if query.trim().is_empty() {
+        return Err(CliError::InvalidArgument(
+            "forage fetch requires --query".to_string(),
+        ));
+    }
+
+    let source = options
+        .source
+        .unwrap_or_else(|| DEFAULT_FORAGE_SOURCE.to_string());
+    let script = options
+        .script
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PUBMED_SCRIPT));
+    if script.as_os_str().is_empty() {
+        return Err(CliError::InvalidArgument(
+            "forage fetch requires --script".to_string(),
+        ));
+    }
+    if !script.exists() {
+        return Err(CliError::InvalidArgument(format!(
+            "forage fetch script not found: {}",
+            script.display()
+        )));
+    }
+
+    let python = options.python.unwrap_or_else(|| DEFAULT_PYTHON.to_string());
+    if python.trim().is_empty() {
+        return Err(CliError::InvalidArgument(
+            "forage fetch requires --python".to_string(),
+        ));
+    }
+
+    let path = options.project.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&path)?;
+    let out_file = forage_fetch_tmp_path();
+    let max = options.max.unwrap_or(DEFAULT_PUBMED_MAX);
+    let output = Command::new(&python)
+        .arg(&script)
+        .arg("--query")
+        .arg(&query)
+        .arg("--max")
+        .arg(max.to_string())
+        .arg("--out")
+        .arg(&out_file)
+        .output()
+        .map_err(|error| {
+            CliError::Core(format!(
+                "failed to run forage fetch script {} with {}: {error}",
+                script.display(),
+                python
+            ))
+        })?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&out_file);
+        return Err(CliError::Core(format!(
+            "forage fetch script failed with status {}: {}",
+            format_exit_status(&output.status),
+            stderr_summary(&output.stderr)
+        )));
+    }
+
+    let observations = ingest_forage_hits(&store, &out_file, &source);
+    let _ = std::fs::remove_file(&out_file);
+    let observations = observations?;
+
+    if options.project.json {
+        Ok(forage_ingest_summary_json(&observations))
+    } else {
+        Ok(format_forage_ingest_summary(&observations))
     }
 }
 
@@ -668,6 +796,85 @@ where
     Ok(options)
 }
 
+fn parse_forage_ingest_options<I>(args: I) -> Result<ForageIngestOptions, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut options = ForageIngestOptions::default();
+    let mut args = args.into_iter();
+
+    while let Some(arg) = next_arg(&mut args)? {
+        match arg.as_str() {
+            "--path" => {
+                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
+            }
+            "--json" => {
+                options.project.json = true;
+            }
+            "--source" => {
+                options.source = Some(require_value("--source", &mut args)?);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
+            }
+            _ => {
+                if options.hits_file.is_some() {
+                    return Err(CliError::InvalidArgument(format!(
+                        "expected one hits file, got extra argument: {arg}"
+                    )));
+                }
+                options.hits_file = Some(PathBuf::from(arg));
+            }
+        }
+    }
+
+    Ok(options)
+}
+
+fn parse_forage_fetch_options<I>(args: I) -> Result<ForageFetchOptions, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut options = ForageFetchOptions::default();
+    let mut args = args.into_iter();
+
+    while let Some(arg) = next_arg(&mut args)? {
+        match arg.as_str() {
+            "--path" => {
+                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
+            }
+            "--json" => {
+                options.project.json = true;
+            }
+            "--query" => {
+                options.query = Some(require_value("--query", &mut args)?);
+            }
+            "--source" => {
+                options.source = Some(require_value("--source", &mut args)?);
+            }
+            "--script" => {
+                options.script = Some(PathBuf::from(require_value("--script", &mut args)?));
+            }
+            "--max" => {
+                options.max = Some(parse_usize_flag("--max", &mut args)?);
+            }
+            "--python" => {
+                options.python = Some(require_value("--python", &mut args)?);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
+            }
+            _ => {
+                return Err(CliError::InvalidArgument(format!(
+                    "forage fetch does not accept positional argument: {arg}"
+                )));
+            }
+        }
+    }
+
+    Ok(options)
+}
+
 fn parse_forage_link_options<I>(args: I) -> Result<ForageLinkOptions, CliError>
 where
     I: IntoIterator<Item = OsString>,
@@ -814,6 +1021,18 @@ fn checkpoints_json(checkpoints: &[Checkpoint]) -> String {
     format!("{{\"schema_version\":\"agentflow.checkpoints.v0\",\"checkpoints\":[{items}]}}")
 }
 
+fn forage_ingest_summary_json(observations: &[ForageObservation]) -> String {
+    let ids = observations
+        .iter()
+        .map(|observation| format!("\"{}\"", escape_json(&observation.id)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"schema_version\":\"agentflow.forage_ingest.v0\",\"count\":{},\"observation_ids\":[{ids}]}}",
+        observations.len()
+    )
+}
+
 fn format_cycle_report(report: &CycleReport) -> String {
     format!(
         "Agent cycle complete\nCheckpoint: {}\nProvisional verdicts: {}\nStrong candidates: {}\nRaised decisions: {}\nBranch proposals: {}\nOutcome: {}\nDecision points:\n{}",
@@ -937,6 +1156,26 @@ fn format_forage_observation_summary(observation: &ForageObservation) -> String 
     )
 }
 
+fn format_forage_ingest_summary(observations: &[ForageObservation]) -> String {
+    format!(
+        "Ingested {} forage observations\nIds:\n{}",
+        observations.len(),
+        format_forage_ingest_ids(observations)
+    )
+}
+
+fn format_forage_ingest_ids(observations: &[ForageObservation]) -> String {
+    if observations.is_empty() {
+        return "  none".to_string();
+    }
+
+    observations
+        .iter()
+        .map(|observation| format!("  {}", observation.id))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn format_evidence_link(heading: &str, link: &EvidenceLink) -> String {
     format!(
         "{heading}\nId: {}\nHypothesis: {}\nObservation: {}\nSource: {}\nGrade: {}\nStance: {}\nNote: {}\nCreated: {}",
@@ -1027,6 +1266,163 @@ fn decision_status_as_str(status: DecisionStatus) -> &'static str {
     match status {
         DecisionStatus::Pending => "pending",
         DecisionStatus::Resolved => "resolved",
+    }
+}
+
+struct ForageHit {
+    external_id: String,
+    title: String,
+    access_status: AccessStatus,
+}
+
+fn ingest_forage_hits(
+    store: &agentflow_core::storage::ProjectStore,
+    hits_file: &Path,
+    source: &str,
+) -> Result<Vec<ForageObservation>, CliError> {
+    let contents = std::fs::read_to_string(hits_file)?;
+    let mut observations = Vec::new();
+
+    for (index, line) in contents.lines().enumerate() {
+        let line_number = index + 1;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let hit = parse_forage_hit(line, line_number)?;
+        observations.push(store.record_forage_observation(
+            source,
+            &hit.external_id,
+            &hit.title,
+            hit.access_status,
+        )?);
+    }
+
+    Ok(observations)
+}
+
+fn parse_forage_hit(line: &str, line_number: usize) -> Result<ForageHit, CliError> {
+    let external_id = required_jsonl_string(line, "external_id", line_number)?;
+    let title = required_jsonl_string(line, "title", line_number)?;
+    let access_status_value = required_jsonl_string(line, "access_status", line_number)?;
+    let access_status = AccessStatus::parse(&access_status_value).ok_or_else(|| {
+        CliError::InvalidArgument(format!(
+            "hits JSONL line {line_number} has invalid access_status: {access_status_value}"
+        ))
+    })?;
+
+    Ok(ForageHit {
+        external_id,
+        title,
+        access_status,
+    })
+}
+
+fn required_jsonl_string(line: &str, field: &str, line_number: usize) -> Result<String, CliError> {
+    json_string_field(line, field).ok_or_else(|| {
+        CliError::InvalidArgument(format!("hits JSONL line {line_number} is missing {field}"))
+    })
+}
+
+fn json_string_field(json: &str, field: &str) -> Option<String> {
+    let marker = format!("\"{field}\"");
+    let start = json.find(&marker)? + marker.len();
+    let rest = json[start..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = find_json_string_end(rest)?;
+    Some(unescape_json_string(&rest[..end]))
+}
+
+fn find_json_string_end(input: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (index, ch) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn unescape_json_string(input: &str) -> String {
+    let mut output = String::new();
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => output.push('"'),
+            Some('\\') => output.push('\\'),
+            Some('n') => output.push('\n'),
+            Some('r') => output.push('\r'),
+            Some('t') => output.push('\t'),
+            Some('u') => {
+                let digits = chars.by_ref().take(4).collect::<String>();
+                if let Ok(code) = u32::from_str_radix(&digits, 16) {
+                    if let Some(decoded) = char::from_u32(code) {
+                        output.push(decoded);
+                    }
+                }
+            }
+            Some(other) => output.push(other),
+            None => break,
+        }
+    }
+    output
+}
+
+fn escape_json(input: &str) -> String {
+    let mut output = String::new();
+    for ch in input.chars() {
+        match ch {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => output.push(ch),
+        }
+    }
+    output
+}
+
+fn forage_fetch_tmp_path() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "agentflow-forage-fetch-{}-{nanos}.jsonl",
+        std::process::id()
+    ))
+}
+
+fn format_exit_status(status: &std::process::ExitStatus) -> String {
+    status.code().map_or_else(
+        || "terminated by signal".to_string(),
+        |code| code.to_string(),
+    )
+}
+
+fn stderr_summary(stderr: &[u8]) -> String {
+    let summary = String::from_utf8_lossy(stderr)
+        .trim()
+        .chars()
+        .take(500)
+        .collect::<String>();
+    if summary.is_empty() {
+        "no stderr".to_string()
+    } else {
+        summary
     }
 }
 
@@ -1379,6 +1775,177 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, CliError::InvalidArgument(_)));
         assert!(err.message().contains("--access must be"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn forage_ingest_records_fixture_and_skips_blank_lines() {
+        let path = temp_project_path("forage-ingest-happy");
+        let _store = init_project(&path);
+        let hits = path.join("hits.jsonl");
+        std::fs::write(
+            &hits,
+            concat!(
+                "{\"external_id\":\"PMID:39000001\",\"title\":\"Marker literature\",\"access_status\":\"abstract_available\"}\n",
+                "\n",
+                "{\"external_id\":\"PMID:39000002\",\"title\":\"Escaped \\\"title\\\"\",\"access_status\":\"metadata_only\"}\n",
+            ),
+        )
+        .unwrap();
+
+        let output = run(args(&[
+            "agentflow",
+            "forage",
+            "ingest",
+            hits.to_str().unwrap(),
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(output.contains("\"schema_version\":\"agentflow.forage_ingest.v0\""));
+        assert!(output.contains("\"count\":2"));
+        assert!(output.contains("\"observation_ids\":[\"event_"));
+
+        let list = run(args(&[
+            "agentflow",
+            "forage",
+            "list",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(list.contains("\"source_id\":\"pubmed\""));
+        assert!(list.contains("\"external_id\":\"PMID:39000001\""));
+        assert!(list.contains("\"external_id\":\"PMID:39000002\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn forage_ingest_rejects_invalid_access_status() {
+        let path = temp_project_path("forage-ingest-invalid-access");
+        let _store = init_project(&path);
+        let hits = path.join("hits.jsonl");
+        std::fs::write(
+            &hits,
+            "{\"external_id\":\"PMID:1\",\"title\":\"Bad access\",\"access_status\":\"full_text\"}\n",
+        )
+        .unwrap();
+
+        let err = run(args(&[
+            "agentflow",
+            "forage",
+            "ingest",
+            hits.to_str().unwrap(),
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+        assert!(matches!(err, CliError::InvalidArgument(_)));
+        assert!(err.message().contains("invalid access_status"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn forage_ingest_surfaces_missing_file() {
+        let path = temp_project_path("forage-ingest-missing-file");
+        let _store = init_project(&path);
+        let hits = path.join("missing.jsonl");
+
+        let err = run(args(&[
+            "agentflow",
+            "forage",
+            "ingest",
+            hits.to_str().unwrap(),
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+        assert!(matches!(err, CliError::Core(_)));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn forage_fetch_validates_required_query_and_max() {
+        let path = temp_project_path("forage-fetch-validation");
+        let _store = init_project(&path);
+
+        let missing_query = run(args(&[
+            "agentflow",
+            "forage",
+            "fetch",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+        assert!(matches!(missing_query, CliError::InvalidArgument(_)));
+        assert!(missing_query.message().contains("requires --query"));
+
+        let invalid_max = run(args(&[
+            "agentflow",
+            "forage",
+            "fetch",
+            "--query",
+            "marker",
+            "--max",
+            "many",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+        assert!(matches!(invalid_max, CliError::InvalidArgument(_)));
+        assert!(invalid_max.message().contains("--max must"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn forage_fetch_surfaces_missing_script_and_nonzero_exit() {
+        let path = temp_project_path("forage-fetch-script-errors");
+        let _store = init_project(&path);
+        let missing_script = path.join("missing.sh");
+
+        let missing_err = run(args(&[
+            "agentflow",
+            "forage",
+            "fetch",
+            "--query",
+            "marker",
+            "--script",
+            missing_script.to_str().unwrap(),
+            "--python",
+            "/bin/sh",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+        assert!(matches!(missing_err, CliError::InvalidArgument(_)));
+        assert!(missing_err.message().contains("script not found"));
+
+        let script = path.join("fail.sh");
+        std::fs::write(&script, "echo fixture failed >&2\nexit 9\n").unwrap();
+        let nonzero_err = run(args(&[
+            "agentflow",
+            "forage",
+            "fetch",
+            "--query",
+            "marker",
+            "--script",
+            script.to_str().unwrap(),
+            "--python",
+            "/bin/sh",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+        assert!(matches!(nonzero_err, CliError::Core(_)));
+        assert!(nonzero_err.message().contains("status 9"));
+        assert!(nonzero_err.message().contains("fixture failed"));
 
         let _ = std::fs::remove_dir_all(path);
     }

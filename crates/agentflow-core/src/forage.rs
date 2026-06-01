@@ -190,6 +190,7 @@ impl ProjectStore {
     }
 
     pub fn list_forage_observations(&self) -> Result<Vec<ForageObservation>, StorageError> {
+        let reverted = self.reverted_event_id_set()?;
         let mut stmt = self.connection().prepare(
             "SELECT id, payload_json, created_at
              FROM events
@@ -207,6 +208,9 @@ impl ProjectStore {
         let mut observations = Vec::new();
         for row in rows {
             let (event_id, payload_json, created_at) = row?;
+            if reverted.contains(&event_id) {
+                continue;
+            }
             observations.push(forage_observation_from_event(
                 event_id,
                 &payload_json,
@@ -223,6 +227,9 @@ impl ProjectStore {
             ));
         }
         let id = id.trim();
+        if self.reverted_event_id_set()?.contains(id) {
+            return Err(StorageError::NotFound(format!("forage observation {id}")));
+        }
         let row = self
             .connection()
             .query_row(
@@ -419,7 +426,7 @@ mod tests {
 
     use crate::argument::{EvidenceGrade, InconclusiveKind, RuleBasedEngine, Stance, Verdict};
     use crate::hypothesis::HypothesisRequest;
-    use crate::storage::{now_unix_seconds, ProjectStore};
+    use crate::storage::{now_unix_seconds, ProjectStore, StorageError};
 
     use super::{current_strength, grade_from_access, AccessStatus, ForageAction, ForagePolicy};
 
@@ -556,6 +563,39 @@ mod tests {
             forage_event_types(&store),
             vec!["forage.action_started", "forage.observation_recorded"]
         );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn reverted_forage_observation_is_hidden_from_projection() {
+        let path = temp_project_path("reverted-observation");
+        let store = ProjectStore::init(&path, Some("Forage Demo")).unwrap();
+        let checkpoint = store.create_checkpoint("before-observation").unwrap();
+        let observation = store
+            .record_forage_observation(
+                "pubmed",
+                "PMID:789",
+                "Later paper",
+                AccessStatus::AbstractAvailable,
+            )
+            .unwrap();
+
+        assert_eq!(store.list_forage_observations().unwrap().len(), 1);
+        assert_eq!(
+            store.inspect_forage_observation(&observation.id).unwrap(),
+            observation
+        );
+
+        store.revert_to(&checkpoint.id).unwrap();
+
+        assert!(store.list_forage_observations().unwrap().is_empty());
+        assert!(matches!(
+            store
+                .inspect_forage_observation(&observation.id)
+                .unwrap_err(),
+            StorageError::NotFound(_)
+        ));
 
         let _ = std::fs::remove_dir_all(path);
     }

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use rusqlite::{params, OptionalExtension};
 
@@ -217,6 +217,11 @@ impl ProjectStore {
             }
         }
         Ok(reverted_ids.into_iter().collect())
+    }
+
+    /// 已被回退的事件 id 集合（复用现有 reverted_event_ids，去重为集合）。
+    pub fn reverted_event_id_set(&self) -> Result<HashSet<String>, StorageError> {
+        Ok(self.reverted_event_ids()?.into_iter().collect())
     }
 
     fn last_event_id(&self) -> Result<Option<String>, StorageError> {
@@ -692,6 +697,44 @@ mod tests {
                 "event_c".to_string()
             ]
         );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn reverted_event_id_set_reuses_deduplicated_revert_projection() {
+        let path = temp_project_path("set");
+        let store = ProjectStore::init(&path, Some("Trace Demo")).unwrap();
+        store
+            .append_event(EventRecord {
+                flow_id: None,
+                step_id: None,
+                run_id: None,
+                event_type: TRACE_REVERTED_EVENT.to_string(),
+                payload_json: revert_record_payload_json(
+                    "checkpoint_a",
+                    &["event_a".to_string(), "event_b".to_string()],
+                ),
+            })
+            .unwrap();
+        store
+            .append_event(EventRecord {
+                flow_id: None,
+                step_id: None,
+                run_id: None,
+                event_type: TRACE_REVERTED_EVENT.to_string(),
+                payload_json: revert_record_payload_json(
+                    "checkpoint_b",
+                    &["event_b".to_string(), "event_c".to_string()],
+                ),
+            })
+            .unwrap();
+
+        let reverted = store.reverted_event_id_set().unwrap();
+        assert_eq!(reverted.len(), 3);
+        assert!(reverted.contains("event_a"));
+        assert!(reverted.contains("event_b"));
+        assert!(reverted.contains("event_c"));
 
         let _ = std::fs::remove_dir_all(path);
     }

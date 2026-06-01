@@ -526,7 +526,15 @@ impl ProjectStore {
     }
 
     pub fn evidence_for(&self, hypothesis_id: &str) -> Result<Vec<EvidenceLink>, StorageError> {
-        self.inspect_hypothesis(hypothesis_id)?;
+        validate_non_empty("hypothesis id", hypothesis_id)?;
+        let hypothesis_id = hypothesis_id.trim();
+        let reverted = self.reverted_event_id_set()?;
+        if let Err(error) = self.inspect_hypothesis(hypothesis_id) {
+            if matches!(&error, StorageError::NotFound(_)) && reverted.contains(hypothesis_id) {
+                return Ok(Vec::new());
+            }
+            return Err(error);
+        }
 
         let mut stmt = self.connection().prepare(
             "SELECT id, payload_json, created_at
@@ -545,6 +553,9 @@ impl ProjectStore {
         let mut evidence = Vec::new();
         for row in rows {
             let (event_id, payload_json, created_at) = row?;
+            if reverted.contains(&event_id) {
+                continue;
+            }
             if json_string_field(&payload_json, "hypothesis_id").as_deref() == Some(hypothesis_id) {
                 evidence.push(evidence_from_event(event_id, &payload_json, created_at)?);
             }
@@ -558,6 +569,7 @@ impl ProjectStore {
         engine: &dyn ArgumentEngine,
         gate: Option<SelfDeceptionGate>,
     ) -> Result<VerdictReport, StorageError> {
+        self.inspect_hypothesis(hypothesis_id)?;
         let evidence = self.evidence_for(hypothesis_id)?;
         let report = engine.render(hypothesis_id, &evidence);
         validate_self_deception_gate(&report.verdict, gate.as_ref())?;
@@ -578,7 +590,13 @@ impl ProjectStore {
     ) -> Result<Option<VerdictSummary>, StorageError> {
         validate_non_empty("hypothesis id", hypothesis_id)?;
         let hypothesis_id = hypothesis_id.trim();
-        self.inspect_hypothesis(hypothesis_id)?;
+        let reverted = self.reverted_event_id_set()?;
+        if let Err(error) = self.inspect_hypothesis(hypothesis_id) {
+            if matches!(&error, StorageError::NotFound(_)) && reverted.contains(hypothesis_id) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
 
         let mut stmt = self.connection().prepare(
             "SELECT id, payload_json, created_at
@@ -596,6 +614,9 @@ impl ProjectStore {
 
         for row in rows {
             let (event_id, payload_json, created_at) = row?;
+            if reverted.contains(&event_id) {
+                continue;
+            }
             if json_string_field(&payload_json, "hypothesis_id").as_deref() == Some(hypothesis_id) {
                 return Ok(Some(verdict_summary_from_event(
                     event_id,
@@ -1006,7 +1027,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::hypothesis::{Confidence, HypothesisRequest, HypothesisStatus};
-    use crate::storage::{now_unix_seconds, ProjectStore};
+    use crate::storage::{now_unix_seconds, ProjectStore, StorageError};
 
     use super::{
         ArgumentEngine, ClaimBasis, EvidenceGrade, EvidenceLink, EvidenceLinkRequest,
@@ -1593,6 +1614,133 @@ mod tests {
         assert_eq!(summary.tag, VerdictTag::InconclusiveFundamental);
         assert_eq!(summary.confidence, Confidence::Low);
         assert!(summary.created_at > 0);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn revert_hides_later_hypothesis_evidence_and_verdict_projection() {
+        let path = temp_project_path("revert-horizon");
+        let store = ProjectStore::init(&path, Some("Argument Demo")).unwrap();
+        let checkpoint = store.create_checkpoint("before-hypothesis").unwrap();
+        let hypothesis_id = record_hypothesis(&store);
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis_id.clone(),
+                observation_id: None,
+                source: Some("lab notebook".to_string()),
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: "Observed support".to_string(),
+            })
+            .unwrap();
+        store
+            .render_verdict(
+                &hypothesis_id,
+                &FixedEngine {
+                    verdict: Verdict::Inconclusive(InconclusiveKind::Provisional {
+                        missing: vec!["more evidence".to_string()],
+                    }),
+                    confidence: Confidence::Low,
+                },
+                None,
+            )
+            .unwrap();
+
+        assert!(store
+            .list_hypotheses()
+            .unwrap()
+            .iter()
+            .any(|hypothesis| hypothesis.id == hypothesis_id));
+        assert_eq!(store.evidence_for(&hypothesis_id).unwrap().len(), 1);
+        assert!(store.latest_verdict_for(&hypothesis_id).unwrap().is_some());
+
+        store.revert_to(&checkpoint.id).unwrap();
+
+        assert!(!store
+            .list_hypotheses()
+            .unwrap()
+            .iter()
+            .any(|hypothesis| hypothesis.id == hypothesis_id));
+        assert!(store.evidence_for(&hypothesis_id).unwrap().is_empty());
+        assert!(store.latest_verdict_for(&hypothesis_id).unwrap().is_none());
+        assert!(matches!(
+            store.inspect_hypothesis(&hypothesis_id).unwrap_err(),
+            StorageError::NotFound(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn reverted_argument_events_are_skipped_for_existing_hypothesis() {
+        let path = temp_project_path("reverted-argument-events");
+        let store = ProjectStore::init(&path, Some("Argument Demo")).unwrap();
+        let hypothesis_id = record_hypothesis(&store);
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis_id.clone(),
+                observation_id: Some("observation_before".to_string()),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: "Evidence before checkpoint".to_string(),
+            })
+            .unwrap();
+        store
+            .render_verdict(
+                &hypothesis_id,
+                &FixedEngine {
+                    verdict: Verdict::Inconclusive(InconclusiveKind::Provisional {
+                        missing: vec!["first pass".to_string()],
+                    }),
+                    confidence: Confidence::Low,
+                },
+                None,
+            )
+            .unwrap();
+        let checkpoint = store.create_checkpoint("before-later-argument").unwrap();
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis_id.clone(),
+                observation_id: Some("observation_after".to_string()),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Contradicts,
+                note: "Evidence after checkpoint".to_string(),
+            })
+            .unwrap();
+        store
+            .render_verdict(
+                &hypothesis_id,
+                &FixedEngine {
+                    verdict: Verdict::Inconclusive(InconclusiveKind::Fundamental {
+                        frontier: "requires external replication".to_string(),
+                    }),
+                    confidence: Confidence::Medium,
+                },
+                Some(valid_gate()),
+            )
+            .unwrap();
+
+        assert_eq!(store.evidence_for(&hypothesis_id).unwrap().len(), 2);
+        assert_eq!(
+            store
+                .latest_verdict_for(&hypothesis_id)
+                .unwrap()
+                .unwrap()
+                .tag,
+            VerdictTag::InconclusiveFundamental
+        );
+
+        store.revert_to(&checkpoint.id).unwrap();
+
+        let evidence = store.evidence_for(&hypothesis_id).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].note, "Evidence before checkpoint");
+        let verdict = store.latest_verdict_for(&hypothesis_id).unwrap().unwrap();
+        assert_eq!(verdict.tag, VerdictTag::InconclusiveProvisional);
+        assert_eq!(verdict.confidence, Confidence::Low);
 
         let _ = std::fs::remove_dir_all(path);
     }

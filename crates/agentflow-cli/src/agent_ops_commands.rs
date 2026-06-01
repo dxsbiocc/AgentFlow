@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentflow_core::agent::CycleReport;
+use agentflow_core::agent::{CycleReport, EnrichedProposal};
 use agentflow_core::argument::{EvidenceLink, Stance};
 use agentflow_core::branch::{
     BranchAction, BranchCandidate, BranchDecision, BranchPolicy, CandidateKind, RuleBasedSelector,
@@ -1035,14 +1035,15 @@ fn forage_ingest_summary_json(observations: &[ForageObservation]) -> String {
 
 fn format_cycle_report(report: &CycleReport) -> String {
     format!(
-        "Agent cycle complete\nCheckpoint: {}\nProvisional verdicts: {}\nStrong candidates: {}\nRaised decisions: {}\nBranch proposals: {}\nOutcome: {}\nDecision points:\n{}",
+        "Agent cycle complete\nCheckpoint: {}\nProvisional verdicts: {}\nStrong candidates: {}\nRaised decisions: {}\nBranch proposals: {}\nOutcome: {}\nDecision points:\n{}\nBranch proposal details:\n{}",
         report.checkpoint_id,
         report.provisional_verdicts.len(),
         report.strong_candidates.len(),
         report.raised_decisions.len(),
         report.branch_proposals.len(),
         report.outcome.as_str(),
-        format_cycle_decision_summaries(&report.raised_decisions)
+        format_cycle_decision_summaries(&report.raised_decisions),
+        format_cycle_branch_summaries(&report.branch_proposals)
     )
 }
 
@@ -1056,6 +1057,38 @@ fn format_cycle_decision_summaries(points: &[DecisionPoint]) -> String {
         .map(|point| format!("  {} [{}] {}", point.id, point.kind.as_str(), point.digest))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_cycle_branch_summaries(proposals: &[EnrichedProposal]) -> String {
+    if proposals.is_empty() {
+        return "  none".to_string();
+    }
+
+    proposals
+        .iter()
+        .map(|proposal| {
+            format!(
+                "  {} [{}] {}: {}; {}",
+                proposal.decision.candidate.hypothesis_id,
+                selection_mode_as_str(proposal.decision.selected_by),
+                branch_action_kind(&proposal.decision.action),
+                branch_action_reason(&proposal.decision.action),
+                branch_match_summary(proposal)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn branch_match_summary(proposal: &EnrichedProposal) -> String {
+    match proposal.matched_tool.as_deref() {
+        Some(tool) => format!(
+            "matched tool: {} ({})",
+            tool,
+            proposal.matched_fit.as_deref().unwrap_or("unknown")
+        ),
+        None => "no tool match".to_string(),
+    }
 }
 
 fn format_branch_candidate(candidate: &BranchCandidate) -> String {
@@ -1513,6 +1546,8 @@ mod tests {
         assert!(human.contains("Agent cycle complete"));
         assert!(human.contains("Outcome: advanced"));
         assert!(human.contains("Provisional verdicts: 1"));
+        assert!(human.contains("Branch proposal details:"));
+        assert!(human.contains("no tool match"));
 
         let json = run(args(&[
             "agentflow",
@@ -1525,6 +1560,7 @@ mod tests {
         .unwrap();
         assert!(json.contains("\"schema_version\":\"agentflow.agent_cycle.v0\""));
         assert!(json.contains("\"outcome\":\"advanced\""));
+        assert!(json.contains("\"matched_tool\":null"));
         assert!(json.contains(&hypothesis_id));
 
         let _ = std::fs::remove_dir_all(path);

@@ -1,0 +1,24 @@
+schema_version: agentflow.tool.v0
+namespace: tcga
+name: survival_assoc
+version: 0.1.0
+maturity: exploratory
+description: Real TCGA survival association for a gene (cBioPortal expression x OS, log-rank).
+params:
+  gene:
+    type: string
+    required: true
+  study:
+    type: string
+    required: false
+outputs:
+  report:
+    type: Markdown
+    observer: marker_report
+    min_rows: 3
+runtime:
+  backend: local
+  command:
+    - /usr/bin/env
+    - python3
+    - tcga_survival_assoc.py

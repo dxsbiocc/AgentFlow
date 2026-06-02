@@ -187,6 +187,22 @@ impl ProjectStore {
             outputs,
         })
     }
+
+    pub fn infer_step_needs(&self, step: &ProposedStep) -> Result<Vec<String>, StorageError> {
+        let mut needs = BTreeSet::new();
+        for (_, artifact_id) in &step.inputs {
+            match self.inspect_artifact(artifact_id) {
+                Ok(inspection) => {
+                    if let Some(source_step_id) = inspection.summary.source_step_id {
+                        needs.insert(source_step_id);
+                    }
+                }
+                Err(StorageError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(needs.into_iter().collect())
+    }
 }
 
 fn has_output_type(executable: &ExecutableToolSpec, desired: &str) -> bool {
@@ -268,7 +284,9 @@ fn parse_json_string_tail(source: &str) -> Result<String, StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::ToolSpec;
+    use crate::storage::{
+        ArtifactImportMode, ArtifactImportRequest, ComputedArtifactRequest, ToolSpec,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -336,6 +354,31 @@ runtime:
 
     fn markdown_output() -> &'static str {
         "  report:\n    type: Markdown\n"
+    }
+
+    fn write_input(path: &std::path::Path, name: &str) -> PathBuf {
+        let file_path = path.join(name);
+        fs::write(&file_path, "sample\tvalue\nA\t1\n").unwrap();
+        file_path
+    }
+
+    fn computed_artifact(
+        store: &ProjectStore,
+        root: &std::path::Path,
+        name: &str,
+        source_step_id: &str,
+    ) -> String {
+        store
+            .register_computed_artifact(ComputedArtifactRequest {
+                source_path: write_input(root, name),
+                artifact_type: "ExpressionTable".to_string(),
+                output_name: "expression_table".to_string(),
+                source_step_id: source_step_id.to_string(),
+                source_run_id: "run_source".to_string(),
+            })
+            .unwrap()
+            .summary
+            .id
     }
 
     #[test]
@@ -509,6 +552,64 @@ runtime:
         let error = store.draft_step_for("missing/tool", &[]).unwrap_err();
 
         assert!(matches!(error, StorageError::NotFound(_)));
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn infer_step_needs_collects_sorted_unique_computed_sources() {
+        let (path, store) = init_store("infer-computed");
+        let z_artifact = computed_artifact(&store, &path, "z.tsv", "step_z");
+        let a_artifact = computed_artifact(&store, &path, "a.tsv", "step_a");
+        let step = ProposedStep {
+            id: "branch_step".to_string(),
+            tool: "analysis/branch".to_string(),
+            needs: Vec::new(),
+            inputs: vec![
+                ("z".to_string(), z_artifact.clone()),
+                ("a".to_string(), a_artifact),
+                ("z_again".to_string(), z_artifact),
+            ],
+            params: Vec::new(),
+            outputs: Vec::new(),
+        };
+
+        let needs = store.infer_step_needs(&step).unwrap();
+
+        assert_eq!(needs, vec!["step_a".to_string(), "step_z".to_string()]);
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn infer_step_needs_skips_imported_missing_and_placeholder_inputs() {
+        let (path, store) = init_store("infer-skips");
+        let imported = store
+            .import_artifact(ArtifactImportRequest {
+                source_path: write_input(&path, "imported.tsv"),
+                artifact_type: "ExpressionTable".to_string(),
+                mode: ArtifactImportMode::Reference,
+            })
+            .unwrap()
+            .summary
+            .id;
+        let step = ProposedStep {
+            id: "branch_step".to_string(),
+            tool: "analysis/branch".to_string(),
+            needs: Vec::new(),
+            inputs: vec![
+                ("imported".to_string(), imported),
+                (
+                    "placeholder".to_string(),
+                    "artifact_REPLACE_expression_table".to_string(),
+                ),
+                ("missing".to_string(), "artifact_missing".to_string()),
+            ],
+            params: Vec::new(),
+            outputs: Vec::new(),
+        };
+
+        let needs = store.infer_step_needs(&step).unwrap();
+
+        assert!(needs.is_empty());
         let _ = fs::remove_dir_all(path);
     }
 }

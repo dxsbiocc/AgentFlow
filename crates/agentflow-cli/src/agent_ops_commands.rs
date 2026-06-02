@@ -4,13 +4,14 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentflow_core::agent::{AppliedAction, ApplyConfig, CycleReport, EnrichedProposal};
-use agentflow_core::argument::{EvidenceLink, Stance};
+use agentflow_core::argument::{EvidenceLink, Stance, VerdictSummary, VerdictTag};
 use agentflow_core::branch::{
     BranchAction, BranchCandidate, BranchDecision, BranchPolicy, CandidateKind, RuleBasedSelector,
     SelectionMode,
 };
 use agentflow_core::forage::{AccessStatus, ForageObservation};
 use agentflow_core::handoff::{DecisionPoint, DecisionStatus};
+use agentflow_core::storage::ProjectStore;
 use agentflow_core::trace_guard::{Checkpoint, DriftReport, RevertRecord};
 
 use crate::{next_arg, require_value, CliError};
@@ -27,6 +28,17 @@ struct AgentRunOptions {
     apply: bool,
     flow: Option<String>,
     max_apply: u32,
+    auto_forage: bool,
+    forage_max: u32,
+    forage_script: Option<PathBuf>,
+    python: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct AutoForageSummary {
+    hypotheses_foraged: usize,
+    observations_linked: usize,
+    skipped: Vec<String>,
 }
 
 impl Default for AgentRunOptions {
@@ -36,6 +48,10 @@ impl Default for AgentRunOptions {
             apply: false,
             flow: None,
             max_apply: 5,
+            auto_forage: false,
+            forage_max: DEFAULT_AUTO_FORAGE_MAX,
+            forage_script: None,
+            python: None,
         }
     }
 }
@@ -82,7 +98,7 @@ struct ForageFetchOptions {
     query: Option<String>,
     source: Option<String>,
     script: Option<PathBuf>,
-    max: Option<usize>,
+    max: Option<u32>,
     python: Option<String>,
 }
 
@@ -103,8 +119,10 @@ struct TraceCheckpointOptions {
 
 const DEFAULT_FORAGE_SOURCE: &str = "pubmed";
 const DEFAULT_PUBMED_SCRIPT: &str = "examples/tools/pubmed_search.py";
-const DEFAULT_PUBMED_MAX: usize = 10;
+const DEFAULT_PUBMED_MAX: u32 = 10;
+const DEFAULT_AUTO_FORAGE_MAX: u32 = 5;
 const DEFAULT_PYTHON: &str = "python3";
+const AUTO_FORAGE_NOTE: &str = "auto-forage";
 
 pub(crate) fn agent_command<I>(args: I) -> Result<String, CliError>
 where
@@ -204,7 +222,23 @@ where
 {
     let options = parse_agent_run_options(args)?;
     let path = options.project.path.unwrap_or(std::env::current_dir()?);
-    let store = agentflow_core::storage::ProjectStore::open(&path)?;
+    let store = ProjectStore::open(&path)?;
+    let auto_forage = if options.auto_forage {
+        let script = options
+            .forage_script
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_PUBMED_SCRIPT));
+        validate_forage_script(&script, "agent run --auto-forage", "--forage-script")?;
+        let python = options.python.unwrap_or_else(|| DEFAULT_PYTHON.to_string());
+        validate_python(&python, "agent run --auto-forage")?;
+        Some(auto_forage_pass(
+            &store,
+            &python,
+            &script,
+            options.forage_max,
+        )?)
+    } else {
+        None
+    };
     let report = store.run_cycle_with_apply_config(ApplyConfig {
         apply: options.apply,
         flow: options.flow,
@@ -212,9 +246,9 @@ where
     })?;
 
     if options.project.json {
-        Ok(report.to_json())
+        Ok(format_agent_run_json(&report, auto_forage.as_ref()))
     } else {
-        Ok(format_cycle_report(&report))
+        Ok(format_agent_run_human(&report, auto_forage.as_ref()))
     }
 }
 
@@ -435,39 +469,43 @@ where
     let script = options
         .script
         .unwrap_or_else(|| PathBuf::from(DEFAULT_PUBMED_SCRIPT));
-    if script.as_os_str().is_empty() {
-        return Err(CliError::InvalidArgument(
-            "forage fetch requires --script".to_string(),
-        ));
-    }
-    if !script.exists() {
-        return Err(CliError::InvalidArgument(format!(
-            "forage fetch script not found: {}",
-            script.display()
-        )));
-    }
+    validate_forage_script(&script, "forage fetch", "--script")?;
 
     let python = options.python.unwrap_or_else(|| DEFAULT_PYTHON.to_string());
-    if python.trim().is_empty() {
-        return Err(CliError::InvalidArgument(
-            "forage fetch requires --python".to_string(),
-        ));
-    }
+    validate_python(&python, "forage fetch")?;
 
     let path = options.project.path.unwrap_or(std::env::current_dir()?);
-    let store = agentflow_core::storage::ProjectStore::open(&path)?;
-    let out_file = forage_fetch_tmp_path();
+    let store = ProjectStore::open(&path)?;
     let max = options.max.unwrap_or(DEFAULT_PUBMED_MAX);
-    let output = Command::new(&python)
-        .arg(&script)
+    let observations = fetch_and_ingest(&store, &python, &script, &query, max, &source)?;
+
+    if options.project.json {
+        Ok(forage_ingest_summary_json(&observations))
+    } else {
+        Ok(format_forage_ingest_summary(&observations))
+    }
+}
+
+fn fetch_and_ingest(
+    store: &ProjectStore,
+    python: &str,
+    script: &Path,
+    query: &str,
+    max: u32,
+    source: &str,
+) -> Result<Vec<ForageObservation>, CliError> {
+    let out_file = forage_fetch_tmp_path();
+    let output = Command::new(python)
+        .arg(script)
         .arg("--query")
-        .arg(&query)
+        .arg(query)
         .arg("--max")
         .arg(max.to_string())
         .arg("--out")
         .arg(&out_file)
         .output()
         .map_err(|error| {
+            let _ = std::fs::remove_file(&out_file);
             CliError::Core(format!(
                 "failed to run forage fetch script {} with {}: {error}",
                 script.display(),
@@ -484,15 +522,62 @@ where
         )));
     }
 
-    let observations = ingest_forage_hits(&store, &out_file, &source);
+    let observations = ingest_forage_hits(store, &out_file, source);
     let _ = std::fs::remove_file(&out_file);
-    let observations = observations?;
+    observations
+}
 
-    if options.project.json {
-        Ok(forage_ingest_summary_json(&observations))
-    } else {
-        Ok(format_forage_ingest_summary(&observations))
+fn auto_forage_pass(
+    store: &ProjectStore,
+    python: &str,
+    script: &Path,
+    max: u32,
+) -> Result<AutoForageSummary, CliError> {
+    let mut summary = AutoForageSummary::default();
+
+    for hypothesis in store.list_hypotheses()? {
+        let verdict = store.latest_verdict_for(&hypothesis.id)?;
+        if !should_auto_forage(verdict.as_ref()) {
+            continue;
+        }
+
+        let observations = match fetch_and_ingest(
+            store,
+            python,
+            script,
+            &hypothesis.statement,
+            max,
+            DEFAULT_FORAGE_SOURCE,
+        ) {
+            Ok(observations) => observations,
+            Err(error) => {
+                summary
+                    .skipped
+                    .push(format!("{}: {}", hypothesis.id, error.message()));
+                continue;
+            }
+        };
+
+        summary.hypotheses_foraged += 1;
+        for observation in observations {
+            store.link_forage_evidence(
+                &hypothesis.id,
+                &observation.id,
+                Stance::Neutral,
+                AUTO_FORAGE_NOTE,
+            )?;
+            summary.observations_linked += 1;
+        }
     }
+
+    Ok(summary)
+}
+
+fn should_auto_forage(verdict: Option<&VerdictSummary>) -> bool {
+    matches!(
+        verdict.map(|summary| summary.tag),
+        None | Some(VerdictTag::InconclusiveProvisional)
+    )
 }
 
 fn forage_list_command<I>(args: I) -> Result<String, CliError>
@@ -703,6 +788,19 @@ where
                         "--max-apply must fit in an unsigned 32-bit integer".to_string(),
                     )
                 })?;
+            }
+            "--auto-forage" => {
+                options.auto_forage = true;
+            }
+            "--forage-max" => {
+                options.forage_max = parse_u32_flag("--forage-max", &mut args)?;
+            }
+            "--forage-script" => {
+                options.forage_script =
+                    Some(PathBuf::from(require_value("--forage-script", &mut args)?));
+            }
+            "--python" => {
+                options.python = Some(require_value("--python", &mut args)?);
             }
             _ if arg.starts_with('-') => {
                 return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
@@ -922,7 +1020,7 @@ where
                 options.script = Some(PathBuf::from(require_value("--script", &mut args)?));
             }
             "--max" => {
-                options.max = Some(parse_usize_flag("--max", &mut args)?);
+                options.max = Some(parse_u32_flag("--max", &mut args)?);
             }
             "--python" => {
                 options.python = Some(require_value("--python", &mut args)?);
@@ -1025,6 +1123,40 @@ where
         .map_err(|_| CliError::InvalidArgument(format!("{flag} must be a non-negative integer")))
 }
 
+fn parse_u32_flag<I>(flag: &str, args: &mut I) -> Result<u32, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let value = parse_usize_flag(flag, args)?;
+    u32::try_from(value).map_err(|_| {
+        CliError::InvalidArgument(format!("{flag} must fit in an unsigned 32-bit integer"))
+    })
+}
+
+fn validate_forage_script(script: &Path, command: &str, flag: &str) -> Result<(), CliError> {
+    if script.as_os_str().is_empty() {
+        return Err(CliError::InvalidArgument(format!(
+            "{command} requires {flag}"
+        )));
+    }
+    if !script.exists() {
+        return Err(CliError::InvalidArgument(format!(
+            "{command} script not found: {}",
+            script.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_python(python: &str, command: &str) -> Result<(), CliError> {
+    if python.trim().is_empty() {
+        return Err(CliError::InvalidArgument(format!(
+            "{command} requires --python"
+        )));
+    }
+    Ok(())
+}
+
 fn parse_access_status(value: &str) -> Result<AccessStatus, CliError> {
     AccessStatus::parse(value).ok_or_else(|| {
         CliError::InvalidArgument(
@@ -1097,6 +1229,68 @@ fn forage_ingest_summary_json(observations: &[ForageObservation]) -> String {
         "{{\"schema_version\":\"agentflow.forage_ingest.v0\",\"count\":{},\"observation_ids\":[{ids}]}}",
         observations.len()
     )
+}
+
+fn format_agent_run_json(report: &CycleReport, auto_forage: Option<&AutoForageSummary>) -> String {
+    let report_json = report.to_json();
+    let Some(auto_forage) = auto_forage else {
+        return report_json;
+    };
+
+    let report_without_closing = report_json.strip_suffix('}').unwrap_or(&report_json);
+    format!(
+        "{report_without_closing},\"auto_forage\":{}}}",
+        auto_forage_summary_json(auto_forage)
+    )
+}
+
+fn auto_forage_summary_json(summary: &AutoForageSummary) -> String {
+    let skipped = summary
+        .skipped
+        .iter()
+        .map(|entry| format!("\"{}\"", escape_json(entry)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        concat!(
+            "{{",
+            "\"hypotheses_foraged\":{},",
+            "\"observations_linked\":{},",
+            "\"skipped\":[{}]",
+            "}}"
+        ),
+        summary.hypotheses_foraged, summary.observations_linked, skipped
+    )
+}
+
+fn format_agent_run_human(report: &CycleReport, auto_forage: Option<&AutoForageSummary>) -> String {
+    let report = format_cycle_report(report);
+    if let Some(summary) = auto_forage {
+        format!("{}\n{report}", format_auto_forage_summary(summary))
+    } else {
+        report
+    }
+}
+
+fn format_auto_forage_summary(summary: &AutoForageSummary) -> String {
+    format!(
+        "Auto-forage\nHypotheses foraged: {}\nObservations linked: {}\nSkipped:\n{}",
+        summary.hypotheses_foraged,
+        summary.observations_linked,
+        format_auto_forage_skipped(&summary.skipped)
+    )
+}
+
+fn format_auto_forage_skipped(skipped: &[String]) -> String {
+    if skipped.is_empty() {
+        return "  none".to_string();
+    }
+
+    skipped
+        .iter()
+        .map(|entry| format!("  {entry}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn format_cycle_report(report: &CycleReport) -> String {
@@ -1557,7 +1751,9 @@ fn stderr_summary(stderr: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::run;
-    use agentflow_core::argument::{EvidenceGrade, EvidenceLinkRequest};
+    use agentflow_core::argument::{
+        ClaimBasis, EvidenceGrade, EvidenceLinkRequest, RuleBasedEngine, SelfDeceptionGate,
+    };
     use agentflow_core::handoff::{Cost, DecisionKind, HandoffOption, Risk};
     use agentflow_core::hypothesis::{HypothesisRequest, HypothesisStatus};
     use agentflow_core::storage::{EventRecord, ProjectStore};
@@ -1590,6 +1786,17 @@ mod tests {
             .id
     }
 
+    fn record_hypothesis_with_statement(store: &ProjectStore, statement: &str) -> String {
+        store
+            .record_hypothesis(HypothesisRequest {
+                statement: statement.to_string(),
+                origin: "c2 test".to_string(),
+                related_goal_id: "goal_c2".to_string(),
+            })
+            .unwrap()
+            .id
+    }
+
     fn link_weak_evidence(store: &ProjectStore, hypothesis_id: &str) {
         store
             .link_evidence(EvidenceLinkRequest {
@@ -1601,6 +1808,53 @@ mod tests {
                 note: "Literature support remains provisional.".to_string(),
             })
             .unwrap();
+    }
+
+    fn valid_gate() -> SelfDeceptionGate {
+        SelfDeceptionGate {
+            supports: "Observed evidence supports the claim".to_string(),
+            against: "Contradictory evidence has been checked".to_string(),
+            alternatives: "Alternative explanations remain less consistent".to_string(),
+            data_quality_risks: "Sampling bias is limited by replication".to_string(),
+            assumptions: "Measurements are comparable across runs".to_string(),
+            falsifier: "A replicated contradiction would overturn this claim".to_string(),
+            claim_basis: ClaimBasis::Observed,
+            not_yet_claimable: "No causal mechanism is claimed yet".to_string(),
+        }
+    }
+
+    fn write_auto_forage_script(path: &Path, fail_query: Option<&str>) {
+        let fail_block = fail_query.map_or_else(String::new, |query| {
+            format!(
+                "if [ \"$query\" = {} ]; then\n  echo \"fixture failure for $query\" >&2\n  exit 7\nfi\n",
+                shell_single_quoted(query)
+            )
+        });
+        std::fs::write(
+            path,
+            format!(
+                r#"set -eu
+out=""
+query=""
+max=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --query) query="$2"; shift 2 ;;
+    --max) max="$2"; shift 2 ;;
+    --out) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+{fail_block}: "${{out:?missing out}}"
+printf '{{"external_id":"PMID:390000%s","title":"Auto forage fixture","access_status":"abstract_available"}}\n' "$max" > "$out"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn shell_single_quoted(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 
     fn option(label: &str) -> HandoffOption {
@@ -1656,6 +1910,158 @@ mod tests {
         assert!(json.contains("\"outcome\":\"advanced\""));
         assert!(json.contains("\"matched_tool\":null"));
         assert!(json.contains(&hypothesis_id));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn agent_run_parses_auto_forage_flags() {
+        let options = parse_agent_run_options(args(&[
+            "--auto-forage",
+            "--forage-max",
+            "3",
+            "--forage-script",
+            "fixture.sh",
+            "--python",
+            "/bin/sh",
+        ]))
+        .unwrap();
+
+        assert!(options.auto_forage);
+        assert_eq!(options.forage_max, 3);
+        assert_eq!(options.forage_script, Some(PathBuf::from("fixture.sh")));
+        assert_eq!(options.python.as_deref(), Some("/bin/sh"));
+    }
+
+    #[test]
+    fn agent_run_auto_forage_links_neutral_evidence_for_provisional_hypothesis() {
+        let path = temp_project_path("agent-run-auto-forage-provisional");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis(&store);
+        link_weak_evidence(&store, &hypothesis_id);
+        store
+            .render_verdict(&hypothesis_id, &RuleBasedEngine, None)
+            .unwrap();
+        let script = path.join("forage-fixture.sh");
+        write_auto_forage_script(&script, None);
+
+        let json = run(args(&[
+            "agentflow",
+            "agent",
+            "run",
+            "--auto-forage",
+            "--forage-max",
+            "2",
+            "--forage-script",
+            script.to_str().unwrap(),
+            "--python",
+            "/bin/sh",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(json.contains("\"auto_forage\":{"));
+        assert!(json.contains("\"hypotheses_foraged\":1"));
+        assert!(json.contains("\"observations_linked\":1"));
+        let evidence = store.evidence_for(&hypothesis_id).unwrap();
+        let linked = evidence
+            .iter()
+            .find(|link| link.note == AUTO_FORAGE_NOTE)
+            .unwrap();
+        assert_eq!(linked.stance, Stance::Neutral);
+        assert_eq!(linked.source.as_deref(), Some("PMID:3900002"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn agent_run_auto_forage_skips_strong_verdicts() {
+        let path = temp_project_path("agent-run-auto-forage-strong-skip");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis(&store);
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis_id.clone(),
+                observation_id: None,
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: "Observed support reaches the decision rule.".to_string(),
+            })
+            .unwrap();
+        store
+            .render_verdict(&hypothesis_id, &RuleBasedEngine, Some(valid_gate()))
+            .unwrap();
+        let script = path.join("forage-fixture.sh");
+        write_auto_forage_script(&script, None);
+
+        let output = run(args(&[
+            "agentflow",
+            "agent",
+            "run",
+            "--auto-forage",
+            "--forage-script",
+            script.to_str().unwrap(),
+            "--python",
+            "/bin/sh",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(output.starts_with("Auto-forage\n"));
+        assert!(output.contains("Hypotheses foraged: 0"));
+        assert!(output.contains("Observations linked: 0"));
+        assert!(!store
+            .evidence_for(&hypothesis_id)
+            .unwrap()
+            .iter()
+            .any(|link| link.note == AUTO_FORAGE_NOTE));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn agent_run_auto_forage_skips_single_script_failure_and_continues() {
+        let path = temp_project_path("agent-run-auto-forage-skip-failure");
+        let store = init_project(&path);
+        let failing_statement = "Auto forage fixture should fail";
+        let failing_id = record_hypothesis_with_statement(&store, failing_statement);
+        let success_id = record_hypothesis_with_statement(&store, "Auto forage fixture succeeds");
+        let script = path.join("forage-fixture.sh");
+        write_auto_forage_script(&script, Some(failing_statement));
+
+        let json = run(args(&[
+            "agentflow",
+            "agent",
+            "run",
+            "--auto-forage",
+            "--forage-script",
+            script.to_str().unwrap(),
+            "--python",
+            "/bin/sh",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(json.contains("\"hypotheses_foraged\":1"));
+        assert!(json.contains("\"observations_linked\":1"));
+        assert!(json.contains(&failing_id));
+        assert!(json.contains("status 7"));
+        assert!(store
+            .evidence_for(&success_id)
+            .unwrap()
+            .iter()
+            .any(|link| link.note == AUTO_FORAGE_NOTE && link.stance == Stance::Neutral));
+        assert!(!store
+            .evidence_for(&failing_id)
+            .unwrap()
+            .iter()
+            .any(|link| link.note == AUTO_FORAGE_NOTE));
 
         let _ = std::fs::remove_dir_all(path);
     }

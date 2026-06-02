@@ -128,6 +128,22 @@ impl AppliedAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyFailure {
+    pub hypothesis_id: String,
+    pub reason: String,
+}
+
+impl ApplyFailure {
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!("{{", "\"hypothesis_id\":\"{}\",", "\"reason\":\"{}\"", "}}"),
+            escape_json(&self.hypothesis_id),
+            escape_json(&self.reason)
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CycleReport {
     pub checkpoint_id: String,
     pub provisional_verdicts: Vec<String>,
@@ -135,6 +151,7 @@ pub struct CycleReport {
     pub raised_decisions: Vec<DecisionPoint>,
     pub branch_proposals: Vec<EnrichedProposal>,
     pub applied: Vec<AppliedAction>,
+    pub apply_failures: Vec<ApplyFailure>,
     pub outcome: CycleOutcome,
 }
 
@@ -158,10 +175,21 @@ impl CycleReport {
             .map(AppliedAction::to_json)
             .collect::<Vec<_>>()
             .join(",");
+        let apply_failures = self
+            .apply_failures
+            .iter()
+            .map(ApplyFailure::to_json)
+            .collect::<Vec<_>>()
+            .join(",");
         let applied_field = if self.applied.is_empty() {
             String::new()
         } else {
             format!("\"applied\":[{applied}],")
+        };
+        let apply_failures_field = if self.apply_failures.is_empty() {
+            String::new()
+        } else {
+            format!("\"apply_failures\":[{apply_failures}],")
         };
 
         format!(
@@ -174,6 +202,7 @@ impl CycleReport {
                 "\"raised_decisions\":[{}],",
                 "\"branch_proposals\":[{}],",
                 "{}",
+                "{}",
                 "\"outcome\":\"{}\"",
                 "}}"
             ),
@@ -183,6 +212,7 @@ impl CycleReport {
             decisions,
             branch_proposals,
             applied_field,
+            apply_failures_field,
             self.outcome.as_str()
         )
     }
@@ -205,6 +235,7 @@ impl ProjectStore {
         let mut raised_decisions = Vec::new();
         let mut branch_proposals = Vec::new();
         let mut applied = Vec::new();
+        let mut apply_failures = Vec::new();
 
         for hypothesis in self.list_hypotheses()? {
             let evidence = self.evidence_for(&hypothesis.id)?;
@@ -311,16 +342,20 @@ impl ProjectStore {
                                 )?;
                                 raised_decisions.push(point);
                             } else {
-                                let patch =
-                                    self.propose_branch_patch(flow_id, &proposal.decision, step)?;
-                                self.approve_graph_patch(&patch.id)?;
-                                let application = self.apply_graph_patch(&patch.id)?;
-                                for step_id in application.applied_steps {
-                                    applied.push(AppliedAction::GraphPatchApplied {
-                                        flow_id: flow_id.to_string(),
-                                        patch_id: patch.id.clone(),
-                                        step_id,
-                                    });
+                                match self.apply_branch_patch_for_proposal(
+                                    flow_id,
+                                    &proposal.decision,
+                                    step,
+                                ) {
+                                    Ok(actions) => applied.extend(actions),
+                                    Err(error) => apply_failures.push(ApplyFailure {
+                                        hypothesis_id: proposal
+                                            .decision
+                                            .candidate
+                                            .hypothesis_id
+                                            .clone(),
+                                        reason: error.to_string(),
+                                    }),
                                 }
                             }
                         }
@@ -349,6 +384,7 @@ impl ProjectStore {
             raised_decisions,
             branch_proposals,
             applied,
+            apply_failures,
             outcome,
         };
         self.append_event(EventRecord {
@@ -389,6 +425,11 @@ impl ProjectStore {
         };
 
         let drafted_step = self.draft_step_for(&candidate.tool_ref, available)?;
+        let needs = self.infer_step_needs(&drafted_step)?;
+        let drafted_step = ProposedStep {
+            needs,
+            ..drafted_step
+        };
         Ok(EnrichedProposal {
             decision,
             matched_tool: Some(candidate.tool_ref),
@@ -415,6 +456,26 @@ impl ProjectStore {
             .take(2)
             .count();
         Ok(candidate_count > 1)
+    }
+
+    fn apply_branch_patch_for_proposal(
+        &self,
+        flow_id: &str,
+        decision: &BranchDecision,
+        step: &ProposedStep,
+    ) -> Result<Vec<AppliedAction>, StorageError> {
+        let patch = self.propose_branch_patch(flow_id, decision, step)?;
+        self.approve_graph_patch(&patch.id)?;
+        let application = self.apply_graph_patch(&patch.id)?;
+        Ok(application
+            .applied_steps
+            .into_iter()
+            .map(|step_id| AppliedAction::GraphPatchApplied {
+                flow_id: flow_id.to_string(),
+                patch_id: patch.id.clone(),
+                step_id,
+            })
+            .collect())
     }
 }
 
@@ -693,8 +754,8 @@ mod tests {
     use crate::handoff::DecisionKind;
     use crate::hypothesis::{Confidence, HypothesisRequest, HypothesisStatus};
     use crate::storage::{
-        now_unix_seconds, ArtifactImportMode, ArtifactImportRequest, FlowDraft, ProjectStore,
-        ToolSpec,
+        now_unix_seconds, ArtifactImportMode, ArtifactImportRequest, ComputedArtifactRequest,
+        FlowDraft, ProjectStore, ToolSpec,
     };
 
     use super::{proposal_keywords, AppliedAction, ApplyConfig, CycleOutcome};
@@ -782,6 +843,26 @@ runtime:
                 source_path,
                 artifact_type: "ExpressionTable".to_string(),
                 mode: ArtifactImportMode::Reference,
+            })
+            .unwrap()
+            .summary
+            .id
+    }
+
+    fn computed_expression_artifact(
+        store: &ProjectStore,
+        root: &std::path::Path,
+        source_step_id: &str,
+    ) -> String {
+        let source_path = root.join(format!("{source_step_id}_expression.tsv"));
+        std::fs::write(&source_path, "gene\tvalue\nKRAS\t2\n").unwrap();
+        store
+            .register_computed_artifact(ComputedArtifactRequest {
+                source_path,
+                artifact_type: "ExpressionTable".to_string(),
+                output_name: "expression_table".to_string(),
+                source_step_id: source_step_id.to_string(),
+                source_run_id: "run_source".to_string(),
             })
             .unwrap()
             .summary
@@ -914,6 +995,59 @@ steps:
         assert!(report
             .to_json()
             .contains("\"type\":\"graph_patch_applied\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn apply_graph_patch_failures_are_recorded_and_later_proposals_continue() {
+        let (path, store) = init_project("apply-graph-failure-continues");
+        register_marker_tool(&store);
+        let expression_id = computed_expression_artifact(&store, &path, "producer_outside_flow");
+        approve_marker_flow(&store, &expression_id);
+        let failing_hypothesis =
+            record_hypothesis(&store, "Marker evidence needs deeper validation");
+        link_evidence(
+            &store,
+            &failing_hypothesis,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support gives this branch medium confidence.",
+        );
+        let succeeding_hypothesis =
+            record_hypothesis(&store, "Marker pathway follow-up needs deeper validation");
+        link_evidence(
+            &store,
+            &succeeding_hypothesis,
+            EvidenceGrade::Hypothesis,
+            Stance::Supports,
+            "Hypothesis-grade evidence keeps this branch lower priority.",
+        );
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: true,
+                flow: Some("auto_flow".to_string()),
+                max_apply: 10,
+            })
+            .unwrap();
+
+        assert_eq!(report.branch_proposals.len(), 2);
+        assert_eq!(report.apply_failures.len(), 2);
+        assert_eq!(report.apply_failures[0].hypothesis_id, failing_hypothesis);
+        assert_eq!(
+            report.apply_failures[1].hypothesis_id,
+            succeeding_hypothesis
+        );
+        assert!(report.apply_failures[0]
+            .reason
+            .contains("needs unknown step producer_outside_flow"));
+        let flow = store.inspect_flow("auto_flow").unwrap();
+        assert!(!flow
+            .steps
+            .iter()
+            .any(|step| step.local_id == "step_marker_deepen"));
+        assert!(report.to_json().contains("\"apply_failures\":[{"));
 
         let _ = std::fs::remove_dir_all(path);
     }
@@ -1125,6 +1259,7 @@ steps:
         let step = proposal.drafted_step.as_ref().unwrap();
         assert_eq!(step.id, "step_marker_deepen");
         assert_eq!(step.tool, "analysis/marker_deepen");
+        assert!(step.needs.is_empty());
         assert_eq!(
             step.inputs,
             vec![("expression_table".to_string(), artifact_id)]
@@ -1137,6 +1272,35 @@ steps:
             )]
         );
         assert!(proposal.to_json().contains("\"drafted_step\":{"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn branch_proposal_infers_needs_from_computed_artifacts() {
+        let (path, store) = init_project("enriched-computed-needs");
+        register_marker_tool(&store);
+        let artifact_id = computed_expression_artifact(&store, &path, "producer_step");
+        let hypothesis_id =
+            record_hypothesis(&store, "Marker evidence requires deeper pathway validation");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is below the decision margin.",
+        );
+
+        let report = store.run_cycle().unwrap();
+
+        assert_eq!(report.outcome, CycleOutcome::Advanced);
+        assert_eq!(report.branch_proposals.len(), 1);
+        let step = report.branch_proposals[0].drafted_step.as_ref().unwrap();
+        assert_eq!(
+            step.inputs,
+            vec![("expression_table".to_string(), artifact_id)]
+        );
+        assert_eq!(step.needs, vec!["producer_step".to_string()]);
 
         let _ = std::fs::remove_dir_all(path);
     }

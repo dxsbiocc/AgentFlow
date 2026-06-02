@@ -363,6 +363,7 @@ pub struct VerdictSummary {
     pub hypothesis_id: String,
     pub tag: VerdictTag,
     pub confidence: Confidence,
+    pub frontier: Option<String>,
     pub created_at: i64,
 }
 
@@ -374,12 +375,14 @@ impl VerdictSummary {
                 "\"hypothesis_id\":\"{}\",",
                 "\"tag\":\"{}\",",
                 "\"confidence\":\"{}\",",
+                "\"frontier\":{},",
                 "\"created_at\":{}",
                 "}}"
             ),
             escape_json(&self.hypothesis_id),
             self.tag.as_str(),
             self.confidence.as_str(),
+            optional_json_string(self.frontier.as_deref()),
             self.created_at
         )
     }
@@ -787,6 +790,7 @@ fn verdict_rendered_payload_json(
             "\"hypothesis_id\":\"{}\",",
             "\"verdict\":\"{}\",",
             "\"confidence\":\"{}\",",
+            "\"frontier\":{},",
             "\"rationale\":\"{}\",",
             "\"gate\":{}",
             "}}"
@@ -794,6 +798,7 @@ fn verdict_rendered_payload_json(
         escape_json(&report.hypothesis_id),
         escape_json(&verdict_payload_text(&report.verdict)),
         report.confidence.as_str(),
+        optional_json_string(verdict_frontier(&report.verdict)),
         escape_json(&report.rationale),
         self_deception_gate_json(gate)
     )
@@ -803,6 +808,13 @@ fn verdict_payload_text(verdict: &Verdict) -> String {
     match verdict {
         Verdict::Affirmed | Verdict::Refuted => verdict.as_str().to_string(),
         Verdict::Inconclusive(kind) => format!("inconclusive_{}", kind.as_str()),
+    }
+}
+
+fn verdict_frontier(verdict: &Verdict) -> Option<&str> {
+    match verdict {
+        Verdict::Inconclusive(InconclusiveKind::Fundamental { frontier }) => Some(frontier),
+        Verdict::Affirmed | Verdict::Refuted | Verdict::Inconclusive(_) => None,
     }
 }
 
@@ -891,6 +903,7 @@ fn verdict_summary_from_event(
         hypothesis_id,
         tag,
         confidence,
+        frontier: json_nullable_string_field(payload_json, "frontier"),
         created_at,
     })
 }

@@ -4,7 +4,11 @@ use std::path::PathBuf;
 
 use rusqlite::params;
 
-use crate::storage::{ArtifactSummary, ProjectStore, StorageError, StoredFlowStep};
+use crate::argument::{EvidenceLink, Stance, VerdictSummary, VerdictTag};
+use crate::handoff::DecisionStatus;
+use crate::storage::{
+    now_unix_seconds, ArtifactSummary, ProjectStore, StorageError, StoredFlowStep,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunAttemptRecord {
@@ -40,6 +44,150 @@ struct ReferencedArtifactRecord {
 }
 
 impl ProjectStore {
+    pub fn generate_research_report_markdown(&self) -> Result<String, StorageError> {
+        let hypotheses = self.list_hypotheses()?;
+        let decisions = self
+            .list_decision_points()?
+            .into_iter()
+            .filter(|point| point.status == DecisionStatus::Pending)
+            .collect::<Vec<_>>();
+        let forage_observations = self.list_forage_observations()?;
+        let research_notes = self.list_research_notes()?;
+
+        let mut markdown = String::new();
+        writeln!(&mut markdown, "# AgentFlow Research Report").unwrap();
+        writeln!(&mut markdown).unwrap();
+        writeln!(&mut markdown, "Generated: `{}`", now_unix_seconds()).unwrap();
+        writeln!(&mut markdown).unwrap();
+
+        writeln!(&mut markdown, "## Hypotheses ({})", hypotheses.len()).unwrap();
+        writeln!(&mut markdown).unwrap();
+        if hypotheses.is_empty() {
+            writeln!(&mut markdown, "- No hypotheses recorded.").unwrap();
+        } else {
+            for hypothesis in &hypotheses {
+                let evidence = self.evidence_for(&hypothesis.id)?;
+                let verdict = self.latest_verdict_for(&hypothesis.id)?;
+                let supporting = evidence
+                    .iter()
+                    .filter(|link| link.stance == Stance::Supports)
+                    .collect::<Vec<_>>();
+                let contradicting = evidence
+                    .iter()
+                    .filter(|link| link.stance == Stance::Contradicts)
+                    .collect::<Vec<_>>();
+                let neutral = evidence
+                    .iter()
+                    .filter(|link| link.stance == Stance::Neutral)
+                    .collect::<Vec<_>>();
+
+                writeln!(&mut markdown, "### {}", hypothesis.statement).unwrap();
+                writeln!(&mut markdown).unwrap();
+                writeln!(&mut markdown, "- id: `{}`", hypothesis.id).unwrap();
+                writeln!(
+                    &mut markdown,
+                    "- lifecycle: `{}`",
+                    hypothesis.status.as_str()
+                )
+                .unwrap();
+                writeln!(
+                    &mut markdown,
+                    "- verdict: {}",
+                    format_research_verdict(verdict.as_ref())
+                )
+                .unwrap();
+                write_research_evidence_group(&mut markdown, "supporting evidence", &supporting);
+                write_research_evidence_group(
+                    &mut markdown,
+                    "contradicting evidence",
+                    &contradicting,
+                );
+                write_research_evidence_group(&mut markdown, "context/neutral evidence", &neutral);
+                writeln!(
+                    &mut markdown,
+                    "- uncertainty: {}",
+                    format_research_uncertainty(verdict.as_ref())
+                )
+                .unwrap();
+                writeln!(&mut markdown).unwrap();
+            }
+        }
+        writeln!(&mut markdown).unwrap();
+
+        writeln!(
+            &mut markdown,
+            "## Open Decisions (pending) ({})",
+            decisions.len()
+        )
+        .unwrap();
+        writeln!(&mut markdown).unwrap();
+        if decisions.is_empty() {
+            writeln!(&mut markdown, "- No pending decision points.").unwrap();
+        } else {
+            for decision in &decisions {
+                writeln!(
+                    &mut markdown,
+                    "- [{}] {} -> options: {}",
+                    decision.kind.as_str(),
+                    decision.digest,
+                    decision
+                        .options
+                        .iter()
+                        .map(|option| option.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .unwrap();
+            }
+        }
+        writeln!(&mut markdown).unwrap();
+
+        writeln!(
+            &mut markdown,
+            "## Literature foraged ({})",
+            forage_observations.len()
+        )
+        .unwrap();
+        writeln!(&mut markdown).unwrap();
+        if forage_observations.is_empty() {
+            writeln!(&mut markdown, "- No literature foraged.").unwrap();
+        } else {
+            for observation in &forage_observations {
+                writeln!(
+                    &mut markdown,
+                    "- [{}] {} ({})",
+                    observation.access_status.as_str(),
+                    observation.title,
+                    observation.external_id
+                )
+                .unwrap();
+            }
+        }
+        writeln!(&mut markdown).unwrap();
+
+        writeln!(
+            &mut markdown,
+            "## Research notes ({})",
+            research_notes.len()
+        )
+        .unwrap();
+        writeln!(&mut markdown).unwrap();
+        if research_notes.is_empty() {
+            writeln!(&mut markdown, "- No research notes recorded.").unwrap();
+        } else {
+            for note in &research_notes {
+                writeln!(
+                    &mut markdown,
+                    "- {} -> {} [{}]",
+                    note.question, note.finding, note.confidence
+                )
+                .unwrap();
+            }
+        }
+
+        Ok(markdown)
+    }
+
     pub fn generate_report_markdown(&self, flow_id: &str) -> Result<String, StorageError> {
         let flow = self.inspect_flow(flow_id)?;
         let step_local_ids = flow
@@ -461,6 +609,79 @@ impl ProjectStore {
     }
 }
 
+fn write_research_evidence_group(markdown: &mut String, label: &str, evidence: &[&EvidenceLink]) {
+    writeln!(markdown, "- {label} ({}):", evidence.len()).unwrap();
+    if evidence.is_empty() {
+        writeln!(markdown, "  - No {label} recorded.").unwrap();
+    } else {
+        for link in evidence {
+            writeln!(
+                markdown,
+                "  - [{}] {} - source: {}",
+                link.grade.as_str(),
+                link.note,
+                research_evidence_source(link)
+            )
+            .unwrap();
+        }
+    }
+}
+
+fn research_evidence_source(link: &EvidenceLink) -> &str {
+    link.source
+        .as_deref()
+        .filter(|source| !source.trim().is_empty())
+        .or_else(|| {
+            link.observation_id
+                .as_deref()
+                .filter(|observation_id| !observation_id.trim().is_empty())
+        })
+        .unwrap_or("-")
+}
+
+fn format_research_verdict(verdict: Option<&VerdictSummary>) -> String {
+    verdict.map_or_else(
+        || "(no verdict)".to_string(),
+        |verdict| {
+            format!(
+                "`{}` (confidence: `{}`)",
+                research_verdict_label(verdict.tag),
+                verdict.confidence.as_str()
+            )
+        },
+    )
+}
+
+fn format_research_uncertainty(verdict: Option<&VerdictSummary>) -> String {
+    match verdict {
+        None => "not yet evaluated".to_string(),
+        Some(verdict) => match verdict.tag {
+            VerdictTag::InconclusiveProvisional => {
+                "evidence below decision margin / needs stronger evidence".to_string()
+            }
+            VerdictTag::InconclusiveFundamental => format!(
+                "currently undecidable: {}",
+                verdict
+                    .frontier
+                    .as_deref()
+                    .unwrap_or("frontier not recorded")
+            ),
+            VerdictTag::Affirmed | VerdictTag::Refuted => {
+                "no explicit uncertainty recorded".to_string()
+            }
+        },
+    }
+}
+
+fn research_verdict_label(tag: VerdictTag) -> &'static str {
+    match tag {
+        VerdictTag::Affirmed => "affirmed",
+        VerdictTag::Refuted => "refuted",
+        VerdictTag::InconclusiveProvisional => "inconclusive(provisional)",
+        VerdictTag::InconclusiveFundamental => "inconclusive(fundamental)",
+    }
+}
+
 fn load_run_attempts(
     store: &ProjectStore,
     flow_id: &str,
@@ -741,6 +962,13 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+    use crate::argument::{
+        ArgumentEngine, ClaimBasis, EvidenceGrade, EvidenceLink, EvidenceLinkRequest,
+        InconclusiveKind, RuleBasedEngine, SelfDeceptionGate, Stance, Verdict, VerdictReport,
+    };
+    use crate::forage::AccessStatus;
+    use crate::handoff::{Cost, DecisionKind, HandoffOption, Risk};
+    use crate::hypothesis::{Confidence, HypothesisRequest};
     use crate::storage::{ArtifactImportMode, ArtifactImportRequest, FlowDraft, ToolSpec};
     use crate::{comparison::BranchComparisonRequest, research::ResearchNoteRequest};
 
@@ -789,12 +1017,222 @@ fi
             .id
     }
 
+    fn handoff_option(label: &str) -> HandoffOption {
+        HandoffOption {
+            label: label.to_string(),
+            direction: format!("{label} direction"),
+            cost: Cost::Cheap,
+            risk: Risk::Low,
+            reversible: true,
+        }
+    }
+
+    fn valid_gate() -> SelfDeceptionGate {
+        SelfDeceptionGate {
+            supports: "Observed evidence supports the claim".to_string(),
+            against: "Contradictory evidence has been checked".to_string(),
+            alternatives: "Alternative explanations remain possible".to_string(),
+            data_quality_risks: "Replication is incomplete".to_string(),
+            assumptions: "Measurements are comparable".to_string(),
+            falsifier: "External replication would resolve the frontier".to_string(),
+            claim_basis: ClaimBasis::Observed,
+            not_yet_claimable: "No causal mechanism is claimed yet".to_string(),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FixedEngine {
+        verdict: Verdict,
+        confidence: Confidence,
+    }
+
+    impl ArgumentEngine for FixedEngine {
+        fn render(&self, hypothesis_id: &str, _evidence: &[EvidenceLink]) -> VerdictReport {
+            VerdictReport {
+                hypothesis_id: hypothesis_id.to_string(),
+                verdict: self.verdict.clone(),
+                confidence: self.confidence,
+                supporting: Vec::new(),
+                contradicting: Vec::new(),
+                rationale: "fixed report verdict".to_string(),
+            }
+        }
+    }
+
     #[test]
     fn report_json_map_parser_handles_punctuation_inside_strings() {
         let parsed =
             parse_json_map(r#"{"gene":"TP53,EGFR:ALK","label":"quoted \"value\""}"#).unwrap();
         assert_eq!(parsed["gene"], "TP53,EGFR:ALK");
         assert_eq!(parsed["label"], "quoted \"value\"");
+    }
+
+    #[test]
+    fn generate_research_report_markdown_handles_empty_project() {
+        let path = temp_project_path("empty-research");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Empty Research")).unwrap();
+
+        let report = store.generate_research_report_markdown().unwrap();
+        assert!(report.contains("# AgentFlow Research Report"));
+        assert!(report.contains("Generated: `"));
+        assert!(report.contains("## Hypotheses (0)"));
+        assert!(report.contains("No hypotheses recorded."));
+        assert!(report.contains("## Open Decisions (pending) (0)"));
+        assert!(report.contains("No pending decision points."));
+        assert!(report.contains("## Literature foraged (0)"));
+        assert!(report.contains("No literature foraged."));
+        assert!(report.contains("## Research notes (0)"));
+        assert!(report.contains("No research notes recorded."));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn generate_research_report_markdown_groups_graded_evidence_and_provisional_uncertainty() {
+        let path = temp_project_path("graded-evidence");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Research Evidence")).unwrap();
+        let hypothesis = store
+            .record_hypothesis(HypothesisRequest {
+                statement: "Marker A changes pathway B".to_string(),
+                origin: "agent".to_string(),
+                related_goal_id: "goal_research".to_string(),
+            })
+            .unwrap();
+
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis.id.clone(),
+                observation_id: None,
+                source: Some("lab_run_1".to_string()),
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: "Observed marker increase in run 1".to_string(),
+            })
+            .unwrap();
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis.id.clone(),
+                observation_id: Some("observation_contra".to_string()),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Contradicts,
+                note: "Observed contradiction in replicate".to_string(),
+            })
+            .unwrap();
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis.id.clone(),
+                observation_id: None,
+                source: None,
+                grade: EvidenceGrade::Hypothesis,
+                stance: Stance::Neutral,
+                note: "Mechanism remains speculative".to_string(),
+            })
+            .unwrap();
+        store
+            .render_verdict(&hypothesis.id, &RuleBasedEngine, None)
+            .unwrap();
+
+        let report = store.generate_research_report_markdown().unwrap();
+        assert!(report.contains("## Hypotheses (1)"));
+        assert!(report.contains("### Marker A changes pathway B"));
+        assert!(report.contains("- lifecycle: `proposed`"));
+        assert!(report.contains("- verdict: `inconclusive(provisional)` (confidence: `medium`)"));
+        assert!(report.contains("- supporting evidence (1):"));
+        assert!(report.contains("[observed] Observed marker increase in run 1 - source: lab_run_1"));
+        assert!(report.contains("- contradicting evidence (1):"));
+        assert!(report.contains(
+            "[observed] Observed contradiction in replicate - source: observation_contra"
+        ));
+        assert!(report.contains("- context/neutral evidence (1):"));
+        assert!(report.contains("[hypothesis] Mechanism remains speculative - source: -"));
+        assert!(report
+            .contains("- uncertainty: evidence below decision margin / needs stronger evidence"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn generate_research_report_markdown_renders_fundamental_frontier_uncertainty() {
+        let path = temp_project_path("fundamental-research");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Research Frontier")).unwrap();
+        let hypothesis = store
+            .record_hypothesis(HypothesisRequest {
+                statement: "External cohort resolves this claim".to_string(),
+                origin: "agent".to_string(),
+                related_goal_id: "goal_research".to_string(),
+            })
+            .unwrap();
+
+        store
+            .render_verdict(
+                &hypothesis.id,
+                &FixedEngine {
+                    verdict: Verdict::Inconclusive(InconclusiveKind::Fundamental {
+                        frontier: "requires external replication".to_string(),
+                    }),
+                    confidence: Confidence::Low,
+                },
+                Some(valid_gate()),
+            )
+            .unwrap();
+
+        let report = store.generate_research_report_markdown().unwrap();
+        assert!(report.contains("- verdict: `inconclusive(fundamental)` (confidence: `low`)"));
+        assert!(
+            report.contains("- uncertainty: currently undecidable: requires external replication")
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn generate_research_report_markdown_renders_pending_decisions_forage_and_notes() {
+        let path = temp_project_path("research-context");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Research Context")).unwrap();
+        store
+            .raise_decision_point(
+                DecisionKind::DeepenOrStop,
+                "Decide whether to deepen marker validation",
+                vec![handoff_option("deepen"), handoff_option("stop")],
+                0,
+            )
+            .unwrap();
+        store
+            .record_forage_observation(
+                "pubmed",
+                "PMID:123",
+                "Marker pathway validation study",
+                AccessStatus::AbstractAvailable,
+            )
+            .unwrap();
+        store
+            .record_research_note(ResearchNoteRequest {
+                problem: "Marker validation".to_string(),
+                question: "Should validation continue?".to_string(),
+                finding: "External literature supports one more validation pass.".to_string(),
+                confidence: "medium".to_string(),
+                source: Some("PMID:123".to_string()),
+            })
+            .unwrap();
+
+        let report = store.generate_research_report_markdown().unwrap();
+        assert!(report.contains("## Open Decisions (pending) (1)"));
+        assert!(report.contains(
+            "[deepen_or_stop] Decide whether to deepen marker validation -> options: deepen, stop"
+        ));
+        assert!(report.contains("## Literature foraged (1)"));
+        assert!(report.contains("[abstract_available] Marker pathway validation study (PMID:123)"));
+        assert!(report.contains("## Research notes (1)"));
+        assert!(report.contains(
+            "Should validation continue? -> External literature supports one more validation pass. [medium]"
+        ));
+
+        let _ = fs::remove_dir_all(path);
     }
 
     #[test]

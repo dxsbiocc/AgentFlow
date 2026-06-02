@@ -107,6 +107,7 @@ pub fn usage() -> String {
         "  agentflow run <flow-id> [--path <path>]",
         "  agentflow run-step <step-id|flow.step|step:flow/step> [--path <path>]",
         "  agentflow report <flow-id> [--path <path>]",
+        "  agentflow report research [--path <path>]",
         "  agentflow cache explain <flow-id|step-id> [--path <path>]",
         "  agentflow cache list [--json] [--path <path>]",
         "  agentflow cache prune (--all|--older-than-seconds <seconds>) [--json] [--path <path>]",
@@ -327,7 +328,13 @@ where
         .ok_or_else(|| CliError::InvalidArgument("report requires <flow-id>".to_string()))?;
     let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
-    store.generate_report_markdown(&flow_id).map_err(Into::into)
+    if flow_id == "research" {
+        store
+            .generate_research_report_markdown()
+            .map_err(Into::into)
+    } else {
+        store.generate_report_markdown(&flow_id).map_err(Into::into)
+    }
 }
 
 fn cache_command<I>(args: I) -> Result<String, CliError>
@@ -3186,6 +3193,7 @@ steps:
     fn usage_lists_report_cache_and_retry_commands() {
         let output = usage();
         assert!(output.contains("agentflow report <flow-id> [--path <path>]"));
+        assert!(output.contains("agentflow report research [--path <path>]"));
         assert!(output.contains("agentflow cache explain <flow-id|step-id> [--path <path>]"));
         assert!(output.contains("agentflow cache list [--json] [--path <path>]"));
         assert!(output.contains(
@@ -5136,6 +5144,33 @@ runtime:
         .unwrap();
         assert!(report.contains("# Flow Report: Marker demo"));
         assert!(report.contains("`scan`"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn report_research_command_generates_project_research_markdown_after_parsing() {
+        let path = temp_project_path("report-research-markdown");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let report = run(args(&[
+            "agentflow",
+            "report",
+            "research",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(report.contains("# AgentFlow Research Report"));
+        assert!(report.contains("No hypotheses recorded."));
 
         let _ = fs::remove_dir_all(path);
     }

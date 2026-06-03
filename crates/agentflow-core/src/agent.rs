@@ -1,9 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::argument::{
-    ArgumentEngine, EvidenceGrade, EvidenceLinkRequest, InconclusiveKind, RuleBasedEngine, Stance,
-    Verdict, VerdictReport,
-};
+use crate::argument::{ArgumentEngine, InconclusiveKind, RuleBasedEngine, Verdict, VerdictReport};
 use crate::branch::{BranchAction, BranchDecision, BranchPolicy, ProposedStep, RuleBasedSelector};
 use crate::handoff::{
     Cost, DecisionKind, DecisionPoint, DefaultPolicy, HandoffOption, InterventionPolicy, Risk,
@@ -15,6 +12,7 @@ use crate::tool_select::{CapabilityQuery, Fit};
 
 const AGENT_CYCLE_COMPLETED_EVENT: &str = "agent.cycle_completed";
 const TOOL_GAP_HYPOTHESIS_MARKER: &str = "hypothesis_id = ";
+const STANCE_ASSESSMENT_OBSERVATION_MARKER: &str = "observation_id = ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CycleOutcome {
@@ -436,6 +434,7 @@ impl ProjectStore {
                                                     &step_id,
                                                     &mut applied,
                                                     &mut apply_failures,
+                                                    &mut raised_decisions,
                                                 )?;
                                             }
                                         }
@@ -499,6 +498,15 @@ impl ProjectStore {
             .into_iter()
             .filter(|point| point.kind == DecisionKind::ToolGap)
             .filter_map(|point| tool_gap_hypothesis_id(&point.digest))
+            .collect())
+    }
+
+    fn pending_stance_assessment_observation_ids(&self) -> Result<BTreeSet<String>, StorageError> {
+        Ok(self
+            .pending_decision_points()?
+            .into_iter()
+            .filter(|point| point.kind == DecisionKind::StanceAssessment)
+            .filter_map(|point| stance_assessment_observation_id(&point.digest))
             .collect())
     }
 
@@ -588,6 +596,7 @@ impl ProjectStore {
         step_id: &str,
         applied: &mut Vec<AppliedAction>,
         apply_failures: &mut Vec<ApplyFailure>,
+        raised_decisions: &mut Vec<DecisionPoint>,
     ) -> Result<(), StorageError> {
         let step_ref = format!("step:{flow_id}/{step_id}");
         let summary = match self.run_step_ref(&step_ref) {
@@ -627,25 +636,48 @@ impl ProjectStore {
         }
 
         if let Some(observation_id) = observation_id.as_deref() {
-            if let Err(error) = self.link_evidence(EvidenceLinkRequest {
-                hypothesis_id: hypothesis_id.to_string(),
-                observation_id: Some(observation_id.to_string()),
-                source: None,
-                grade: EvidenceGrade::Observed,
-                stance: Stance::Neutral,
-                note: "auto-run".to_string(),
-            }) {
-                apply_failures.push(ApplyFailure {
-                    hypothesis_id: hypothesis_id.to_string(),
-                    reason: format!("auto-run evidence link for step {step_id} failed: {error}"),
-                });
-            }
+            self.raise_stance_assessment_for_observation(
+                hypothesis_id,
+                step_id,
+                observation_id,
+                raised_decisions,
+            )?;
         }
 
         applied.push(AppliedAction::StepRun {
             step_id: step_id.to_string(),
             observation_id,
         });
+        Ok(())
+    }
+
+    fn raise_stance_assessment_for_observation(
+        &self,
+        hypothesis_id: &str,
+        step_id: &str,
+        observation_id: &str,
+        raised_decisions: &mut Vec<DecisionPoint>,
+    ) -> Result<(), StorageError> {
+        let pending_observations = self.pending_stance_assessment_observation_ids()?;
+        if pending_observations.contains(observation_id) {
+            return Ok(());
+        }
+
+        let observation = self.inspect_observation(observation_id)?;
+        let hypothesis = self.inspect_hypothesis(hypothesis_id)?;
+        let point = self.raise_decision_point(
+            DecisionKind::StanceAssessment,
+            &stance_assessment_digest(
+                step_id,
+                observation_id,
+                &observation.summary,
+                hypothesis_id,
+                &hypothesis.statement,
+            ),
+            stance_assessment_options(hypothesis_id, observation_id),
+            2,
+        )?;
+        raised_decisions.push(point);
         Ok(())
     }
 
@@ -858,6 +890,55 @@ fn graph_patch_apply_options(hypothesis_id: &str, flow_id: &str) -> Vec<HandoffO
             reversible: true,
         },
     ]
+}
+
+fn stance_assessment_digest(
+    step_id: &str,
+    observation_id: &str,
+    observation_summary: &str,
+    hypothesis_id: &str,
+    hypothesis_statement: &str,
+) -> String {
+    format!(
+        "分析步骤 {step_id} 产出真实发现：{observation_summary}。{STANCE_ASSESSMENT_OBSERVATION_MARKER}{observation_id}；请判定它对假设「{hypothesis_statement}」的立场。若支持/反对，运行：evidence link --hypothesis {hypothesis_id} --observation {observation_id} --stance supports|contradicts --grade observed"
+    )
+}
+
+fn stance_assessment_options(hypothesis_id: &str, observation_id: &str) -> Vec<HandoffOption> {
+    vec![
+        HandoffOption {
+            label: "supports — 该发现支持假设".to_string(),
+            direction: format!("将观察 {observation_id} 作为支持证据链接到假设 {hypothesis_id}"),
+            cost: Cost::Cheap,
+            risk: Risk::Low,
+            reversible: true,
+        },
+        HandoffOption {
+            label: "contradicts — 反对假设".to_string(),
+            direction: format!("将观察 {observation_id} 作为反对证据链接到假设 {hypothesis_id}"),
+            cost: Cost::Cheap,
+            risk: Risk::Low,
+            reversible: true,
+        },
+        HandoffOption {
+            label: "inconclusive — 暂无法判定/需更多证据".to_string(),
+            direction: format!("暂不将观察 {observation_id} 链接为假设 {hypothesis_id} 的立场证据"),
+            cost: Cost::Cheap,
+            risk: Risk::Low,
+            reversible: true,
+        },
+    ]
+}
+
+fn stance_assessment_observation_id(digest: &str) -> Option<String> {
+    let rest = digest.split_once(STANCE_ASSESSMENT_OBSERVATION_MARKER)?.1;
+    rest.split('；').next().map(str::trim).and_then(|id| {
+        if id.is_empty() {
+            None
+        } else {
+            Some(id.to_string())
+        }
+    })
 }
 
 fn tool_gap_digest(decision: &BranchDecision) -> String {
@@ -1448,8 +1529,91 @@ steps:
     }
 
     #[test]
-    fn auto_run_runs_applied_step_and_links_neutral_observation_evidence() {
-        let (path, store) = init_project("auto-run-links-neutral-evidence");
+    fn auto_run_runs_applied_step_and_raises_stance_assessment_decision() {
+        let (path, store) = init_project("auto-run-raises-stance-assessment");
+        let script = write_auto_run_marker_script(&path, false);
+        register_exploratory_marker_tool(&store, &script);
+        let artifact_id = import_expression_artifact(&store, &path);
+        approve_auto_run_marker_flow(&store, &artifact_id);
+        let statement = "Marker THRSP evidence requires deeper pathway validation";
+        let hypothesis_id = record_hypothesis(&store, statement);
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: true,
+                auto_run: true,
+                flow: Some("auto_flow".to_string()),
+                max_apply: 5,
+                propose_synth: false,
+            })
+            .unwrap();
+
+        assert_eq!(report.outcome, CycleOutcome::HandedOff);
+        let (step_id, observation_id) = report
+            .applied
+            .iter()
+            .find_map(|action| match action {
+                AppliedAction::StepRun {
+                    step_id,
+                    observation_id: Some(observation_id),
+                } => Some((step_id, observation_id)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(step_id, "step_marker_deepen");
+        let observation = store.inspect_observation(observation_id).unwrap();
+        assert_eq!(
+            observation.step_id.as_deref(),
+            Some("step:auto_flow/step_marker_deepen")
+        );
+        assert_eq!(observation.kind, "marker_report");
+
+        let evidence = store.evidence_for(&hypothesis_id).unwrap();
+        assert!(!evidence.iter().any(|link| link.note == "auto-run"));
+        assert!(!evidence
+            .iter()
+            .any(|link| link.observation_id.as_deref() == Some(observation_id.as_str())));
+
+        assert_eq!(report.raised_decisions.len(), 1);
+        let point = &report.raised_decisions[0];
+        assert_eq!(point.kind, DecisionKind::StanceAssessment);
+        assert_eq!(point.recommendation, 2);
+        assert_eq!(point.options.len(), 3);
+        assert_eq!(point.options[0].label, "supports — 该发现支持假设");
+        assert_eq!(point.options[1].label, "contradicts — 反对假设");
+        assert_eq!(
+            point.options[2].label,
+            "inconclusive — 暂无法判定/需更多证据"
+        );
+        assert!(point.digest.contains("产出真实发现"));
+        assert!(point.digest.contains(&observation.summary));
+        assert!(point.digest.contains(statement));
+        assert!(point.digest.contains(observation_id));
+        assert!(point
+            .digest
+            .contains(&format!("evidence link --hypothesis {hypothesis_id}")));
+        assert!(point
+            .digest
+            .contains(&format!("--observation {observation_id}")));
+        assert!(point.digest.contains("--stance supports|contradicts"));
+        assert!(point.digest.contains("--grade observed"));
+        assert!(report.to_json().contains("\"type\":\"step_run\""));
+        assert!(report.to_json().contains("\"observation_id\":\""));
+        assert!(report.to_json().contains("\"kind\":\"stance_assessment\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_run_skips_duplicate_pending_stance_assessment_for_observation() {
+        let (path, store) = init_project("auto-run-stance-dedup");
         let script = write_auto_run_marker_script(&path, false);
         register_exploratory_marker_tool(&store, &script);
         let artifact_id = import_expression_artifact(&store, &path);
@@ -1475,39 +1639,39 @@ steps:
                 propose_synth: false,
             })
             .unwrap();
-
-        let (step_id, observation_id) = report
+        assert_eq!(report.raised_decisions.len(), 1);
+        let observation_id = report
             .applied
             .iter()
             .find_map(|action| match action {
                 AppliedAction::StepRun {
-                    step_id,
                     observation_id: Some(observation_id),
-                } => Some((step_id, observation_id)),
+                    ..
+                } => Some(observation_id.as_str()),
                 _ => None,
             })
             .unwrap();
-        assert_eq!(step_id, "step_marker_deepen");
-        let observation = store.inspect_observation(observation_id).unwrap();
-        assert_eq!(
-            observation.step_id.as_deref(),
-            Some("step:auto_flow/step_marker_deepen")
-        );
-        assert_eq!(observation.kind, "marker_report");
 
-        let evidence = store.evidence_for(&hypothesis_id).unwrap();
-        let auto_run_link = evidence
-            .iter()
-            .find(|link| link.note == "auto-run")
+        let mut raised_decisions = Vec::new();
+        store
+            .raise_stance_assessment_for_observation(
+                &hypothesis_id,
+                "step_marker_deepen",
+                observation_id,
+                &mut raised_decisions,
+            )
             .unwrap();
+
+        assert!(raised_decisions.is_empty());
         assert_eq!(
-            auto_run_link.observation_id.as_deref(),
-            Some(observation_id.as_str())
+            store
+                .pending_decision_points()
+                .unwrap()
+                .into_iter()
+                .filter(|point| point.kind == DecisionKind::StanceAssessment)
+                .count(),
+            1
         );
-        assert_eq!(auto_run_link.stance, Stance::Neutral);
-        assert_eq!(auto_run_link.grade, EvidenceGrade::Inferred);
-        assert!(report.to_json().contains("\"type\":\"step_run\""));
-        assert!(report.to_json().contains("\"observation_id\":\""));
 
         let _ = std::fs::remove_dir_all(path);
     }

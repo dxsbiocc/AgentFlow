@@ -78,6 +78,7 @@ pub enum DecisionKind {
     BudgetThreshold,
     GoalMutation,
     ToolGap,
+    StanceAssessment,
 }
 
 impl DecisionKind {
@@ -88,6 +89,7 @@ impl DecisionKind {
             Self::BudgetThreshold => "budget_threshold",
             Self::GoalMutation => "goal_mutation",
             Self::ToolGap => "tool_gap",
+            Self::StanceAssessment => "stance_assessment",
         }
     }
 
@@ -98,6 +100,7 @@ impl DecisionKind {
             "budget_threshold" => Some(Self::BudgetThreshold),
             "goal_mutation" => Some(Self::GoalMutation),
             "tool_gap" => Some(Self::ToolGap),
+            "stance_assessment" => Some(Self::StanceAssessment),
             _ => None,
         }
     }
@@ -878,6 +881,7 @@ mod tests {
             DecisionKind::BudgetThreshold,
             DecisionKind::GoalMutation,
             DecisionKind::ToolGap,
+            DecisionKind::StanceAssessment,
         ] {
             assert_eq!(DecisionKind::parse(kind.as_str()), Some(kind));
         }

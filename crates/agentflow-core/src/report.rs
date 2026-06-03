@@ -96,13 +96,24 @@ impl ProjectStore {
                     format_research_verdict(verdict.as_ref())
                 )
                 .unwrap();
-                write_research_evidence_group(&mut markdown, "supporting evidence", &supporting);
                 write_research_evidence_group(
+                    self,
+                    &mut markdown,
+                    "supporting evidence",
+                    &supporting,
+                );
+                write_research_evidence_group(
+                    self,
                     &mut markdown,
                     "contradicting evidence",
                     &contradicting,
                 );
-                write_research_evidence_group(&mut markdown, "context/neutral evidence", &neutral);
+                write_research_evidence_group(
+                    self,
+                    &mut markdown,
+                    "context/neutral evidence",
+                    &neutral,
+                );
                 writeln!(
                     &mut markdown,
                     "- uncertainty: {}",
@@ -609,7 +620,12 @@ impl ProjectStore {
     }
 }
 
-fn write_research_evidence_group(markdown: &mut String, label: &str, evidence: &[&EvidenceLink]) {
+fn write_research_evidence_group(
+    store: &ProjectStore,
+    markdown: &mut String,
+    label: &str,
+    evidence: &[&EvidenceLink],
+) {
     writeln!(markdown, "- {label} ({}):", evidence.len()).unwrap();
     if evidence.is_empty() {
         writeln!(markdown, "  - No {label} recorded.").unwrap();
@@ -623,6 +639,22 @@ fn write_research_evidence_group(markdown: &mut String, label: &str, evidence: &
                 research_evidence_source(link)
             )
             .unwrap();
+            // Embed the actual finding (observation summary) so the report surfaces what
+            // the analysis found, not just an observation id. Tolerant: skip if it does
+            // not resolve to a recorded observation.
+            if let Some(observation_id) = link
+                .observation_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                if let Ok(observation) = store.inspect_observation(observation_id) {
+                    let finding = observation.summary.trim();
+                    if !finding.is_empty() {
+                        writeln!(markdown, "    - finding: {finding}").unwrap();
+                    }
+                }
+            }
         }
     }
 }
@@ -1150,6 +1182,43 @@ fi
         assert!(report.contains("[hypothesis] Mechanism remains speculative - source: -"));
         assert!(report
             .contains("- uncertainty: evidence below decision margin / needs stronger evidence"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn generate_research_report_markdown_embeds_observation_finding() {
+        let path = temp_project_path("research-finding-embed");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Research Finding")).unwrap();
+        let data = path.join("data.tsv");
+        fs::write(&data, "sample\tTP53\ns1\t1\n").unwrap();
+        let artifact_id = import_artifact(&store, data);
+        let observation = store.observe_artifact(&artifact_id).unwrap();
+        let hypothesis = store
+            .record_hypothesis(HypothesisRequest {
+                statement: "The analysis finding is surfaced in the report".to_string(),
+                origin: "agent".to_string(),
+                related_goal_id: "goal_finding".to_string(),
+            })
+            .unwrap();
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis.id.clone(),
+                observation_id: Some(observation.id.clone()),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: "linked observation".to_string(),
+            })
+            .unwrap();
+
+        let report = store.generate_research_report_markdown().unwrap();
+        assert!(
+            report.contains("    - finding: "),
+            "report should embed the observation finding:\n{report}"
+        );
+        assert!(report.contains(observation.summary.trim()));
 
         let _ = fs::remove_dir_all(path);
     }

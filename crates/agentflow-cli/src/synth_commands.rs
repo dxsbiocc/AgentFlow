@@ -10,7 +10,7 @@ use agentflow_core::storage::{ProjectStore, ToolSpec};
 
 use crate::{next_arg, require_value, CliError};
 
-const DEFAULT_SYNTHESIZER: &str = "claude -p";
+pub(crate) const DEFAULT_SYNTHESIZER: &str = "claude -p";
 const SYNTH_VERSION: &str = "0.1.0";
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -200,7 +200,7 @@ fn build_synth_prompt(description: &str) -> String {
     )
 }
 
-fn run_synthesizer(command_line: &str, prompt: &str) -> Result<String, CliError> {
+pub(crate) fn run_synthesizer(command_line: &str, prompt: &str) -> Result<String, CliError> {
     let argv = split_synthesizer_command(command_line)?;
     let mut command = Command::new(&argv[0]);
     command.args(&argv[1..]).arg(prompt);
@@ -219,7 +219,7 @@ fn run_synthesizer(command_line: &str, prompt: &str) -> Result<String, CliError>
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn split_synthesizer_command(command_line: &str) -> Result<Vec<String>, CliError> {
+pub(crate) fn split_synthesizer_command(command_line: &str) -> Result<Vec<String>, CliError> {
     let argv = command_line
         .split_whitespace()
         .map(ToOwned::to_owned)
@@ -232,7 +232,7 @@ fn split_synthesizer_command(command_line: &str) -> Result<Vec<String>, CliError
     Ok(argv)
 }
 
-fn strip_markdown_fence(candidate: &str) -> String {
+pub(crate) fn strip_markdown_fence(candidate: &str) -> String {
     let trimmed = candidate.trim();
     let mut lines = trimmed.lines().collect::<Vec<_>>();
     if lines

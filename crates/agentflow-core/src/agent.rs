@@ -11,6 +11,7 @@ use crate::storage::{ArtifactSummary, EventRecord, ProjectStore, StorageError};
 use crate::tool_select::{CapabilityQuery, Fit};
 
 const AGENT_CYCLE_COMPLETED_EVENT: &str = "agent.cycle_completed";
+const TOOL_GAP_HYPOTHESIS_MARKER: &str = "hypothesis_id = ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CycleOutcome {
@@ -67,6 +68,7 @@ pub struct ApplyConfig {
     pub apply: bool,
     pub flow: Option<String>,
     pub max_apply: u32,
+    pub propose_synth: bool,
 }
 
 impl Default for ApplyConfig {
@@ -75,6 +77,7 @@ impl Default for ApplyConfig {
             apply: false,
             flow: None,
             max_apply: 5,
+            propose_synth: false,
         }
     }
 }
@@ -298,6 +301,11 @@ impl ProjectStore {
         let artifacts = self.list_artifacts()?;
         let available_input_types = available_input_types(&artifacts);
         let available = available_artifacts(&artifacts);
+        let mut pending_tool_gap_hypotheses = if config.propose_synth {
+            self.pending_tool_gap_hypothesis_ids()?
+        } else {
+            BTreeSet::new()
+        };
         for decision in decisions {
             match &decision.action {
                 BranchAction::Abandon {
@@ -315,6 +323,18 @@ impl ProjectStore {
                 BranchAction::Deepen { .. } | BranchAction::Spawn { .. } => {
                     let proposal =
                         self.enrich_branch_proposal(decision, &available_input_types, &available)?;
+                    if config.propose_synth && proposal.matched_tool.is_none() {
+                        let hypothesis_id = &proposal.decision.candidate.hypothesis_id;
+                        if pending_tool_gap_hypotheses.insert(hypothesis_id.clone()) {
+                            let point = self.raise_decision_point(
+                                DecisionKind::ToolGap,
+                                &tool_gap_digest(&proposal.decision),
+                                tool_gap_options(hypothesis_id),
+                                0,
+                            )?;
+                            raised_decisions.push(point);
+                        }
+                    }
                     if config.apply {
                         if let (Some(flow_id), Some(step)) =
                             (config.flow.as_deref(), proposal.drafted_step.as_ref())
@@ -401,6 +421,15 @@ impl ProjectStore {
 }
 
 impl ProjectStore {
+    fn pending_tool_gap_hypothesis_ids(&self) -> Result<BTreeSet<String>, StorageError> {
+        Ok(self
+            .pending_decision_points()?
+            .into_iter()
+            .filter(|point| point.kind == DecisionKind::ToolGap)
+            .filter_map(|point| tool_gap_hypothesis_id(&point.digest))
+            .collect())
+    }
+
     fn enrich_branch_proposal(
         &self,
         decision: BranchDecision,
@@ -638,6 +667,69 @@ fn graph_patch_apply_options(hypothesis_id: &str, flow_id: &str) -> Vec<HandoffO
             reversible: true,
         },
     ]
+}
+
+fn tool_gap_digest(decision: &BranchDecision) -> String {
+    let hypothesis_id = &decision.candidate.hypothesis_id;
+    let statement = &decision.candidate.statement;
+    let synth_name = tool_gap_synth_name(statement);
+    let description = statement.replace('"', "\\\"");
+    format!(
+        "§15 决策痕迹：{TOOL_GAP_HYPOTHESIS_MARKER}{hypothesis_id}；能力需求 = {statement}；现状 = 无注册工具匹配（registry_match 失败）；建议 = 合成一个 exploratory 工具：`agentflow synth --name {synth_name} --description \"{description}\" --fixture <你的已知答案文件> --expect <...>`；需人类批准 + 提供验证 fixture"
+    )
+}
+
+fn tool_gap_options(hypothesis_id: &str) -> Vec<HandoffOption> {
+    vec![
+        HandoffOption {
+            label: "合成一个工具（提供 fixture 后 synth）".to_string(),
+            direction: format!(
+                "为假设 {hypothesis_id} 准备验证 fixture，并在批准后运行 agentflow synth"
+            ),
+            cost: Cost::Moderate,
+            risk: Risk::Medium,
+            reversible: true,
+        },
+        HandoffOption {
+            label: "注册一个已有工具".to_string(),
+            direction: format!("为假设 {hypothesis_id} 查找并注册已有工具"),
+            cost: Cost::Cheap,
+            risk: Risk::Low,
+            reversible: true,
+        },
+        HandoffOption {
+            label: "跳过该分支".to_string(),
+            direction: format!("保持假设 {hypothesis_id} 不推进该能力缺口分支"),
+            cost: Cost::Cheap,
+            risk: Risk::Low,
+            reversible: true,
+        },
+    ]
+}
+
+fn tool_gap_hypothesis_id(digest: &str) -> Option<String> {
+    let rest = digest.split_once(TOOL_GAP_HYPOTHESIS_MARKER)?.1;
+    rest.split('；').next().map(str::trim).and_then(|id| {
+        if id.is_empty() {
+            None
+        } else {
+            Some(id.to_string())
+        }
+    })
+}
+
+fn tool_gap_synth_name(statement: &str) -> String {
+    let mut name = String::from("tool_gap");
+    for token in statement
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|token| token.len() >= 3)
+        .take(4)
+    {
+        name.push('_');
+        name.push_str(&token);
+    }
+    name
 }
 
 fn verdict_label(verdict: &Verdict) -> &'static str {
@@ -922,6 +1014,7 @@ steps:
                 apply: true,
                 flow: None,
                 max_apply: 5,
+                propose_synth: false,
             })
             .unwrap();
 
@@ -961,6 +1054,7 @@ steps:
                 apply: true,
                 flow: Some("auto_flow".to_string()),
                 max_apply: 5,
+                propose_synth: false,
             })
             .unwrap();
 
@@ -1029,6 +1123,7 @@ steps:
                 apply: true,
                 flow: Some("auto_flow".to_string()),
                 max_apply: 10,
+                propose_synth: false,
             })
             .unwrap();
 
@@ -1076,6 +1171,7 @@ steps:
                 apply: true,
                 flow: Some("unused_flow".to_string()),
                 max_apply: 5,
+                propose_synth: false,
             })
             .unwrap();
 
@@ -1119,6 +1215,7 @@ steps:
                 apply: true,
                 flow: None,
                 max_apply: 1,
+                propose_synth: false,
             })
             .unwrap();
 
@@ -1158,6 +1255,7 @@ steps:
                 apply: true,
                 flow: None,
                 max_apply: 5,
+                propose_synth: false,
             })
             .unwrap();
         assert_eq!(
@@ -1216,6 +1314,153 @@ steps:
         assert_eq!(event_count(&store, "argument.verdict_rendered"), 2);
         assert_eq!(event_count(&store, "agent.cycle_completed"), 1);
         assert!(report.to_json().contains("\"outcome\":\"advanced\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn propose_synth_raises_tool_gap_for_unmatched_branch() {
+        let (path, store) = init_project("propose-synth-tool-gap");
+        let hypothesis_id = record_hypothesis(&store, "Weak support needs custom validation");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: false,
+                flow: None,
+                max_apply: 5,
+                propose_synth: true,
+            })
+            .unwrap();
+
+        assert_eq!(report.outcome, CycleOutcome::HandedOff);
+        assert_eq!(report.branch_proposals.len(), 1);
+        assert!(report.branch_proposals[0].matched_tool.is_none());
+        assert_eq!(report.raised_decisions.len(), 1);
+        let point = &report.raised_decisions[0];
+        assert_eq!(point.kind, DecisionKind::ToolGap);
+        assert_eq!(point.recommendation, 0);
+        assert!(point.digest.contains("§15 决策痕迹"));
+        assert!(point
+            .digest
+            .contains("能力需求 = Weak support needs custom validation"));
+        assert!(point.digest.contains("无注册工具匹配"));
+        assert!(point.digest.contains("agentflow synth"));
+        assert!(point.digest.contains("需人类批准 + 提供验证 fixture"));
+        assert!(point.digest.contains(&hypothesis_id));
+        assert_eq!(point.options.len(), 3);
+        assert_eq!(
+            point.options[0].label,
+            "合成一个工具（提供 fixture 后 synth）"
+        );
+        assert_eq!(point.options[1].label, "注册一个已有工具");
+        assert_eq!(point.options[2].label, "跳过该分支");
+        assert_eq!(event_count(&store, "handoff.decision_point_raised"), 1);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn propose_synth_default_off_does_not_raise_for_unmatched_branch() {
+        let (path, store) = init_project("propose-synth-default-off");
+        let hypothesis_id = record_hypothesis(&store, "Weak support stays proposal only");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: false,
+                flow: None,
+                max_apply: 5,
+                propose_synth: false,
+            })
+            .unwrap();
+
+        assert_eq!(report.outcome, CycleOutcome::Advanced);
+        assert_eq!(report.raised_decisions.len(), 0);
+        assert_eq!(report.branch_proposals.len(), 1);
+        assert!(report.branch_proposals[0].matched_tool.is_none());
+        assert_eq!(event_count(&store, "handoff.decision_point_raised"), 0);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn propose_synth_dedups_pending_tool_gap_for_same_hypothesis() {
+        let (path, store) = init_project("propose-synth-dedup");
+        let hypothesis_id = record_hypothesis(&store, "Weak support needs one custom validator");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+        let config = ApplyConfig {
+            apply: false,
+            flow: None,
+            max_apply: 5,
+            propose_synth: true,
+        };
+
+        let first = store.run_cycle_with_apply_config(config.clone()).unwrap();
+        let second = store.run_cycle_with_apply_config(config).unwrap();
+
+        assert_eq!(first.raised_decisions.len(), 1);
+        assert_eq!(first.raised_decisions[0].kind, DecisionKind::ToolGap);
+        assert!(second.raised_decisions.is_empty());
+        assert_eq!(second.branch_proposals.len(), 1);
+        let pending = store.pending_decision_points().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, DecisionKind::ToolGap);
+        assert!(pending[0].digest.contains(&hypothesis_id));
+        assert_eq!(event_count(&store, "handoff.decision_point_raised"), 1);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn propose_synth_does_not_raise_tool_gap_when_tool_matches() {
+        let (path, store) = init_project("propose-synth-tool-match");
+        register_marker_tool(&store);
+        import_expression_artifact(&store, &path);
+        let hypothesis_id =
+            record_hypothesis(&store, "Marker evidence requires deeper pathway validation");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: false,
+                flow: None,
+                max_apply: 5,
+                propose_synth: true,
+            })
+            .unwrap();
+
+        assert_eq!(report.outcome, CycleOutcome::Advanced);
+        assert_eq!(report.raised_decisions.len(), 0);
+        assert_eq!(
+            report.branch_proposals[0].matched_tool.as_deref(),
+            Some("analysis/marker_deepen")
+        );
+        assert_eq!(event_count(&store, "handoff.decision_point_raised"), 0);
 
         let _ = std::fs::remove_dir_all(path);
     }

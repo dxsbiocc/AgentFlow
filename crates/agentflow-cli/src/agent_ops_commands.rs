@@ -2364,17 +2364,15 @@ steps:
     }
 
     #[test]
-    fn agent_run_apply_auto_run_links_neutral_evidence_from_cli() {
+    fn agent_run_apply_auto_run_raises_stance_assessment_from_cli() {
         let path = temp_project_path("agent-run-auto-run");
         let store = init_project(&path);
         let script = write_auto_run_marker_script(&path);
         register_exploratory_marker_tool(&store, &script);
         let artifact_id = import_expression_artifact(&store, &path);
         approve_auto_run_marker_flow(&store, &artifact_id);
-        let hypothesis_id = record_hypothesis_with_statement(
-            &store,
-            "Marker THRSP evidence requires deeper pathway validation",
-        );
+        let statement = "Marker THRSP evidence requires deeper pathway validation";
+        let hypothesis_id = record_hypothesis_with_statement(&store, statement);
         link_weak_evidence(&store, &hypothesis_id);
 
         let json = run(args(&[
@@ -2393,14 +2391,29 @@ steps:
 
         assert!(json.contains("\"type\":\"step_run\""));
         assert!(json.contains("\"observation_id\":\"observation_marker_report_"));
+        assert!(json.contains("\"outcome\":\"handed_off\""));
+        assert!(json.contains("\"kind\":\"stance_assessment\""));
+        let observations = store.list_observations().unwrap();
+        assert_eq!(observations.len(), 1);
+        let observation = &observations[0];
+        let pending = store.pending_decision_points().unwrap();
+        assert_eq!(pending.len(), 1);
+        let point = &pending[0];
+        assert_eq!(point.kind, DecisionKind::StanceAssessment);
+        assert_eq!(point.recommendation, 2);
+        assert!(point.digest.contains(&observation.summary));
+        assert!(point.digest.contains(statement));
+        assert!(point.digest.contains(&observation.id));
+        assert!(point
+            .digest
+            .contains(&format!("evidence link --hypothesis {hypothesis_id}")));
+        assert!(point.digest.contains("--stance supports|contradicts"));
+        assert!(point.digest.contains("--grade observed"));
         let evidence = store.evidence_for(&hypothesis_id).unwrap();
-        let linked = evidence
+        assert!(!evidence.iter().any(|link| link.note == "auto-run"));
+        assert!(!evidence
             .iter()
-            .find(|link| link.note == "auto-run")
-            .unwrap();
-        assert_eq!(linked.stance, Stance::Neutral);
-        assert_eq!(linked.grade, EvidenceGrade::Inferred);
-        assert!(linked.observation_id.is_some());
+            .any(|link| link.observation_id.as_deref() == Some(observation.id.as_str())));
 
         let _ = std::fs::remove_dir_all(path);
     }

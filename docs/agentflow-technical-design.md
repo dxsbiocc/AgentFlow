@@ -1284,6 +1284,11 @@ Custom code is allowed only after the system records:
 
 New code should enter as `exploratory` or `wrapped`, not `verified`.
 
+> **实现注记（2026-06-03）**：本节正由控制层里程碑 **S1/S2** 落地（见 `status/s1-tool-synthesis-plan.md`、`status/s2-grade-cap-plan.md`）。
+> - S1 `agentflow synth`：LLM 写候选代码 → 在隔离 workdir 用 **fixture/已知答案验证** → 仅通过才注册，且**一律 `exploratory`**（对应本节"tests/fixture data validate"+"enter as exploratory, not verified"）。
+> - S2：exploratory 工具的证据 grade 封顶（`Observed`→`Inferred`），使其无法独立驱动 `affirmed`——把"低信任"做成机制。
+> - **尚未实现**：本节的完整决策痕迹记录（why insufficient / external candidates considered / literature support / assumptions）与 `user_approval` 闸门、以及 `exploratory→wrapped→verified` 晋升流水线——计划随 S3（循环遇能力缺口→raise 合成决策点）补齐。
+
 ### Hypothesis Lifecycle
 
 Scientific hypotheses should be first-class objects, not hidden prose.

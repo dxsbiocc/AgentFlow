@@ -452,9 +452,29 @@ pub fn run_cycle(store: &ProjectStore, goal: &Goal) -> Result<LoopOutcome, Agent
 4. **H4 轨迹安全垫** ✅ **已实现并验收（2026-05-31，见 `status/h4-trace-guard-plan.md`）**：`trace_guard.rs` checkpoint / `detect_drift` / `revert_to`（只记录不物删）+ `reverted_event_ids`。core 测试 129→135。让域投影真正尊重回退区间的接线放到 H7（此前无不可逆自主写入）。
 5. **H5 防自欺闸门** ✅ **已实现并验收（2026-05-31，见 `status/h5-self-deception-gate-plan.md`）**：`render_verdict` 强判决（Affirmed/Refuted/Fundamental）落库前强制 `SelfDeceptionGate`（缺 gate / against·alternatives 空 / Affirmed+Speculative 三拒），Provisional 不卡。core 测试 135→141。报告区分 Evidence Grade 留到报告/CLI 里程碑。
 6. **H6 觅食引擎** ✅ **已实现并验收（2026-05-31，见 `status/h6-forage-engine-plan.md`）**：`forage.rs` —— `AccessStatus` 七态 + `grade_from_access` 合规映射（纯文献单独不能判 Affirmed）+ `current_strength` 挥发 + `ForagePolicy` + 觅食事件 + `link_forage_evidence` 证据桥。core 测试 141→151。**架构决策（2026-05-31）：检索走「注册工具（外置进程）」路线**——core 只定义 forage trait + SourceAdapter 契约 + AccessStatus 合规；真实 HTTP 检索（PubMed/bioRxiv）做成**注册工具**由现有 runtime executor 执行，core 保持零新增依赖，契合「一切皆工具」模型并复用已建成的执行/缓存/围栏。
-7. **H7 控制主循环**：`agent/mod.rs` 串起来，单 Agent 闭环跑通一个真实科研目标。
+7. **H7 控制主循环**（拆为 H7a + H7b，均 ✅ 已实现并验收）：
+   - **H7a 提议模式主循环** ✅（`status/h7a-control-loop-plan.md`）：`agent.rs::run_cycle` 串四引擎，自主跑「判决→选分支」，强判决/Abandon 交接，全程提议零不可逆写入。core→155。
+   - **H7b-1 回退区间接入域投影** ✅（`status/h7b1-revert-horizon-plan.md`）：`trace revert` 从「只记录」升级为「真回滚」。core→161。
+   - **H7b-2 自主 apply 开闸** ✅（`status/h7b2-auto-apply-plan.md`）：`agent run --apply`（opt-in 默认关）刹车门控+上限+可回退，强判决永不自动 affirm。core→172。
 
 > 排序逻辑：先建分支选择**所依赖**的证据/判决层（H1），随即放开自动化推进（H2）；安全不靠"默认审批"，而靠交接（H3）+ 轨迹（H4）。这与现状 `framework-review` 的"先看见再自治、防幻想自治"姿态相反——按 §1.5，本层为准。
+
+## 9.5 主线之后的 as-built 里程碑（路线图同步，2026-06-03）
+
+主线 H1–H7b 之后的实现（均已合并 main，各有 `status/*.md` 验收记录）：
+
+| 里程碑 | 内容 | 对齐 |
+| --- | --- | --- |
+| **C1 / C2** | 统一 CLI：hypothesis/evidence/verdict + branch/decision/forage/trace/agent/tools | 暴露四引擎，cli 22→49 |
+| **R1** | 真实 PubMed 检索闭环（外置脚本，core 零依赖） | 兑现 §6/§H6「检索即注册工具」 |
+| **F1** | auto-forage（`agent run --auto-forage`，证据 Neutral 入账） | 觅食接入循环 |
+| **F2** | 依赖边自动接线 + apply 容错 | 自治步骤接进图 |
+| **F3** | 统一研究报告 `report research`（分级证据+不确定性） | 兑现 §15 报告区分 grade |
+| **G1** | 真实 TCGA 生存关联分析工具（cBioPortal，log-rank） | **验证而非检索**——观测证据驱动判决 |
+| **S1** | 受控工具合成 `agentflow synth`（LLM 写码→fixture 验证→注册 exploratory） | **兑现 §15 Tool Gap Resolution**：自定义代码须 fixture 验证、入口 exploratory |
+| **S2** | 合成/exploratory 工具证据 grade 封顶（Observed→Inferred） | 把「低信任」从标签变机制；自主合成 S3 的安全前提 |
+
+> **对齐结论**：以上均未偏离控制宪法 A1–A4 与四引擎；S1/S2 实现的正是 `technical-design §15 Tool Gap Resolution`（设计已有、此前未做）。core 零依赖铁律守住（LLM/网络全在外置进程）。**已知未尽**：S1 尚未记录 §15 要求的完整决策痕迹（why/considered/literature/assumptions）与 user_approval 闸门——这随 S3「循环遇缺口→raise 合成决策点」补齐。
 
 ---
 

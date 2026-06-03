@@ -2,6 +2,7 @@ use std::fmt;
 
 use rusqlite::params;
 
+use crate::domain::ToolMaturity;
 use crate::hypothesis::Confidence;
 use crate::storage::{EventRecord, ProjectStore, StorageError};
 
@@ -509,10 +510,11 @@ impl ArgumentEngine for RuleBasedEngine {
 impl ProjectStore {
     pub fn link_evidence(
         &self,
-        request: EvidenceLinkRequest,
+        mut request: EvidenceLinkRequest,
     ) -> Result<EvidenceLink, StorageError> {
         validate_evidence_link_request(&request)?;
         self.inspect_hypothesis(&request.hypothesis_id)?;
+        request.grade = self.capped_evidence_grade(&request)?;
 
         let id = self.append_event(EventRecord {
             flow_id: None,
@@ -526,6 +528,68 @@ impl ProjectStore {
             .into_iter()
             .find(|link| link.id == id)
             .ok_or_else(|| StorageError::NotFound(format!("evidence link {id}")))
+    }
+
+    fn capped_evidence_grade(
+        &self,
+        request: &EvidenceLinkRequest,
+    ) -> Result<EvidenceGrade, StorageError> {
+        if request.grade != EvidenceGrade::Observed {
+            return Ok(request.grade);
+        }
+
+        let Some(observation_id) = request.observation_id.as_deref() else {
+            return Ok(request.grade);
+        };
+        if self.source_tool_maturity_for_observation(observation_id)?
+            == Some(ToolMaturity::Exploratory)
+        {
+            return Ok(EvidenceGrade::Inferred);
+        }
+
+        Ok(request.grade)
+    }
+
+    fn source_tool_maturity_for_observation(
+        &self,
+        observation_id: &str,
+    ) -> Result<Option<ToolMaturity>, StorageError> {
+        let observation_id = observation_id.trim();
+        if observation_id.is_empty() {
+            return Ok(None);
+        }
+
+        let observation = match self.inspect_observation(observation_id) {
+            Ok(observation) => observation,
+            Err(StorageError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let (Some(flow_id), Some(step_id)) = (observation.flow_id, observation.step_id) else {
+            return Ok(None);
+        };
+
+        let flow = match self.inspect_flow(&flow_id) {
+            Ok(flow) => flow,
+            Err(StorageError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Some(tool_ref) = flow
+            .steps
+            .iter()
+            .find(|step| step.id == step_id || step.local_id == step_id)
+            .and_then(|step| step.tool_ref.as_deref())
+            .map(str::trim)
+            .filter(|tool_ref| !tool_ref.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let inspection = match self.inspect_tool(tool_ref) {
+            Ok(inspection) => inspection,
+            Err(StorageError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(ToolMaturity::parse(&inspection.summary.maturity))
     }
 
     pub fn evidence_for(&self, hypothesis_id: &str) -> Result<Vec<EvidenceLink>, StorageError> {
@@ -1037,10 +1101,11 @@ fn escape_json(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
     use crate::hypothesis::{Confidence, HypothesisRequest, HypothesisStatus};
-    use crate::storage::{now_unix_seconds, ProjectStore, StorageError};
+    use crate::storage::{now_unix_seconds, FlowDraft, ProjectStore, StorageError, ToolSpec};
 
     use super::{
         ArgumentEngine, ClaimBasis, EvidenceGrade, EvidenceLink, EvidenceLinkRequest,
@@ -1106,6 +1171,78 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    fn tool_observation(
+        store: &ProjectStore,
+        root: &std::path::Path,
+        flow_id: &str,
+        tool_name: &str,
+        maturity: &str,
+    ) -> String {
+        let script_path = root.join(format!("{tool_name}.sh"));
+        fs::write(
+            &script_path,
+            r#"printf '# Source evidence
+score: 0.9
+' > "$AGENTFLOW_OUTPUT_REPORT"
+"#,
+        )
+        .unwrap();
+        store
+            .register_tool(
+                ToolSpec::from_simple_yaml(&format!(
+                    r#"
+schema_version: agentflow.tool.v0
+namespace: evidence
+name: {tool_name}
+version: 0.1.0
+maturity: {maturity}
+description: Produce argument evidence
+outputs:
+  report:
+    type: Markdown
+    observer: artifact_summary
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {}
+"#,
+                    script_path.display()
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .approve_flow(
+                FlowDraft::from_simple_yaml(&format!(
+                    r#"
+schema_version: agentflow.flow.v0
+id: {flow_id}
+name: Evidence source
+steps:
+  - id: produce
+    tool: evidence/{tool_name}
+    reason: Produce evidence observation
+    needs: []
+    outputs:
+      report: report
+"#
+                ))
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+
+        let before = store.list_observations().unwrap().len();
+        let summary = store.run_flow(flow_id).unwrap();
+        assert_eq!(summary.completed_steps, 1);
+        assert_eq!(summary.failed_steps, 0);
+
+        let observations = store.list_observations().unwrap();
+        assert_eq!(observations.len(), before + 1);
+        observations.last().unwrap().id.clone()
     }
 
     #[derive(Debug, Clone)]
@@ -1206,6 +1343,152 @@ mod tests {
         assert!(error.to_string().contains("argument evidence note"));
 
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn observed_grade_is_capped_only_for_exploratory_tool_observations() {
+        let path = temp_project_path("grade-cap");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Argument Demo")).unwrap();
+        let exploratory_observation = tool_observation(
+            &store,
+            &path,
+            "exploratory_flow",
+            "synth_like",
+            "exploratory",
+        );
+        let verified_observation =
+            tool_observation(&store, &path, "verified_flow", "verified_tool", "verified");
+        let exploratory_id = record_hypothesis(&store);
+        let verified_id = record_hypothesis(&store);
+        let manual_id = record_hypothesis(&store);
+        let non_observed_id = record_hypothesis(&store);
+
+        let exploratory = store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: exploratory_id.clone(),
+                observation_id: Some(exploratory_observation),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: "Exploratory tool support".to_string(),
+            })
+            .unwrap();
+        let verified = store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: verified_id.clone(),
+                observation_id: Some(verified_observation),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: "Verified tool support".to_string(),
+            })
+            .unwrap();
+        let manual = store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: manual_id.clone(),
+                observation_id: None,
+                source: Some("manual note".to_string()),
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: "Manual support".to_string(),
+            })
+            .unwrap();
+        let non_observed = store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: non_observed_id.clone(),
+                observation_id: exploratory.observation_id.clone(),
+                source: None,
+                grade: EvidenceGrade::LiteratureSupported,
+                stance: Stance::Supports,
+                note: "Exploratory source with non-observed grade".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(exploratory.grade, EvidenceGrade::Inferred);
+        assert_eq!(
+            store.evidence_for(&exploratory_id).unwrap()[0].grade,
+            EvidenceGrade::Inferred
+        );
+        assert_eq!(verified.grade, EvidenceGrade::Observed);
+        assert_eq!(
+            store.evidence_for(&verified_id).unwrap()[0].grade,
+            EvidenceGrade::Observed
+        );
+        assert_eq!(manual.grade, EvidenceGrade::Observed);
+        assert_eq!(
+            store.evidence_for(&manual_id).unwrap()[0].grade,
+            EvidenceGrade::Observed
+        );
+        assert_eq!(non_observed.grade, EvidenceGrade::LiteratureSupported);
+        assert_eq!(
+            store.evidence_for(&non_observed_id).unwrap()[0].grade,
+            EvidenceGrade::LiteratureSupported
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn exploratory_tool_evidence_cannot_independently_affirm_but_verified_can() {
+        let path = temp_project_path("grade-cap-verdict");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Argument Demo")).unwrap();
+        let exploratory_observation = tool_observation(
+            &store,
+            &path,
+            "exploratory_verdict",
+            "synth_verdict",
+            "exploratory",
+        );
+        let verified_observation = tool_observation(
+            &store,
+            &path,
+            "verified_verdict",
+            "verified_verdict_tool",
+            "verified",
+        );
+        let exploratory_id = record_hypothesis(&store);
+        let verified_id = record_hypothesis(&store);
+
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: exploratory_id.clone(),
+                observation_id: Some(exploratory_observation),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: "Exploratory support".to_string(),
+            })
+            .unwrap();
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: verified_id.clone(),
+                observation_id: Some(verified_observation),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: "Verified support".to_string(),
+            })
+            .unwrap();
+
+        let exploratory_report = store
+            .render_verdict(&exploratory_id, &RuleBasedEngine, None)
+            .unwrap();
+        let verified_report = store
+            .render_verdict(&verified_id, &RuleBasedEngine, Some(valid_gate()))
+            .unwrap();
+
+        assert!(matches!(
+            exploratory_report.verdict,
+            Verdict::Inconclusive(InconclusiveKind::Provisional { .. })
+        ));
+        assert!(exploratory_report
+            .rationale
+            .contains("has_obs_support=false"));
+        assert_eq!(verified_report.verdict, Verdict::Affirmed);
+
+        let _ = fs::remove_dir_all(path);
     }
 
     #[test]

@@ -82,6 +82,19 @@ impl Default for ApplyConfig {
     }
 }
 
+pub trait ParamInferer {
+    fn infer(&self, hypothesis_statement: &str, param_name: &str) -> Option<String>;
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct NoopParamInferer;
+
+impl ParamInferer for NoopParamInferer {
+    fn infer(&self, _hypothesis_statement: &str, _param_name: &str) -> Option<String> {
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppliedAction {
     LifecycleTransition {
@@ -230,6 +243,14 @@ impl ProjectStore {
         &self,
         config: ApplyConfig,
     ) -> Result<CycleReport, StorageError> {
+        self.run_cycle_with(config, &NoopParamInferer)
+    }
+
+    pub fn run_cycle_with(
+        &self,
+        config: ApplyConfig,
+        inferer: &dyn ParamInferer,
+    ) -> Result<CycleReport, StorageError> {
         let checkpoint = self.create_checkpoint("agent_cycle")?;
         let engine = RuleBasedEngine;
         let policy = DefaultPolicy;
@@ -321,8 +342,12 @@ impl ProjectStore {
                     raised_decisions.push(point);
                 }
                 BranchAction::Deepen { .. } | BranchAction::Spawn { .. } => {
-                    let proposal =
-                        self.enrich_branch_proposal(decision, &available_input_types, &available)?;
+                    let proposal = self.enrich_branch_proposal(
+                        decision,
+                        &available_input_types,
+                        &available,
+                        inferer,
+                    )?;
                     if config.propose_synth && proposal.matched_tool.is_none() {
                         let hypothesis_id = &proposal.decision.candidate.hypothesis_id;
                         if pending_tool_gap_hypotheses.insert(hypothesis_id.clone()) {
@@ -435,6 +460,7 @@ impl ProjectStore {
         decision: BranchDecision,
         available_input_types: &[String],
         available: &[(String, String)],
+        inferer: &dyn ParamInferer,
     ) -> Result<EnrichedProposal, StorageError> {
         let query = CapabilityQuery {
             desired_output_type: None,
@@ -453,7 +479,8 @@ impl ProjectStore {
             });
         };
 
-        let drafted_step = self.draft_step_for(&candidate.tool_ref, available)?;
+        let mut drafted_step = self.draft_step_for(&candidate.tool_ref, available)?;
+        infer_replace_params(&mut drafted_step, &decision.candidate.statement, inferer);
         let needs = self.infer_step_needs(&drafted_step)?;
         let drafted_step = ProposedStep {
             needs,
@@ -505,6 +532,27 @@ impl ProjectStore {
                 step_id,
             })
             .collect())
+    }
+}
+
+fn infer_replace_params(
+    step: &mut ProposedStep,
+    hypothesis_statement: &str,
+    inferer: &dyn ParamInferer,
+) {
+    for (param_name, param_value) in &mut step.params {
+        let placeholder = format!("REPLACE_{param_name}");
+        if param_value != &placeholder {
+            continue;
+        }
+
+        let Some(inferred) = inferer.infer(hypothesis_statement, param_name) else {
+            continue;
+        };
+        let trimmed = inferred.trim();
+        if !trimmed.is_empty() {
+            *param_value = trimmed.to_string();
+        }
     }
 }
 
@@ -850,7 +898,9 @@ mod tests {
         FlowDraft, ProjectStore, ToolSpec,
     };
 
-    use super::{proposal_keywords, AppliedAction, ApplyConfig, CycleOutcome};
+    use super::{
+        proposal_keywords, AppliedAction, ApplyConfig, CycleOutcome, NoopParamInferer, ParamInferer,
+    };
 
     fn temp_project_path(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -925,6 +975,46 @@ runtime:
         )
         .unwrap();
         store.register_tool(spec).unwrap();
+    }
+
+    fn register_gene_marker_tool(store: &ProjectStore) {
+        let spec = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: gene_marker_deepen
+version: 0.1.0
+maturity: verified
+description: Marker gene deepening report for pathway validation
+inputs:
+  expression_table:
+    type: ExpressionTable
+    required: true
+params:
+  gene:
+    type: string
+    required: true
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap();
+        store.register_tool(spec).unwrap();
+    }
+
+    struct StubParamInferer;
+
+    impl ParamInferer for StubParamInferer {
+        fn infer(&self, hypothesis_statement: &str, param_name: &str) -> Option<String> {
+            assert!(hypothesis_statement.contains("THRSP"));
+            assert_eq!(param_name, "gene");
+            Some("THRSP".to_string())
+        }
     }
 
     fn import_expression_artifact(store: &ProjectStore, root: &std::path::Path) -> String {
@@ -1546,6 +1636,63 @@ steps:
             vec![("expression_table".to_string(), artifact_id)]
         );
         assert_eq!(step.needs, vec!["producer_step".to_string()]);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn branch_proposal_uses_param_inferer_for_replace_params() {
+        let (path, store) = init_project("enriched-param-infer");
+        register_gene_marker_tool(&store);
+        import_expression_artifact(&store, &path);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is below the decision margin.",
+        );
+
+        let report = store
+            .run_cycle_with(ApplyConfig::default(), &StubParamInferer)
+            .unwrap();
+
+        let step = report.branch_proposals[0].drafted_step.as_ref().unwrap();
+        assert_eq!(step.params, vec![("gene".to_string(), "THRSP".to_string())]);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn noop_param_inferer_keeps_replace_params() {
+        let (path, store) = init_project("enriched-param-noop");
+        register_gene_marker_tool(&store);
+        import_expression_artifact(&store, &path);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is below the decision margin.",
+        );
+
+        let report = store
+            .run_cycle_with(ApplyConfig::default(), &NoopParamInferer)
+            .unwrap();
+
+        let step = report.branch_proposals[0].drafted_step.as_ref().unwrap();
+        assert_eq!(
+            step.params,
+            vec![("gene".to_string(), "REPLACE_gene".to_string())]
+        );
 
         let _ = std::fs::remove_dir_all(path);
     }

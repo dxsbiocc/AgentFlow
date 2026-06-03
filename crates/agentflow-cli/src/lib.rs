@@ -96,7 +96,7 @@ pub fn usage() -> String {
         "  agentflow tools list [--json] [--path <path>]",
         "  agentflow tools inspect <tool-ref> [--json] [--path <path>]",
         "  agentflow tools match [--output <type>] [--input <type>]... [--keyword <kw>]... [--json] [--path <path>]",
-        "  agentflow tools draft-step <tool-ref> [--input <type>:<artifact-id>]... [--json] [--path <path>]",
+        "  agentflow tools draft-step <tool-ref> [--input <type>:<artifact-id>]... [--hypothesis <id>] [--infer-params] [--synthesizer <cmd>] [--json] [--path <path>]",
         "  agentflow synth --name <n> --description <text> --fixture <input-file> --expect <substring> [--synthesizer <cmd>] [--path <path>]",
         "  agentflow env check <tool-ref> [--json] [--path <path>]",
         "  agentflow env prepare <tool-ref> [--json] [--path <path>]",
@@ -1129,13 +1129,52 @@ where
     })?;
     let path = options.project.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
-    let step = store.draft_step_for(&tool_ref, &options.inputs)?;
+    let mut step = store.draft_step_for(&tool_ref, &options.inputs)?;
+    if options.infer_params {
+        let hypothesis_id = options.hypothesis_id.as_deref().ok_or_else(|| {
+            CliError::InvalidArgument("--infer-params requires --hypothesis <id>".to_string())
+        })?;
+        let hypothesis = store.inspect_hypothesis(hypothesis_id)?;
+        let synthesizer = options
+            .synthesizer
+            .as_deref()
+            .unwrap_or(synth_commands::DEFAULT_SYNTHESIZER);
+        infer_draft_step_params(&mut step, &hypothesis.statement, synthesizer);
+    }
 
     if options.project.json {
         Ok(proposed_step_json(&step))
     } else {
         Ok(format_proposed_step(&step))
     }
+}
+
+fn infer_draft_step_params(
+    step: &mut agentflow_core::branch::ProposedStep,
+    statement: &str,
+    synthesizer: &str,
+) {
+    for (param_name, param_value) in &mut step.params {
+        if param_value != &format!("REPLACE_{param_name}") {
+            continue;
+        }
+
+        let prompt = format!(
+            "Research hypothesis: \"{statement}\". A bioinformatics analysis tool needs a value for the parameter \"{param_name}\". Reply with ONLY the value (e.g. a gene symbol like THRSP), no explanation, no quotes."
+        );
+        let Ok(candidate) = synth_commands::run_synthesizer(synthesizer, &prompt) else {
+            continue;
+        };
+        let stripped = synth_commands::strip_markdown_fence(&candidate);
+        let Some(inferred) = first_non_empty_line(&stripped) else {
+            continue;
+        };
+        *param_value = inferred.to_string();
+    }
+}
+
+fn first_non_empty_line(value: &str) -> Option<&str> {
+    value.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
 fn env_command<I>(args: I) -> Result<String, CliError>
@@ -1442,6 +1481,9 @@ struct ToolsDraftStepOptions {
     project: ProjectOptions,
     tool_ref: Option<String>,
     inputs: Vec<(String, String)>,
+    hypothesis_id: Option<String>,
+    infer_params: bool,
+    synthesizer: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1921,6 +1963,15 @@ where
                 let input = require_value("--input", &mut args)?;
                 options.inputs.push(parse_draft_step_input(&input)?);
             }
+            "--hypothesis" => {
+                options.hypothesis_id = Some(require_value("--hypothesis", &mut args)?);
+            }
+            "--infer-params" => {
+                options.infer_params = true;
+            }
+            "--synthesizer" => {
+                options.synthesizer = Some(require_value("--synthesizer", &mut args)?);
+            }
             _ if arg.starts_with('-') => {
                 return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
             }
@@ -1933,6 +1984,12 @@ where
                 options.tool_ref = Some(arg);
             }
         }
+    }
+
+    if options.infer_params && options.hypothesis_id.is_none() {
+        return Err(CliError::InvalidArgument(
+            "--infer-params requires --hypothesis <id>".to_string(),
+        ));
     }
 
     Ok(options)
@@ -2974,6 +3031,20 @@ exec "$@"
         runner_path
     }
 
+    fn write_synthesizer_stub(path: &std::path::Path, name: &str, output: &str) -> PathBuf {
+        let stub_path = path.join(name);
+        fs::write(
+            &stub_path,
+            format!(
+                "#!/bin/sh\nprintf '%s' '{}'\n",
+                output.replace('\'', "'\\''")
+            ),
+        )
+        .unwrap();
+        make_executable(&stub_path);
+        stub_path
+    }
+
     fn write_sample_tool(path: &std::path::Path) -> PathBuf {
         let spec_path = path.join("marker_survival_scan.tool.yaml");
         fs::write(
@@ -3115,6 +3186,29 @@ steps:
         )
         .unwrap();
         flow_path
+    }
+
+    fn record_cli_hypothesis(path: &std::path::Path, statement: &str) -> String {
+        let output = run(args(&[
+            "agentflow",
+            "hypothesis",
+            "create",
+            "--statement",
+            statement,
+            "--origin",
+            "test",
+            "--goal",
+            "goal_test",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        output
+            .split("Id: ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .unwrap()
+            .to_string()
     }
 
     fn prepare_approved_marker_flow(path: &std::path::Path) {
@@ -3456,6 +3550,120 @@ steps:
 
         assert!(error.message().contains("not found: tool missing/tool"));
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn tools_draft_step_infers_replace_param_from_hypothesis_stub() {
+        let path = temp_project_path("tools-draft-infer-param");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let spec_path = write_sample_tool(&path);
+        run(args(&[
+            "agentflow",
+            "tools",
+            "register",
+            spec_path.to_str().unwrap(),
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let hypothesis_id =
+            record_cli_hypothesis(&path, "THRSP is a candidate survival-associated marker");
+        let stub_path = write_synthesizer_stub(&path, "synth-thrsp.sh", "THRSP\n");
+
+        let draft = run(args(&[
+            "agentflow",
+            "tools",
+            "draft-step",
+            "marker/marker_survival_scan",
+            "--input",
+            "TSV:artifact_table",
+            "--hypothesis",
+            &hypothesis_id,
+            "--infer-params",
+            "--synthesizer",
+            stub_path.to_str().unwrap(),
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(draft.contains("\"gene\":\"THRSP\""));
+        assert!(!draft.contains("\"gene\":\"REPLACE_gene\""));
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn tools_draft_step_keeps_placeholder_when_inference_is_empty() {
+        let path = temp_project_path("tools-draft-infer-empty");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let spec_path = write_sample_tool(&path);
+        run(args(&[
+            "agentflow",
+            "tools",
+            "register",
+            spec_path.to_str().unwrap(),
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let hypothesis_id =
+            record_cli_hypothesis(&path, "No unambiguous marker should be inferred");
+        let stub_path = write_synthesizer_stub(&path, "synth-empty.sh", "\n");
+
+        let draft = run(args(&[
+            "agentflow",
+            "tools",
+            "draft-step",
+            "marker/marker_survival_scan",
+            "--input",
+            "TSV:artifact_table",
+            "--hypothesis",
+            &hypothesis_id,
+            "--infer-params",
+            "--synthesizer",
+            stub_path.to_str().unwrap(),
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(draft.contains("\"gene\":\"REPLACE_gene\""));
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn tools_draft_step_infer_params_requires_hypothesis() {
+        let error = run(args(&[
+            "agentflow",
+            "tools",
+            "draft-step",
+            "marker/marker_survival_scan",
+            "--infer-params",
+        ]))
+        .unwrap_err();
+
+        assert!(matches!(error, CliError::InvalidArgument(_)));
+        assert!(error
+            .message()
+            .contains("--infer-params requires --hypothesis <id>"));
     }
 
     #[test]

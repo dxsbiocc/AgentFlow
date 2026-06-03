@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use crate::argument::{ArgumentEngine, InconclusiveKind, RuleBasedEngine, Verdict, VerdictReport};
+use crate::argument::{
+    ArgumentEngine, EvidenceGrade, EvidenceLinkRequest, InconclusiveKind, RuleBasedEngine, Stance,
+    Verdict, VerdictReport,
+};
 use crate::branch::{BranchAction, BranchDecision, BranchPolicy, ProposedStep, RuleBasedSelector};
 use crate::handoff::{
     Cost, DecisionKind, DecisionPoint, DefaultPolicy, HandoffOption, InterventionPolicy, Risk,
@@ -66,6 +69,7 @@ impl EnrichedProposal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyConfig {
     pub apply: bool,
+    pub auto_run: bool,
     pub flow: Option<String>,
     pub max_apply: u32,
     pub propose_synth: bool,
@@ -75,6 +79,7 @@ impl Default for ApplyConfig {
     fn default() -> Self {
         Self {
             apply: false,
+            auto_run: false,
             flow: None,
             max_apply: 5,
             propose_synth: false,
@@ -105,6 +110,10 @@ pub enum AppliedAction {
         flow_id: String,
         patch_id: String,
         step_id: String,
+    },
+    StepRun {
+        step_id: String,
+        observation_id: Option<String>,
     },
 }
 
@@ -138,6 +147,20 @@ impl AppliedAction {
                 escape_json(flow_id),
                 escape_json(patch_id),
                 escape_json(step_id)
+            ),
+            Self::StepRun {
+                step_id,
+                observation_id,
+            } => format!(
+                concat!(
+                    "{{",
+                    "\"type\":\"step_run\",",
+                    "\"step_id\":\"{}\",",
+                    "\"observation_id\":{}",
+                    "}}"
+                ),
+                escape_json(step_id),
+                optional_string_json(observation_id.as_deref())
             ),
         }
     }
@@ -275,7 +298,7 @@ impl ProjectStore {
                             equivalent_branches: false,
                             conflicts_user_premise: false,
                             mutates_goal: false,
-                            near_budget: applied.len() as u32 >= config.max_apply,
+                            near_budget: applied_budget_count(&applied) as u32 >= config.max_apply,
                         };
                         if let Some(kind) = policy.assess(&ctx) {
                             let point = self.raise_decision_point(
@@ -373,7 +396,8 @@ impl ProjectStore {
                                 )?,
                                 conflicts_user_premise: false,
                                 mutates_goal: false,
-                                near_budget: applied.len() as u32 >= config.max_apply,
+                                near_budget: applied_budget_count(&applied) as u32
+                                    >= config.max_apply,
                             };
                             if let Some(kind) = policy.assess(&ctx) {
                                 let point = self.raise_decision_point(
@@ -392,7 +416,30 @@ impl ProjectStore {
                                     &proposal.decision,
                                     step,
                                 ) {
-                                    Ok(actions) => applied.extend(actions),
+                                    Ok(actions) => {
+                                        for action in actions {
+                                            let auto_run_target = match &action {
+                                                AppliedAction::GraphPatchApplied {
+                                                    flow_id,
+                                                    step_id,
+                                                    ..
+                                                } if config.auto_run => {
+                                                    Some((flow_id.clone(), step_id.clone()))
+                                                }
+                                                _ => None,
+                                            };
+                                            applied.push(action);
+                                            if let Some((flow_id, step_id)) = auto_run_target {
+                                                self.auto_run_applied_step(
+                                                    &proposal.decision.candidate.hypothesis_id,
+                                                    &flow_id,
+                                                    &step_id,
+                                                    &mut applied,
+                                                    &mut apply_failures,
+                                                )?;
+                                            }
+                                        }
+                                    }
                                     Err(error) => apply_failures.push(ApplyFailure {
                                         hypothesis_id: proposal
                                             .decision
@@ -533,6 +580,102 @@ impl ProjectStore {
             })
             .collect())
     }
+
+    fn auto_run_applied_step(
+        &self,
+        hypothesis_id: &str,
+        flow_id: &str,
+        step_id: &str,
+        applied: &mut Vec<AppliedAction>,
+        apply_failures: &mut Vec<ApplyFailure>,
+    ) -> Result<(), StorageError> {
+        let step_ref = format!("step:{flow_id}/{step_id}");
+        let summary = match self.run_step_ref(&step_ref) {
+            Ok(summary) => summary,
+            Err(error) => {
+                apply_failures.push(ApplyFailure {
+                    hypothesis_id: hypothesis_id.to_string(),
+                    reason: auto_run_failure_reason(step_id, &error.to_string()),
+                });
+                applied.push(AppliedAction::StepRun {
+                    step_id: step_id.to_string(),
+                    observation_id: None,
+                });
+                return Ok(());
+            }
+        };
+
+        let source_step_id = summary
+            .attempts
+            .first()
+            .map(|attempt| attempt.step_id.as_str())
+            .unwrap_or(step_ref.as_str());
+        let observation_id = self.latest_observation_id_for_step(source_step_id)?;
+        if summary.failed_steps > 0 {
+            let status = summary
+                .attempts
+                .first()
+                .map(|attempt| attempt.status.as_str())
+                .unwrap_or("unknown");
+            apply_failures.push(ApplyFailure {
+                hypothesis_id: hypothesis_id.to_string(),
+                reason: auto_run_failure_reason(
+                    step_id,
+                    &format!("completed with status {status}"),
+                ),
+            });
+        }
+
+        if let Some(observation_id) = observation_id.as_deref() {
+            if let Err(error) = self.link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis_id.to_string(),
+                observation_id: Some(observation_id.to_string()),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Neutral,
+                note: "auto-run".to_string(),
+            }) {
+                apply_failures.push(ApplyFailure {
+                    hypothesis_id: hypothesis_id.to_string(),
+                    reason: format!("auto-run evidence link for step {step_id} failed: {error}"),
+                });
+            }
+        }
+
+        applied.push(AppliedAction::StepRun {
+            step_id: step_id.to_string(),
+            observation_id,
+        });
+        Ok(())
+    }
+
+    fn latest_observation_id_for_step(
+        &self,
+        source_step_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        Ok(self
+            .list_observations()?
+            .into_iter()
+            .rev()
+            .find(|observation| observation.step_id.as_deref() == Some(source_step_id))
+            .map(|observation| observation.id))
+    }
+}
+
+fn applied_budget_count(applied: &[AppliedAction]) -> usize {
+    applied
+        .iter()
+        .filter(|action| {
+            matches!(
+                action,
+                AppliedAction::LifecycleTransition { .. } | AppliedAction::GraphPatchApplied { .. }
+            )
+        })
+        .count()
+}
+
+fn auto_run_failure_reason(step_id: &str, reason: &str) -> String {
+    format!("auto-run step {step_id} failed: {reason}")
 }
 
 fn infer_replace_params(
@@ -1007,6 +1150,53 @@ runtime:
         store.register_tool(spec).unwrap();
     }
 
+    fn write_auto_run_marker_script(root: &std::path::Path, fail: bool) -> PathBuf {
+        let script_path = root.join(if fail {
+            "auto_run_marker_fail.sh"
+        } else {
+            "auto_run_marker.sh"
+        });
+        let body = if fail {
+            "echo 'fixture auto-run failure' >&2\nexit 7\n".to_string()
+        } else {
+            r#"cat "$AGENTFLOW_INPUT_EXPRESSION_TABLE" >/dev/null
+printf '# Marker report\nGene: THRSP\nscore: 0.61\n' > "$AGENTFLOW_OUTPUT_MARKER_REPORT"
+"#
+            .to_string()
+        };
+        std::fs::write(&script_path, body).unwrap();
+        script_path
+    }
+
+    fn register_exploratory_marker_tool(store: &ProjectStore, script_path: &std::path::Path) {
+        let command = script_path.display();
+        let spec = ToolSpec::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: marker_deepen
+version: 0.1.0
+maturity: exploratory
+description: Marker evidence deepening report for pathway validation
+inputs:
+  expression_table:
+    type: ExpressionTable
+    required: true
+outputs:
+  marker_report:
+    type: Markdown
+    observer: marker_report
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {command}
+"#
+        ))
+        .unwrap();
+        store.register_tool(spec).unwrap();
+    }
+
     struct StubParamInferer;
 
     impl ParamInferer for StubParamInferer {
@@ -1076,6 +1266,31 @@ steps:
             .unwrap();
     }
 
+    fn approve_auto_run_marker_flow(store: &ProjectStore, artifact_id: &str) {
+        store
+            .approve_flow(
+                FlowDraft::from_simple_yaml(&format!(
+                    r#"
+schema_version: agentflow.flow.v0
+id: auto_flow
+name: Auto run flow
+steps:
+  - id: seed
+    tool: analysis/marker_deepen
+    reason: Existing seed analysis
+    needs: []
+    inputs:
+      expression_table: {artifact_id}
+    outputs:
+      marker_report: seed_marker_report
+"#
+                ))
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+    }
+
     fn event_count(store: &ProjectStore, event_type: &str) -> i64 {
         store
             .connection()
@@ -1102,6 +1317,7 @@ steps:
         let report = store
             .run_cycle_with_apply_config(ApplyConfig {
                 apply: true,
+                auto_run: false,
                 flow: None,
                 max_apply: 5,
                 propose_synth: false,
@@ -1142,6 +1358,7 @@ steps:
         let report = store
             .run_cycle_with_apply_config(ApplyConfig {
                 apply: true,
+                auto_run: false,
                 flow: Some("auto_flow".to_string()),
                 max_apply: 5,
                 propose_synth: false,
@@ -1161,7 +1378,7 @@ steps:
                     patch_id,
                     step_id,
                 } => Some((flow_id, patch_id, step_id)),
-                AppliedAction::LifecycleTransition { .. } => None,
+                _ => None,
             })
             .unwrap();
         assert_eq!(graph_action.0, "auto_flow");
@@ -1179,6 +1396,166 @@ steps:
         assert!(report
             .to_json()
             .contains("\"type\":\"graph_patch_applied\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_run_default_off_does_not_run_applied_step_or_link_evidence() {
+        let (path, store) = init_project("auto-run-default-off");
+        let script = write_auto_run_marker_script(&path, false);
+        register_exploratory_marker_tool(&store, &script);
+        let artifact_id = import_expression_artifact(&store, &path);
+        approve_auto_run_marker_flow(&store, &artifact_id);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: true,
+                auto_run: false,
+                flow: Some("auto_flow".to_string()),
+                max_apply: 5,
+                propose_synth: false,
+            })
+            .unwrap();
+
+        assert!(report.applied.iter().any(|action| matches!(
+            action,
+            AppliedAction::GraphPatchApplied { step_id, .. } if step_id == "step_marker_deepen"
+        )));
+        assert!(!report
+            .applied
+            .iter()
+            .any(|action| matches!(action, AppliedAction::StepRun { .. })));
+        assert!(store.list_observations().unwrap().is_empty());
+        assert!(!store
+            .evidence_for(&hypothesis_id)
+            .unwrap()
+            .iter()
+            .any(|link| link.note == "auto-run"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_run_runs_applied_step_and_links_neutral_observation_evidence() {
+        let (path, store) = init_project("auto-run-links-neutral-evidence");
+        let script = write_auto_run_marker_script(&path, false);
+        register_exploratory_marker_tool(&store, &script);
+        let artifact_id = import_expression_artifact(&store, &path);
+        approve_auto_run_marker_flow(&store, &artifact_id);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: true,
+                auto_run: true,
+                flow: Some("auto_flow".to_string()),
+                max_apply: 5,
+                propose_synth: false,
+            })
+            .unwrap();
+
+        let (step_id, observation_id) = report
+            .applied
+            .iter()
+            .find_map(|action| match action {
+                AppliedAction::StepRun {
+                    step_id,
+                    observation_id: Some(observation_id),
+                } => Some((step_id, observation_id)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(step_id, "step_marker_deepen");
+        let observation = store.inspect_observation(observation_id).unwrap();
+        assert_eq!(
+            observation.step_id.as_deref(),
+            Some("step:auto_flow/step_marker_deepen")
+        );
+        assert_eq!(observation.kind, "marker_report");
+
+        let evidence = store.evidence_for(&hypothesis_id).unwrap();
+        let auto_run_link = evidence
+            .iter()
+            .find(|link| link.note == "auto-run")
+            .unwrap();
+        assert_eq!(
+            auto_run_link.observation_id.as_deref(),
+            Some(observation_id.as_str())
+        );
+        assert_eq!(auto_run_link.stance, Stance::Neutral);
+        assert_eq!(auto_run_link.grade, EvidenceGrade::Inferred);
+        assert!(report.to_json().contains("\"type\":\"step_run\""));
+        assert!(report.to_json().contains("\"observation_id\":\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_run_step_failure_is_recorded_without_interrupting_cycle() {
+        let (path, store) = init_project("auto-run-failure-continues");
+        let script = write_auto_run_marker_script(&path, true);
+        register_exploratory_marker_tool(&store, &script);
+        let artifact_id = import_expression_artifact(&store, &path);
+        approve_auto_run_marker_flow(&store, &artifact_id);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: true,
+                auto_run: true,
+                flow: Some("auto_flow".to_string()),
+                max_apply: 5,
+                propose_synth: false,
+            })
+            .unwrap();
+
+        assert!(report.applied.iter().any(|action| matches!(
+            action,
+            AppliedAction::GraphPatchApplied { step_id, .. } if step_id == "step_marker_deepen"
+        )));
+        assert!(report.applied.iter().any(|action| matches!(
+            action,
+            AppliedAction::StepRun {
+                step_id,
+                observation_id: None,
+            } if step_id == "step_marker_deepen"
+        )));
+        assert_eq!(report.apply_failures.len(), 1);
+        assert_eq!(report.apply_failures[0].hypothesis_id, hypothesis_id);
+        assert!(report.apply_failures[0].reason.contains("auto-run step"));
+        assert!(store.list_observations().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(path);
     }
@@ -1211,6 +1588,7 @@ steps:
         let report = store
             .run_cycle_with_apply_config(ApplyConfig {
                 apply: true,
+                auto_run: false,
                 flow: Some("auto_flow".to_string()),
                 max_apply: 10,
                 propose_synth: false,
@@ -1259,6 +1637,7 @@ steps:
         let report = store
             .run_cycle_with_apply_config(ApplyConfig {
                 apply: true,
+                auto_run: false,
                 flow: Some("unused_flow".to_string()),
                 max_apply: 5,
                 propose_synth: false,
@@ -1303,6 +1682,7 @@ steps:
         let report = store
             .run_cycle_with_apply_config(ApplyConfig {
                 apply: true,
+                auto_run: false,
                 flow: None,
                 max_apply: 1,
                 propose_synth: false,
@@ -1343,6 +1723,7 @@ steps:
         let report = store
             .run_cycle_with_apply_config(ApplyConfig {
                 apply: true,
+                auto_run: false,
                 flow: None,
                 max_apply: 5,
                 propose_synth: false,
@@ -1423,6 +1804,7 @@ steps:
         let report = store
             .run_cycle_with_apply_config(ApplyConfig {
                 apply: false,
+                auto_run: false,
                 flow: None,
                 max_apply: 5,
                 propose_synth: true,
@@ -1471,6 +1853,7 @@ steps:
         let report = store
             .run_cycle_with_apply_config(ApplyConfig {
                 apply: false,
+                auto_run: false,
                 flow: None,
                 max_apply: 5,
                 propose_synth: false,
@@ -1499,6 +1882,7 @@ steps:
         );
         let config = ApplyConfig {
             apply: false,
+            auto_run: false,
             flow: None,
             max_apply: 5,
             propose_synth: true,
@@ -1538,6 +1922,7 @@ steps:
         let report = store
             .run_cycle_with_apply_config(ApplyConfig {
                 apply: false,
+                auto_run: false,
                 flow: None,
                 max_apply: 5,
                 propose_synth: true,

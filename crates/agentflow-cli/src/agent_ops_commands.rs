@@ -28,6 +28,7 @@ struct PathJsonOptions {
 struct AgentRunOptions {
     project: PathJsonOptions,
     apply: bool,
+    auto_run: bool,
     flow: Option<String>,
     max_apply: u32,
     propose_synth: bool,
@@ -51,6 +52,7 @@ impl Default for AgentRunOptions {
         Self {
             project: PathJsonOptions::default(),
             apply: false,
+            auto_run: false,
             flow: None,
             max_apply: 5,
             propose_synth: false,
@@ -249,6 +251,7 @@ where
     };
     let config = ApplyConfig {
         apply: options.apply,
+        auto_run: options.auto_run,
         flow: options.flow,
         max_apply: options.max_apply,
         propose_synth: options.propose_synth,
@@ -819,6 +822,9 @@ where
             }
             "--apply" => {
                 options.apply = true;
+            }
+            "--auto-run" => {
+                options.auto_run = true;
             }
             "--flow" => {
                 options.flow = Some(require_value("--flow", &mut args)?);
@@ -1414,6 +1420,15 @@ fn format_applied_actions(actions: &[AppliedAction]) -> String {
                 "  graph patch {} applied to {} step {}",
                 patch_id, flow_id, step_id
             ),
+            AppliedAction::StepRun {
+                step_id,
+                observation_id,
+            } => match observation_id {
+                Some(observation_id) => {
+                    format!("  step {} ran and observed {}", step_id, observation_id)
+                }
+                None => format!("  step {} ran without observation", step_id),
+            },
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1808,7 +1823,7 @@ mod tests {
     use agentflow_core::handoff::{Cost, DecisionKind, HandoffOption, Risk};
     use agentflow_core::hypothesis::{HypothesisRequest, HypothesisStatus};
     use agentflow_core::storage::{
-        ArtifactImportMode, ArtifactImportRequest, EventRecord, ProjectStore, ToolSpec,
+        ArtifactImportMode, ArtifactImportRequest, EventRecord, FlowDraft, ProjectStore, ToolSpec,
     };
 
     fn args(items: &[&str]) -> Vec<OsString> {
@@ -1936,7 +1951,7 @@ runtime:
         store.register_tool(spec).unwrap();
     }
 
-    fn import_expression_artifact(store: &ProjectStore, root: &Path) {
+    fn import_expression_artifact(store: &ProjectStore, root: &Path) -> String {
         let source_path = root.join("expression.tsv");
         std::fs::write(&source_path, "gene\tvalue\nTHRSP\t3\n").unwrap();
         store
@@ -1945,6 +1960,74 @@ runtime:
                 artifact_type: "ExpressionTable".to_string(),
                 mode: ArtifactImportMode::Reference,
             })
+            .unwrap()
+            .summary
+            .id
+    }
+
+    fn write_auto_run_marker_script(root: &Path) -> PathBuf {
+        let script_path = root.join("agent-run-auto-marker.sh");
+        std::fs::write(
+            &script_path,
+            r#"cat "$AGENTFLOW_INPUT_EXPRESSION_TABLE" >/dev/null
+printf '# Marker report\nGene: THRSP\nscore: 0.61\n' > "$AGENTFLOW_OUTPUT_MARKER_REPORT"
+"#,
+        )
+        .unwrap();
+        script_path
+    }
+
+    fn register_exploratory_marker_tool(store: &ProjectStore, script_path: &Path) {
+        let command = script_path.display();
+        let spec = ToolSpec::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: marker_deepen
+version: 0.1.0
+maturity: exploratory
+description: Marker evidence deepening report for pathway validation
+inputs:
+  expression_table:
+    type: ExpressionTable
+    required: true
+outputs:
+  marker_report:
+    type: Markdown
+    observer: marker_report
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {command}
+"#
+        ))
+        .unwrap();
+        store.register_tool(spec).unwrap();
+    }
+
+    fn approve_auto_run_marker_flow(store: &ProjectStore, artifact_id: &str) {
+        store
+            .approve_flow(
+                FlowDraft::from_simple_yaml(&format!(
+                    r#"
+schema_version: agentflow.flow.v0
+id: auto_flow
+name: Auto run flow
+steps:
+  - id: seed
+    tool: analysis/marker_deepen
+    reason: Existing seed analysis
+    needs: []
+    inputs:
+      expression_table: {artifact_id}
+    outputs:
+      marker_report: seed_marker_report
+"#
+                ))
+                .unwrap(),
+                None,
+            )
             .unwrap();
     }
 
@@ -2049,6 +2132,16 @@ runtime:
         let options = parse_agent_run_options(args(&["--propose-synth"])).unwrap();
 
         assert!(options.propose_synth);
+    }
+
+    #[test]
+    fn agent_run_parses_auto_run_flag() {
+        let default = parse_agent_run_options(std::iter::empty::<OsString>()).unwrap();
+        assert!(!default.auto_run);
+
+        let options = parse_agent_run_options(args(&["--auto-run"])).unwrap();
+
+        assert!(options.auto_run);
     }
 
     #[test]
@@ -2266,6 +2359,48 @@ runtime:
             store.inspect_hypothesis(&hypothesis_id).unwrap().status,
             HypothesisStatus::UnderTest
         );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn agent_run_apply_auto_run_links_neutral_evidence_from_cli() {
+        let path = temp_project_path("agent-run-auto-run");
+        let store = init_project(&path);
+        let script = write_auto_run_marker_script(&path);
+        register_exploratory_marker_tool(&store, &script);
+        let artifact_id = import_expression_artifact(&store, &path);
+        approve_auto_run_marker_flow(&store, &artifact_id);
+        let hypothesis_id = record_hypothesis_with_statement(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_weak_evidence(&store, &hypothesis_id);
+
+        let json = run(args(&[
+            "agentflow",
+            "agent",
+            "run",
+            "--apply",
+            "--flow",
+            "auto_flow",
+            "--auto-run",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(json.contains("\"type\":\"step_run\""));
+        assert!(json.contains("\"observation_id\":\"observation_marker_report_"));
+        let evidence = store.evidence_for(&hypothesis_id).unwrap();
+        let linked = evidence
+            .iter()
+            .find(|link| link.note == "auto-run")
+            .unwrap();
+        assert_eq!(linked.stance, Stance::Neutral);
+        assert_eq!(linked.grade, EvidenceGrade::Inferred);
+        assert!(linked.observation_id.is_some());
 
         let _ = std::fs::remove_dir_all(path);
     }

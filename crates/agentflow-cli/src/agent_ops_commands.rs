@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentflow_core::agent::{AppliedAction, ApplyConfig, CycleReport, EnrichedProposal};
+use agentflow_core::agent::{
+    AppliedAction, ApplyConfig, CycleReport, EnrichedProposal, ParamInferer,
+};
 use agentflow_core::argument::{EvidenceLink, Stance, VerdictSummary, VerdictTag};
 use agentflow_core::branch::{
     BranchAction, BranchCandidate, BranchDecision, BranchPolicy, CandidateKind, RuleBasedSelector,
@@ -14,7 +16,7 @@ use agentflow_core::handoff::{DecisionPoint, DecisionStatus};
 use agentflow_core::storage::ProjectStore;
 use agentflow_core::trace_guard::{Checkpoint, DriftReport, RevertRecord};
 
-use crate::{next_arg, require_value, CliError};
+use crate::{next_arg, require_value, synth_commands, CliError};
 
 #[derive(Debug, Default)]
 struct PathJsonOptions {
@@ -29,6 +31,8 @@ struct AgentRunOptions {
     flow: Option<String>,
     max_apply: u32,
     propose_synth: bool,
+    infer_params: bool,
+    synthesizer: Option<String>,
     auto_forage: bool,
     forage_max: u32,
     forage_script: Option<PathBuf>,
@@ -50,6 +54,8 @@ impl Default for AgentRunOptions {
             flow: None,
             max_apply: 5,
             propose_synth: false,
+            infer_params: false,
+            synthesizer: None,
             auto_forage: false,
             forage_max: DEFAULT_AUTO_FORAGE_MAX,
             forage_script: None,
@@ -241,12 +247,22 @@ where
     } else {
         None
     };
-    let report = store.run_cycle_with_apply_config(ApplyConfig {
+    let config = ApplyConfig {
         apply: options.apply,
         flow: options.flow,
         max_apply: options.max_apply,
         propose_synth: options.propose_synth,
-    })?;
+    };
+    let report = if options.infer_params {
+        let synthesizer = options
+            .synthesizer
+            .as_deref()
+            .unwrap_or(synth_commands::DEFAULT_SYNTHESIZER);
+        let inferer = LlmParamInferer { synthesizer };
+        store.run_cycle_with(config, &inferer)?
+    } else {
+        store.run_cycle_with_apply_config(config)?
+    };
 
     if options.project.json {
         Ok(format_agent_run_json(&report, auto_forage.as_ref()))
@@ -576,6 +592,29 @@ fn auto_forage_pass(
     Ok(summary)
 }
 
+struct LlmParamInferer<'a> {
+    synthesizer: &'a str,
+}
+
+impl ParamInferer for LlmParamInferer<'_> {
+    fn infer(&self, hypothesis_statement: &str, param_name: &str) -> Option<String> {
+        let prompt = param_inference_prompt(hypothesis_statement, param_name);
+        let candidate = synth_commands::run_synthesizer(self.synthesizer, &prompt).ok()?;
+        let stripped = synth_commands::strip_markdown_fence(&candidate);
+        first_non_empty_line(&stripped).map(ToOwned::to_owned)
+    }
+}
+
+fn param_inference_prompt(statement: &str, param_name: &str) -> String {
+    format!(
+        "Research hypothesis: \"{statement}\". A bioinformatics analysis tool needs a value for the parameter \"{param_name}\". Reply with ONLY the value (e.g. a gene symbol like THRSP), no explanation, no quotes."
+    )
+}
+
+fn first_non_empty_line(value: &str) -> Option<&str> {
+    value.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
 fn should_auto_forage(verdict: Option<&VerdictSummary>) -> bool {
     matches!(
         verdict.map(|summary| summary.tag),
@@ -794,6 +833,12 @@ where
             }
             "--propose-synth" => {
                 options.propose_synth = true;
+            }
+            "--infer-params" => {
+                options.infer_params = true;
+            }
+            "--synthesizer" => {
+                options.synthesizer = Some(require_value("--synthesizer", &mut args)?);
             }
             "--auto-forage" => {
                 options.auto_forage = true;
@@ -1762,7 +1807,9 @@ mod tests {
     };
     use agentflow_core::handoff::{Cost, DecisionKind, HandoffOption, Risk};
     use agentflow_core::hypothesis::{HypothesisRequest, HypothesisStatus};
-    use agentflow_core::storage::{EventRecord, ProjectStore};
+    use agentflow_core::storage::{
+        ArtifactImportMode, ArtifactImportRequest, EventRecord, ProjectStore, ToolSpec,
+    };
 
     fn args(items: &[&str]) -> Vec<OsString> {
         items.iter().map(OsString::from).collect()
@@ -1859,6 +1906,61 @@ printf '{{"external_id":"PMID:390000%s","title":"Auto forage fixture","access_st
         .unwrap();
     }
 
+    fn register_gene_marker_tool(store: &ProjectStore) {
+        let spec = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: gene_marker_deepen
+version: 0.1.0
+maturity: verified
+description: Marker gene deepening report for pathway validation
+inputs:
+  expression_table:
+    type: ExpressionTable
+    required: true
+params:
+  gene:
+    type: string
+    required: true
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap();
+        store.register_tool(spec).unwrap();
+    }
+
+    fn import_expression_artifact(store: &ProjectStore, root: &Path) {
+        let source_path = root.join("expression.tsv");
+        std::fs::write(&source_path, "gene\tvalue\nTHRSP\t3\n").unwrap();
+        store
+            .import_artifact(ArtifactImportRequest {
+                source_path,
+                artifact_type: "ExpressionTable".to_string(),
+                mode: ArtifactImportMode::Reference,
+            })
+            .unwrap();
+    }
+
+    fn write_synthesizer_stub(path: &Path, output: &str) -> String {
+        let stub_path = path.join("agent-run-param-synth.sh");
+        std::fs::write(
+            &stub_path,
+            format!(
+                "#!/bin/sh\nprintf '%s' '{}'\n",
+                output.replace('\'', "'\\''")
+            ),
+        )
+        .unwrap();
+        format!("/bin/sh {}", stub_path.display())
+    }
+
     fn shell_single_quoted(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
@@ -1947,6 +2049,62 @@ printf '{{"external_id":"PMID:390000%s","title":"Auto forage fixture","access_st
         let options = parse_agent_run_options(args(&["--propose-synth"])).unwrap();
 
         assert!(options.propose_synth);
+    }
+
+    #[test]
+    fn agent_run_parses_infer_params_flags() {
+        let default = parse_agent_run_options(std::iter::empty::<OsString>()).unwrap();
+        assert!(!default.infer_params);
+        assert_eq!(default.synthesizer, None);
+
+        let options =
+            parse_agent_run_options(args(&["--infer-params", "--synthesizer", "stub -p"])).unwrap();
+
+        assert!(options.infer_params);
+        assert_eq!(options.synthesizer.as_deref(), Some("stub -p"));
+    }
+
+    #[test]
+    fn agent_run_infers_replace_param_from_stub_backend() {
+        let path = temp_project_path("agent-run-infer-param");
+        let store = init_project(&path);
+        register_gene_marker_tool(&store);
+        import_expression_artifact(&store, &path);
+        let hypothesis_id = record_hypothesis_with_statement(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_weak_evidence(&store, &hypothesis_id);
+
+        let without_inference = run(args(&[
+            "agentflow",
+            "agent",
+            "run",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(without_inference.contains("\"gene\":\"REPLACE_gene\""));
+
+        let synthesizer = write_synthesizer_stub(&path, "THRSP\n");
+        let with_inference = run(args(&[
+            "agentflow",
+            "agent",
+            "run",
+            "--infer-params",
+            "--synthesizer",
+            &synthesizer,
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(with_inference.contains("\"gene\":\"THRSP\""));
+        assert!(!with_inference.contains("\"gene\":\"REPLACE_gene\""));
+
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]

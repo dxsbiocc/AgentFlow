@@ -1,6 +1,7 @@
 use std::fmt;
 
 use rusqlite::params;
+use serde::{Deserialize, Serialize};
 
 use crate::argument::{EvidenceGrade, EvidenceLink, EvidenceLinkRequest, Stance};
 use crate::storage::{EventRecord, ProjectStore, StorageError};
@@ -8,7 +9,8 @@ use crate::storage::{EventRecord, ProjectStore, StorageError};
 const FORAGE_ACTION_STARTED_EVENT: &str = "forage.action_started";
 const FORAGE_OBSERVATION_RECORDED_EVENT: &str = "forage.observation_recorded";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AccessStatus {
     MetadataOnly,
     AbstractAvailable,
@@ -52,7 +54,8 @@ impl fmt::Display for AccessStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ForageAction {
     ReadMap,
     ExploreUnknown,
@@ -84,7 +87,7 @@ impl fmt::Display for ForageAction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForageObservation {
     pub id: String,
     pub source_id: String,
@@ -96,24 +99,7 @@ pub struct ForageObservation {
 
 impl ForageObservation {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"id\":\"{}\",",
-                "\"source_id\":\"{}\",",
-                "\"external_id\":\"{}\",",
-                "\"title\":\"{}\",",
-                "\"access_status\":\"{}\",",
-                "\"retrieved_at\":{}",
-                "}}"
-            ),
-            escape_json(&self.id),
-            escape_json(&self.source_id),
-            escape_json(&self.external_id),
-            escape_json(&self.title),
-            self.access_status.as_str(),
-            self.retrieved_at
-        )
+        serde_json::to_string(self).expect("forage observation serializes to JSON")
     }
 }
 
@@ -284,19 +270,28 @@ fn validate_non_empty(label: &str, value: &str) -> Result<(), StorageError> {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ForageActionPayload {
+    action: ForageAction,
+    query: String,
+    source_id: String,
+}
+
 fn forage_action_payload_json(action: ForageAction, query: &str, source_id: &str) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"action\":\"{}\",",
-            "\"query\":\"{}\",",
-            "\"source_id\":\"{}\"",
-            "}}"
-        ),
-        action.as_str(),
-        escape_json(query.trim()),
-        escape_json(source_id.trim())
-    )
+    serde_json::to_string(&ForageActionPayload {
+        action,
+        query: query.trim().to_string(),
+        source_id: source_id.trim().to_string(),
+    })
+    .expect("forage action payload serializes to JSON")
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ForageObservationPayload {
+    source_id: String,
+    external_id: String,
+    title: String,
+    access_status: AccessStatus,
 }
 
 fn forage_observation_payload_json(
@@ -305,20 +300,13 @@ fn forage_observation_payload_json(
     title: &str,
     access_status: AccessStatus,
 ) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"source_id\":\"{}\",",
-            "\"external_id\":\"{}\",",
-            "\"title\":\"{}\",",
-            "\"access_status\":\"{}\"",
-            "}}"
-        ),
-        escape_json(source_id.trim()),
-        escape_json(external_id.trim()),
-        escape_json(title.trim()),
-        access_status.as_str()
-    )
+    serde_json::to_string(&ForageObservationPayload {
+        source_id: source_id.trim().to_string(),
+        external_id: external_id.trim().to_string(),
+        title: title.trim().to_string(),
+        access_status,
+    })
+    .expect("forage observation payload serializes to JSON")
 }
 
 fn forage_observation_from_event(
@@ -326,98 +314,26 @@ fn forage_observation_from_event(
     payload_json: &str,
     created_at: i64,
 ) -> Result<ForageObservation, StorageError> {
+    let payload = forage_observation_payload_from_json(&id, payload_json)?;
     Ok(ForageObservation {
-        id: id.clone(),
-        source_id: required_json_string(&id, payload_json, "source_id")?,
-        external_id: required_json_string(&id, payload_json, "external_id")?,
-        title: required_json_string(&id, payload_json, "title")?,
-        access_status: parse_access_status(&id, payload_json, "access_status")?,
+        id,
+        source_id: payload.source_id,
+        external_id: payload.external_id,
+        title: payload.title,
+        access_status: payload.access_status,
         retrieved_at: created_at,
     })
 }
 
-fn required_json_string(
+fn forage_observation_payload_from_json(
     event_id: &str,
     payload_json: &str,
-    field: &str,
-) -> Result<String, StorageError> {
-    json_string_field(payload_json, field).ok_or_else(|| {
-        StorageError::InvalidInput(format!("forage event {event_id} is missing {field}"))
-    })
-}
-
-fn parse_access_status(
-    event_id: &str,
-    payload_json: &str,
-    field: &str,
-) -> Result<AccessStatus, StorageError> {
-    let value = required_json_string(event_id, payload_json, field)?;
-    AccessStatus::parse(&value).ok_or_else(|| {
+) -> Result<ForageObservationPayload, StorageError> {
+    serde_json::from_str(payload_json).map_err(|err| {
         StorageError::InvalidInput(format!(
-            "forage event {event_id} has invalid access status {value}"
+            "forage event {event_id} has invalid payload: {err}"
         ))
     })
-}
-
-fn json_string_field(json: &str, field: &str) -> Option<String> {
-    let marker = format!("\"{field}\":\"");
-    let start = json.find(&marker)? + marker.len();
-    let rest = &json[start..];
-    let end = find_json_string_end(rest)?;
-    Some(unescape_json_string(&rest[..end]))
-}
-
-fn find_json_string_end(input: &str) -> Option<usize> {
-    let mut escaped = false;
-    for (index, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(index),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn unescape_json_string(input: &str) -> String {
-    let mut output = String::new();
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('"') => output.push('"'),
-                Some('\\') => output.push('\\'),
-                Some('n') => output.push('\n'),
-                Some('r') => output.push('\r'),
-                Some('t') => output.push('\t'),
-                Some(other) => output.push(other),
-                None => {}
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-    output
-}
-
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => output.push(ch),
-        }
-    }
-    output
 }
 
 #[cfg(test)]
@@ -426,7 +342,7 @@ mod tests {
 
     use crate::argument::{EvidenceGrade, InconclusiveKind, RuleBasedEngine, Stance, Verdict};
     use crate::hypothesis::HypothesisRequest;
-    use crate::storage::{now_unix_seconds, ProjectStore, StorageError};
+    use crate::storage::{now_unix_seconds, EventRecord, ProjectStore, StorageError};
 
     use super::{current_strength, grade_from_access, AccessStatus, ForageAction, ForagePolicy};
 
@@ -510,6 +426,34 @@ mod tests {
     }
 
     #[test]
+    fn enum_json_strings_match_display_contract() {
+        for status in [
+            AccessStatus::MetadataOnly,
+            AccessStatus::AbstractAvailable,
+            AccessStatus::OpenAccessFullText,
+            AccessStatus::UserProvidedFullText,
+            AccessStatus::SubscriptionConnectorFullText,
+            AccessStatus::FullTextUnavailable,
+            AccessStatus::RetrievalFailed,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{}\"", status.as_str())
+            );
+        }
+        for action in [
+            ForageAction::ReadMap,
+            ForageAction::ExploreUnknown,
+            ForageAction::VerifyKnown,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&action).unwrap(),
+                format!("\"{}\"", action.as_str())
+            );
+        }
+    }
+
+    #[test]
     fn current_strength_applies_half_life_decay() {
         assert!((current_strength(10.0, 30.0, 30) - 5.0).abs() < f64::EPSILON);
         assert_eq!(current_strength(10.0, 0.0, 30), 10.0);
@@ -565,6 +509,69 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn legacy_handwritten_payloads_parse_with_json_whitespace_and_ordering() {
+        let path = temp_project_path("legacy-payload");
+        let store = ProjectStore::init(&path, Some("Forage Demo")).unwrap();
+        let event_id = store
+            .append_event(EventRecord {
+                flow_id: None,
+                step_id: None,
+                run_id: None,
+                event_type: super::FORAGE_OBSERVATION_RECORDED_EVENT.to_string(),
+                payload_json: r#"{
+                    "access_status": "abstract_available",
+                    "title": "Legacy \"payload\"\nparses",
+                    "external_id": "PMID:legacy",
+                    "source_id": "pubmed"
+                }"#
+                .to_string(),
+            })
+            .unwrap();
+
+        let inspected = store.inspect_forage_observation(&event_id).unwrap();
+        assert_eq!(inspected.source_id, "pubmed");
+        assert_eq!(inspected.external_id, "PMID:legacy");
+        assert_eq!(inspected.title, "Legacy \"payload\"\nparses");
+        assert_eq!(inspected.access_status, AccessStatus::AbstractAvailable);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn json_outputs_match_legacy_bytes() {
+        let observation = super::ForageObservation {
+            id: "event_1".to_string(),
+            source_id: "pubmed".to_string(),
+            external_id: "PMID:123".to_string(),
+            title: "Quote \" and newline\nslash \\ tab\t".to_string(),
+            access_status: AccessStatus::AbstractAvailable,
+            retrieved_at: 123,
+        };
+
+        assert_eq!(
+            observation.to_json(),
+            "{\"id\":\"event_1\",\"source_id\":\"pubmed\",\"external_id\":\"PMID:123\",\"title\":\"Quote \\\" and newline\\nslash \\\\ tab\\t\",\"access_status\":\"abstract_available\",\"retrieved_at\":123}"
+        );
+        assert_eq!(
+            super::forage_action_payload_json(
+                ForageAction::ExploreUnknown,
+                " query \"x\" ",
+                " pubmed "
+            ),
+            "{\"action\":\"explore_unknown\",\"query\":\"query \\\"x\\\"\",\"source_id\":\"pubmed\"}"
+        );
+        assert_eq!(
+            super::forage_observation_payload_json(
+                " pubmed ",
+                " PMID:123 ",
+                " Title\nwith tab\t ",
+                AccessStatus::OpenAccessFullText,
+            ),
+            "{\"source_id\":\"pubmed\",\"external_id\":\"PMID:123\",\"title\":\"Title\\nwith tab\",\"access_status\":\"open_access_full_text\"}"
+        );
     }
 
     #[test]

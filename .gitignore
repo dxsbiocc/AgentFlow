@@ -1,4 +1,5 @@
 /target/
 /.agentflow/
 /.omx/
+/.codegraph/
 *.log

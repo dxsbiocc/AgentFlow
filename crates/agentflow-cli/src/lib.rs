@@ -1,5 +1,6 @@
 mod agent_commands;
 mod agent_ops_commands;
+mod synth_commands;
 
 use std::ffi::OsString;
 use std::fs;
@@ -52,6 +53,7 @@ where
         Some(command) if command == "status" => status_command(args),
         Some(command) if command == "doctor" => doctor_command(args),
         Some(command) if command == "tools" => tools_command(args),
+        Some(command) if command == "synth" => synth_commands::synth_command(args),
         Some(command) if command == "env" => env_command(args),
         Some(command) if command == "import" => import_command(args),
         Some(command) if command == "artifacts" => artifacts_command(args),
@@ -95,6 +97,7 @@ pub fn usage() -> String {
         "  agentflow tools inspect <tool-ref> [--json] [--path <path>]",
         "  agentflow tools match [--output <type>] [--input <type>]... [--keyword <kw>]... [--json] [--path <path>]",
         "  agentflow tools draft-step <tool-ref> [--input <type>:<artifact-id>]... [--json] [--path <path>]",
+        "  agentflow synth --name <n> --description <text> --fixture <input-file> --expect <substring> [--synthesizer <cmd>] [--path <path>]",
         "  agentflow env check <tool-ref> [--json] [--path <path>]",
         "  agentflow env prepare <tool-ref> [--json] [--path <path>]",
         "  agentflow env export <tool-ref> [--json] [--path <path>]",

@@ -28,6 +28,7 @@ struct AgentRunOptions {
     apply: bool,
     flow: Option<String>,
     max_apply: u32,
+    propose_synth: bool,
     auto_forage: bool,
     forage_max: u32,
     forage_script: Option<PathBuf>,
@@ -48,6 +49,7 @@ impl Default for AgentRunOptions {
             apply: false,
             flow: None,
             max_apply: 5,
+            propose_synth: false,
             auto_forage: false,
             forage_max: DEFAULT_AUTO_FORAGE_MAX,
             forage_script: None,
@@ -243,6 +245,7 @@ where
         apply: options.apply,
         flow: options.flow,
         max_apply: options.max_apply,
+        propose_synth: options.propose_synth,
     })?;
 
     if options.project.json {
@@ -788,6 +791,9 @@ where
                         "--max-apply must fit in an unsigned 32-bit integer".to_string(),
                     )
                 })?;
+            }
+            "--propose-synth" => {
+                options.propose_synth = true;
             }
             "--auto-forage" => {
                 options.auto_forage = true;
@@ -1931,6 +1937,16 @@ printf '{{"external_id":"PMID:390000%s","title":"Auto forage fixture","access_st
         assert_eq!(options.forage_max, 3);
         assert_eq!(options.forage_script, Some(PathBuf::from("fixture.sh")));
         assert_eq!(options.python.as_deref(), Some("/bin/sh"));
+    }
+
+    #[test]
+    fn agent_run_parses_propose_synth_flag() {
+        let default = parse_agent_run_options(std::iter::empty::<OsString>()).unwrap();
+        assert!(!default.propose_synth);
+
+        let options = parse_agent_run_options(args(&["--propose-synth"])).unwrap();
+
+        assert!(options.propose_synth);
     }
 
     #[test]

@@ -77,6 +77,7 @@ pub enum DecisionKind {
     PremiseChallenged,
     BudgetThreshold,
     GoalMutation,
+    ToolGap,
 }
 
 impl DecisionKind {
@@ -86,6 +87,7 @@ impl DecisionKind {
             Self::PremiseChallenged => "premise_challenged",
             Self::BudgetThreshold => "budget_threshold",
             Self::GoalMutation => "goal_mutation",
+            Self::ToolGap => "tool_gap",
         }
     }
 
@@ -95,6 +97,7 @@ impl DecisionKind {
             "premise_challenged" => Some(Self::PremiseChallenged),
             "budget_threshold" => Some(Self::BudgetThreshold),
             "goal_mutation" => Some(Self::GoalMutation),
+            "tool_gap" => Some(Self::ToolGap),
             _ => None,
         }
     }
@@ -874,6 +877,7 @@ mod tests {
             DecisionKind::PremiseChallenged,
             DecisionKind::BudgetThreshold,
             DecisionKind::GoalMutation,
+            DecisionKind::ToolGap,
         ] {
             assert_eq!(DecisionKind::parse(kind.as_str()), Some(kind));
         }

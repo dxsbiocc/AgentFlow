@@ -1,13 +1,15 @@
 use std::fmt;
 
 use rusqlite::params;
+use serde::{Deserialize, Serialize};
 
 use crate::storage::{EventRecord, ProjectStore, StorageError};
 
 const HYPOTHESIS_CREATED_EVENT: &str = "hypothesis.created";
 const HYPOTHESIS_TRANSITIONED_EVENT: &str = "hypothesis.transitioned";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Confidence {
     Low,
     Medium,
@@ -39,7 +41,8 @@ impl fmt::Display for Confidence {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HypothesisStatus {
     Proposed,
     UnderTest,
@@ -105,7 +108,7 @@ impl fmt::Display for HypothesisStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hypothesis {
     pub id: String,
     pub statement: String,
@@ -119,28 +122,7 @@ pub struct Hypothesis {
 
 impl Hypothesis {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"id\":\"{}\",",
-                "\"statement\":\"{}\",",
-                "\"origin\":\"{}\",",
-                "\"related_goal_id\":\"{}\",",
-                "\"status\":\"{}\",",
-                "\"confidence\":\"{}\",",
-                "\"created_at\":{},",
-                "\"updated_at\":{}",
-                "}}"
-            ),
-            escape_json(&self.id),
-            escape_json(&self.statement),
-            escape_json(&self.origin),
-            escape_json(&self.related_goal_id),
-            self.status.as_str(),
-            self.confidence.as_str(),
-            self.created_at,
-            self.updated_at
-        )
+        serde_json::to_string(self).expect("hypothesis serializes to JSON")
     }
 }
 
@@ -204,15 +186,13 @@ impl ProjectStore {
                     )?);
                 }
                 HYPOTHESIS_TRANSITIONED_EVENT => {
-                    let hypothesis_id =
-                        required_json_string(&event_id, &payload_json, "hypothesis_id")?;
+                    let payload = transitioned_payload_from_json(&event_id, &payload_json)?;
                     if let Some(hypothesis) = hypotheses
                         .iter_mut()
-                        .find(|hypothesis: &&mut Hypothesis| hypothesis.id == hypothesis_id)
+                        .find(|hypothesis: &&mut Hypothesis| hypothesis.id == payload.hypothesis_id)
                     {
-                        hypothesis.status = parse_status(&event_id, &payload_json, "status")?;
-                        hypothesis.confidence =
-                            parse_confidence(&event_id, &payload_json, "confidence")?;
+                        hypothesis.status = payload.status;
+                        hypothesis.confidence = payload.confidence;
                         hypothesis.updated_at = created_at;
                     }
                 }
@@ -278,23 +258,31 @@ fn validate_non_empty(label: &str, value: &str) -> Result<(), StorageError> {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct HypothesisCreatedPayload {
+    statement: String,
+    origin: String,
+    related_goal_id: String,
+    status: HypothesisStatus,
+    confidence: Confidence,
+}
+
 fn hypothesis_created_payload_json(request: &HypothesisRequest) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"statement\":\"{}\",",
-            "\"origin\":\"{}\",",
-            "\"related_goal_id\":\"{}\",",
-            "\"status\":\"{}\",",
-            "\"confidence\":\"{}\"",
-            "}}"
-        ),
-        escape_json(request.statement.trim()),
-        escape_json(request.origin.trim()),
-        escape_json(request.related_goal_id.trim()),
-        HypothesisStatus::Proposed.as_str(),
-        Confidence::Low.as_str()
-    )
+    serde_json::to_string(&HypothesisCreatedPayload {
+        statement: request.statement.trim().to_string(),
+        origin: request.origin.trim().to_string(),
+        related_goal_id: request.related_goal_id.trim().to_string(),
+        status: HypothesisStatus::Proposed,
+        confidence: Confidence::Low,
+    })
+    .expect("hypothesis created payload serializes to JSON")
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HypothesisTransitionedPayload {
+    hypothesis_id: String,
+    status: HypothesisStatus,
+    confidence: Confidence,
 }
 
 fn hypothesis_transitioned_payload_json(
@@ -302,18 +290,12 @@ fn hypothesis_transitioned_payload_json(
     status: HypothesisStatus,
     confidence: Confidence,
 ) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"hypothesis_id\":\"{}\",",
-            "\"status\":\"{}\",",
-            "\"confidence\":\"{}\"",
-            "}}"
-        ),
-        escape_json(hypothesis_id.trim()),
-        status.as_str(),
-        confidence.as_str()
-    )
+    serde_json::to_string(&HypothesisTransitionedPayload {
+        hypothesis_id: hypothesis_id.trim().to_string(),
+        status,
+        confidence,
+    })
+    .expect("hypothesis transitioned payload serializes to JSON")
 }
 
 fn hypothesis_from_created_event(
@@ -321,122 +303,48 @@ fn hypothesis_from_created_event(
     payload_json: &str,
     created_at: i64,
 ) -> Result<Hypothesis, StorageError> {
+    let payload = created_payload_from_json(&id, payload_json)?;
     Ok(Hypothesis {
-        id: id.clone(),
-        statement: required_json_string(&id, payload_json, "statement")?,
-        origin: required_json_string(&id, payload_json, "origin")?,
-        related_goal_id: required_json_string(&id, payload_json, "related_goal_id")?,
-        status: parse_status(&id, payload_json, "status")?,
-        confidence: parse_confidence(&id, payload_json, "confidence")?,
+        id,
+        statement: payload.statement,
+        origin: payload.origin,
+        related_goal_id: payload.related_goal_id,
+        status: payload.status,
+        confidence: payload.confidence,
         created_at,
         updated_at: created_at,
     })
 }
 
-fn required_json_string(
+fn created_payload_from_json(
     event_id: &str,
     payload_json: &str,
-    field: &str,
-) -> Result<String, StorageError> {
-    json_string_field(payload_json, field).ok_or_else(|| {
-        StorageError::InvalidInput(format!("hypothesis event {event_id} is missing {field}"))
-    })
-}
-
-fn parse_status(
-    event_id: &str,
-    payload_json: &str,
-    field: &str,
-) -> Result<HypothesisStatus, StorageError> {
-    let value = required_json_string(event_id, payload_json, field)?;
-    HypothesisStatus::parse(&value).ok_or_else(|| {
+) -> Result<HypothesisCreatedPayload, StorageError> {
+    serde_json::from_str(payload_json).map_err(|err| {
         StorageError::InvalidInput(format!(
-            "hypothesis event {event_id} has invalid status {value}"
+            "hypothesis event {event_id} has invalid payload: {err}"
         ))
     })
 }
 
-fn parse_confidence(
+fn transitioned_payload_from_json(
     event_id: &str,
     payload_json: &str,
-    field: &str,
-) -> Result<Confidence, StorageError> {
-    let value = required_json_string(event_id, payload_json, field)?;
-    Confidence::parse(&value).ok_or_else(|| {
+) -> Result<HypothesisTransitionedPayload, StorageError> {
+    serde_json::from_str(payload_json).map_err(|err| {
         StorageError::InvalidInput(format!(
-            "hypothesis event {event_id} has invalid confidence {value}"
+            "hypothesis event {event_id} has invalid payload: {err}"
         ))
     })
-}
-
-fn json_string_field(json: &str, field: &str) -> Option<String> {
-    let marker = format!("\"{field}\":\"");
-    let start = json.find(&marker)? + marker.len();
-    let rest = &json[start..];
-    let end = find_json_string_end(rest)?;
-    Some(unescape_json_string(&rest[..end]))
-}
-
-fn find_json_string_end(input: &str) -> Option<usize> {
-    let mut escaped = false;
-    for (index, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(index),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn unescape_json_string(input: &str) -> String {
-    let mut output = String::new();
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('"') => output.push('"'),
-                Some('\\') => output.push('\\'),
-                Some('n') => output.push('\n'),
-                Some('r') => output.push('\r'),
-                Some('t') => output.push('\t'),
-                Some(other) => output.push(other),
-                None => {}
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-    output
-}
-
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => output.push(ch),
-        }
-    }
-    output
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use crate::storage::{now_unix_seconds, ProjectStore};
+    use crate::storage::{now_unix_seconds, EventRecord, ProjectStore};
 
-    use super::{Confidence, HypothesisRequest, HypothesisStatus};
+    use super::{Confidence, Hypothesis, HypothesisRequest, HypothesisStatus};
 
     fn temp_project_path(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -616,6 +524,88 @@ mod tests {
     }
 
     #[test]
+    fn legacy_handwritten_payloads_parse_with_json_whitespace_and_ordering() {
+        let path = temp_project_path("legacy-payload");
+        let store = ProjectStore::init(&path, Some("Hypothesis Demo")).unwrap();
+        let hypothesis_id = store
+            .append_event(EventRecord {
+                flow_id: None,
+                step_id: None,
+                run_id: None,
+                event_type: super::HYPOTHESIS_CREATED_EVENT.to_string(),
+                payload_json: r#"{
+                    "confidence": "low",
+                    "related_goal_id": "goal_legacy",
+                    "origin": "agent",
+                    "status": "proposed",
+                    "statement": "Legacy payload parses"
+                }"#
+                .to_string(),
+            })
+            .unwrap();
+
+        store
+            .append_event(EventRecord {
+                flow_id: None,
+                step_id: None,
+                run_id: None,
+                event_type: super::HYPOTHESIS_TRANSITIONED_EVENT.to_string(),
+                payload_json: format!(
+                    r#"{{
+                        "confidence": "medium",
+                        "status": "under_test",
+                        "hypothesis_id": "{hypothesis_id}"
+                    }}"#
+                ),
+            })
+            .unwrap();
+
+        let inspected = store.inspect_hypothesis(&hypothesis_id).unwrap();
+        assert_eq!(inspected.statement, "Legacy payload parses");
+        assert_eq!(inspected.origin, "agent");
+        assert_eq!(inspected.related_goal_id, "goal_legacy");
+        assert_eq!(inspected.status, HypothesisStatus::UnderTest);
+        assert_eq!(inspected.confidence, Confidence::Medium);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn json_outputs_match_legacy_bytes() {
+        let hypothesis = Hypothesis {
+            id: "event_1".to_string(),
+            statement: "Quote \" and newline\n".to_string(),
+            origin: "agent\\cli".to_string(),
+            related_goal_id: "goal_1".to_string(),
+            status: HypothesisStatus::UnderTest,
+            confidence: Confidence::Medium,
+            created_at: 11,
+            updated_at: 22,
+        };
+
+        assert_eq!(
+            hypothesis.to_json(),
+            "{\"id\":\"event_1\",\"statement\":\"Quote \\\" and newline\\n\",\"origin\":\"agent\\\\cli\",\"related_goal_id\":\"goal_1\",\"status\":\"under_test\",\"confidence\":\"medium\",\"created_at\":11,\"updated_at\":22}"
+        );
+        assert_eq!(
+            super::hypothesis_created_payload_json(&HypothesisRequest {
+                statement: " Statement ".to_string(),
+                origin: " agent ".to_string(),
+                related_goal_id: " goal_1 ".to_string(),
+            }),
+            "{\"statement\":\"Statement\",\"origin\":\"agent\",\"related_goal_id\":\"goal_1\",\"status\":\"proposed\",\"confidence\":\"low\"}"
+        );
+        assert_eq!(
+            super::hypothesis_transitioned_payload_json(
+                " event_1 ",
+                HypothesisStatus::Supported,
+                Confidence::High
+            ),
+            "{\"hypothesis_id\":\"event_1\",\"status\":\"supported\",\"confidence\":\"high\"}"
+        );
+    }
+
+    #[test]
     fn hypothesis_status_transition_rules_match_contract() {
         assert!(HypothesisStatus::Proposed.can_transition_to(HypothesisStatus::UnderTest));
         assert!(HypothesisStatus::UnderTest.can_transition_to(HypothesisStatus::Supported));
@@ -628,5 +618,17 @@ mod tests {
         assert!(!HypothesisStatus::Proposed.can_transition_to(HypothesisStatus::Proposed));
         assert!(!HypothesisStatus::Proposed.can_transition_to(HypothesisStatus::Supported));
         assert!(!HypothesisStatus::Superseded.can_transition_to(HypothesisStatus::UnderTest));
+    }
+
+    #[test]
+    fn enum_json_strings_match_display_contract() {
+        assert_eq!(
+            serde_json::to_string(&HypothesisStatus::UnderTest).unwrap(),
+            format!("\"{}\"", HypothesisStatus::UnderTest.as_str())
+        );
+        assert_eq!(
+            serde_json::to_string(&Confidence::Low).unwrap(),
+            format!("\"{}\"", Confidence::Low.as_str())
+        );
     }
 }

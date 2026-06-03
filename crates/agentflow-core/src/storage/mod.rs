@@ -4,6 +4,7 @@ mod migrations;
 mod project_store;
 mod schema;
 mod tool_registry;
+mod yaml;
 
 pub use artifact_registry::{
     artifacts_list_json, ArtifactImportMode, ArtifactImportRequest, ArtifactInspection,

@@ -2,11 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, OptionalExtension};
+use serde::Deserialize;
 
 use crate::domain::StepStatus;
 
 use super::project_store::{now_unix_seconds, EventRecord, ProjectStore, StorageError};
 use super::tool_registry::ExecutableToolSpec;
+use super::yaml;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowDraft {
@@ -19,20 +21,28 @@ pub struct FlowDraft {
 
 impl FlowDraft {
     pub fn from_simple_yaml(source_text: &str) -> Result<Self, StorageError> {
-        let top_fields = parse_top_level_fields(source_text);
-        let schema_version = required_field(&top_fields, "schema_version")?;
+        let raw = yaml::parse_yaml::<RawFlowDraft>("flow", source_text)?;
+        let schema_version =
+            required_flow_field(raw.schema_version.clone(), "schema_version", source_text)?;
         if schema_version != agentflow_schemas::FLOW_SCHEMA_V0 {
-            return Err(StorageError::InvalidInput(format!(
-                "flow schema_version must be {}",
-                agentflow_schemas::FLOW_SCHEMA_V0
-            )));
+            return Err(yaml::invalid_input_at_field(
+                source_text,
+                "schema_version",
+                format!(
+                    "flow schema_version must be {}",
+                    agentflow_schemas::FLOW_SCHEMA_V0
+                ),
+            ));
         }
 
-        let id = required_field(&top_fields, "id")?;
-        let name = required_field(&top_fields, "name")?;
-        validate_ref_part("flow id", &id)?;
+        let id = required_flow_field(raw.id.clone(), "id", source_text)?;
+        let name = required_flow_field(raw.name.clone(), "name", source_text)?;
+        validate_ref_part("flow id", &id)
+            .map_err(|error| yaml::with_field_location(source_text, "id", error))?;
         if name.trim().is_empty() {
-            return Err(StorageError::InvalidInput(
+            return Err(yaml::invalid_input_at_field(
+                source_text,
+                "name",
                 "flow name must not be empty".to_string(),
             ));
         }
@@ -41,7 +51,7 @@ impl FlowDraft {
             schema_version,
             id,
             name,
-            steps: parse_steps(source_text)?,
+            steps: raw.into_steps(source_text)?,
             source_text: source_text.to_string(),
         })
     }
@@ -56,6 +66,102 @@ pub struct FlowStepDraft {
     pub inputs: BTreeMap<String, String>,
     pub params: BTreeMap<String, String>,
     pub outputs: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct RawFlowDraft {
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    schema_version: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    id: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    name: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_default_vec")]
+    steps: Vec<RawFlowStepDraft>,
+}
+
+impl RawFlowDraft {
+    fn into_steps(self, source_text: &str) -> Result<Vec<FlowStepDraft>, StorageError> {
+        self.steps
+            .into_iter()
+            .map(|step| step.into_step(source_text))
+            .collect()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFlowStepDraft {
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    id: Option<String>,
+    #[serde(
+        rename = "tool",
+        default,
+        deserialize_with = "yaml::deserialize_optional_scalar_string"
+    )]
+    tool_ref: Option<String>,
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "yaml::deserialize_optional_scalar_string"
+    )]
+    _step_type: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "yaml::deserialize_optional_present_scalar_string"
+    )]
+    reason: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_string_vec_or_csv")]
+    needs: Vec<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_string_map")]
+    inputs: BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_string_map")]
+    params: BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_string_map")]
+    outputs: BTreeMap<String, String>,
+}
+
+impl RawFlowStepDraft {
+    fn into_step(self, source_text: &str) -> Result<FlowStepDraft, StorageError> {
+        let step = FlowStepDraft {
+            id: self.id.unwrap_or_default(),
+            tool_ref: self.tool_ref.unwrap_or_default(),
+            needs: self.needs,
+            reason: self.reason,
+            inputs: self.inputs,
+            params: self.params,
+            outputs: self.outputs,
+        };
+        finalize_raw_step(step, source_text)
+    }
+}
+
+fn finalize_raw_step(
+    step: FlowStepDraft,
+    source_text: &str,
+) -> Result<FlowStepDraft, StorageError> {
+    if step.id.trim().is_empty() {
+        return Err(yaml::invalid_input_at_field(
+            source_text,
+            "id",
+            "flow step is missing id",
+        ));
+    }
+    Ok(step)
+}
+
+fn required_flow_field(
+    value: Option<String>,
+    field_name: &str,
+    source_text: &str,
+) -> Result<String, StorageError> {
+    value.filter(|value| !value.is_empty()).ok_or_else(|| {
+        yaml::invalid_input_at_field(
+            source_text,
+            field_name,
+            format!("flow spec is missing required field {field_name}"),
+        )
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -634,175 +740,6 @@ fn artifact_ref(input: &str) -> Option<&str> {
     }
 }
 
-fn parse_top_level_fields(source_text: &str) -> BTreeMap<String, String> {
-    let mut fields = BTreeMap::new();
-    for line in source_text.lines() {
-        if line.starts_with(char::is_whitespace) {
-            continue;
-        }
-        let without_comment = line.split_once('#').map_or(line, |(left, _)| left);
-        let trimmed = without_comment.trim();
-        if trimmed.is_empty() || trimmed == "steps:" {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once(':') else {
-            continue;
-        };
-        let value = normalize_scalar(value.trim());
-        if !key.trim().is_empty() && !value.is_empty() {
-            fields.insert(key.trim().to_string(), value);
-        }
-    }
-    fields
-}
-
-fn parse_steps(source_text: &str) -> Result<Vec<FlowStepDraft>, StorageError> {
-    let mut in_steps = false;
-    let mut current: Option<FlowStepDraft> = None;
-    let mut section: Option<String> = None;
-    let mut steps = Vec::new();
-
-    for line in source_text.lines() {
-        let without_comment = line.split_once('#').map_or(line, |(left, _)| left);
-        let trimmed = without_comment.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if !in_steps {
-            if trimmed == "steps:" {
-                in_steps = true;
-            }
-            continue;
-        }
-
-        if let Some(rest) = trimmed.strip_prefix("- ") {
-            if let Some(step) = current.take() {
-                steps.push(finalize_step(step)?);
-            }
-            let mut step = empty_step();
-            section = None;
-            if let Some((key, value)) = rest.split_once(':') {
-                set_step_field(&mut step, key.trim(), value.trim(), &mut section)?;
-            }
-            current = Some(step);
-            continue;
-        }
-
-        let Some(step) = current.as_mut() else {
-            return Err(StorageError::InvalidInput(
-                "steps entries must start with - id: ...".to_string(),
-            ));
-        };
-        let Some((key, value)) = trimmed.split_once(':') else {
-            return Err(StorageError::InvalidInput(format!(
-                "cannot parse flow step line: {trimmed}"
-            )));
-        };
-        let key = key.trim();
-        let value = value.trim();
-        if let Some(section_name) = section.as_deref() {
-            if value.is_empty() && matches!(key, "inputs" | "params" | "outputs") {
-                section = Some(key.to_string());
-            } else if matches!(section_name, "inputs" | "params" | "outputs")
-                && !matches!(key, "id" | "tool" | "needs" | "reason")
-            {
-                insert_section_value(step, section_name, key, value);
-            } else {
-                set_step_field(step, key, value, &mut section)?;
-            }
-        } else {
-            set_step_field(step, key, value, &mut section)?;
-        }
-    }
-
-    if let Some(step) = current.take() {
-        steps.push(finalize_step(step)?);
-    }
-
-    Ok(steps)
-}
-
-fn empty_step() -> FlowStepDraft {
-    FlowStepDraft {
-        id: String::new(),
-        tool_ref: String::new(),
-        needs: Vec::new(),
-        reason: None,
-        inputs: BTreeMap::new(),
-        params: BTreeMap::new(),
-        outputs: BTreeMap::new(),
-    }
-}
-
-fn set_step_field(
-    step: &mut FlowStepDraft,
-    key: &str,
-    value: &str,
-    section: &mut Option<String>,
-) -> Result<(), StorageError> {
-    match key {
-        "id" => step.id = normalize_scalar(value),
-        "tool" => step.tool_ref = normalize_scalar(value),
-        "needs" => step.needs = parse_inline_list(value),
-        "reason" => step.reason = Some(normalize_scalar(value)),
-        "inputs" | "params" | "outputs" if value.is_empty() => {
-            *section = Some(key.to_string());
-        }
-        "inputs" | "params" | "outputs" => {
-            return Err(StorageError::InvalidInput(format!(
-                "{key} must be a nested map in agentflow.flow.v0"
-            )));
-        }
-        _ => {
-            return Err(StorageError::InvalidInput(format!(
-                "unsupported flow step field {key}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn insert_section_value(step: &mut FlowStepDraft, section: &str, key: &str, value: &str) {
-    let value = normalize_scalar(value);
-    match section {
-        "inputs" => {
-            step.inputs.insert(key.to_string(), value);
-        }
-        "params" => {
-            step.params.insert(key.to_string(), value);
-        }
-        "outputs" => {
-            step.outputs.insert(key.to_string(), value);
-        }
-        _ => {}
-    }
-}
-
-fn finalize_step(step: FlowStepDraft) -> Result<FlowStepDraft, StorageError> {
-    if step.id.trim().is_empty() {
-        return Err(StorageError::InvalidInput(
-            "flow step is missing id".to_string(),
-        ));
-    }
-    Ok(step)
-}
-
-fn parse_inline_list(input: &str) -> Vec<String> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() || trimmed == "[]" {
-        return Vec::new();
-    }
-    let inner = trimmed
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(trimmed);
-    inner
-        .split(',')
-        .map(normalize_scalar)
-        .filter(|value| !value.is_empty())
-        .collect()
-}
-
 fn has_cycle(steps: &[FlowStepDraft]) -> bool {
     let graph = steps
         .iter()
@@ -872,18 +809,6 @@ fn validate_ref_part(label: &str, value: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn normalize_scalar(input: &str) -> String {
-    let trimmed = input.trim();
-    if trimmed.len() >= 2
-        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
-            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
-    {
-        trimmed[1..trimmed.len() - 1].to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 fn map_json(map: &BTreeMap<String, String>) -> String {
     let fields = map
         .iter()
@@ -912,15 +837,6 @@ fn optional_json_string(value: Option<&str>) -> String {
         || "null".to_string(),
         |inner| format!("\"{}\"", escape_json(inner)),
     )
-}
-
-fn required_field(
-    fields: &BTreeMap<String, String>,
-    field_name: &str,
-) -> Result<String, StorageError> {
-    fields.get(field_name).cloned().ok_or_else(|| {
-        StorageError::InvalidInput(format!("flow spec is missing required field {field_name}"))
-    })
 }
 
 fn escape_json(input: &str) -> String {
@@ -1050,6 +966,72 @@ steps:
             draft.steps[0].inputs.get("expression_table").unwrap(),
             "artifact_1"
         );
+    }
+
+    #[test]
+    fn parses_inline_flow_yaml_equivalent_to_block_form() {
+        let block = FlowDraft::from_simple_yaml(
+            r#"
+schema_version: agentflow.flow.v0
+id: inline_demo
+name: Inline demo
+steps:
+  - id: prep
+    tool: marker/prep
+    needs: []
+    inputs:
+      expr: artifact_1
+    params:
+      gene: TP53
+    outputs:
+      report: prep_report
+  - id: scan
+    tool: marker/scan
+    needs:
+      - prep
+      - qc
+    inputs:
+      expr: prep.report
+    params:
+      gene: TP53
+    outputs:
+      report: marker_report
+"#,
+        )
+        .unwrap();
+        let mut inline = FlowDraft::from_simple_yaml(
+            r#"
+schema_version: agentflow.flow.v0
+id: inline_demo
+name: Inline demo
+steps:
+  - {id: prep, tool: marker/prep, needs: [], inputs: {expr: artifact_1}, params: {gene: TP53}, outputs: {report: prep_report}}
+  - {id: scan, tool: marker/scan, needs: [prep, qc], inputs: {expr: prep.report}, params: {gene: TP53}, outputs: {report: marker_report}}
+"#,
+        )
+        .unwrap();
+
+        inline.source_text = block.source_text.clone();
+        assert_eq!(inline, block);
+    }
+
+    #[test]
+    fn flow_yaml_validation_errors_are_invalid_input_with_location() {
+        let err = FlowDraft::from_simple_yaml(
+            r#"
+schema_version: agentflow.flow.v0
+id: bad id
+name: Bad flow
+steps: []
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, StorageError::InvalidInput(_)));
+        let message = err.to_string();
+        assert!(message.contains("flow id"), "{message}");
+        assert!(message.contains("line"), "{message}");
+        assert!(message.contains("column"), "{message}");
     }
 
     #[test]

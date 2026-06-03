@@ -2,11 +2,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use rusqlite::{params, OptionalExtension};
+use serde::Deserialize;
 
 use crate::domain::ToolMaturity;
 
 use super::migrations;
 use super::project_store::{now_unix_seconds, EventRecord, ProjectStore, StorageError};
+use super::yaml;
 
 const DEFAULT_NAMESPACE: &str = "local";
 const SIMPLE_YAML_SOURCE_FORMAT: &str = "agentflow.tool.v0.simple_yaml";
@@ -67,40 +69,62 @@ pub struct ExecutableToolSpec {
 
 impl ToolSpec {
     pub fn from_simple_yaml(source_text: &str) -> Result<Self, StorageError> {
-        let fields = parse_top_level_fields(source_text);
-        let schema_version = required_field(&fields, "schema_version")?;
+        let raw = yaml::parse_yaml::<RawToolSpec>("tool", source_text)?;
+        let schema_version =
+            required_tool_field(raw.schema_version.clone(), "schema_version", source_text)?;
         if schema_version != agentflow_schemas::TOOL_SCHEMA_V0 {
-            return Err(StorageError::InvalidInput(format!(
-                "tool schema_version must be {}",
-                agentflow_schemas::TOOL_SCHEMA_V0
-            )));
+            return Err(yaml::invalid_input_at_field(
+                source_text,
+                "schema_version",
+                format!(
+                    "tool schema_version must be {}",
+                    agentflow_schemas::TOOL_SCHEMA_V0
+                ),
+            ));
         }
 
-        let namespace = fields
-            .get("namespace")
-            .cloned()
+        let namespace = raw
+            .namespace
+            .clone()
+            .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_NAMESPACE.to_string());
-        let name = required_field(&fields, "name")?;
-        let version = required_field(&fields, "version")?;
-        let maturity_name = required_field(&fields, "maturity")?;
-        let description = required_field(&fields, "description")?;
+        let name = required_tool_field(raw.name.clone(), "name", source_text)?;
+        let version = required_tool_field(raw.version.clone(), "version", source_text)?;
+        let maturity_name = required_tool_field(raw.maturity.clone(), "maturity", source_text)?;
+        let description = required_tool_field(raw.description.clone(), "description", source_text)?;
         let maturity = ToolMaturity::parse(&maturity_name).ok_or_else(|| {
-            StorageError::InvalidInput(format!(
-                "maturity must be one of: verified, wrapped, exploratory; got {maturity_name}"
-            ))
+            yaml::invalid_input_at_field(
+                source_text,
+                "maturity",
+                format!(
+                    "maturity must be one of: verified, wrapped, exploratory; got {maturity_name}"
+                ),
+            )
         })?;
 
-        validate_ref_part("namespace", &namespace)?;
-        validate_ref_part("name", &name)?;
-        validate_ref_part("version", &version)?;
-        let validator_profile = fields.get("validator_profile").cloned();
+        validate_ref_part("namespace", &namespace)
+            .map_err(|error| yaml::with_field_location(source_text, "namespace", error))?;
+        validate_ref_part("name", &name)
+            .map_err(|error| yaml::with_field_location(source_text, "name", error))?;
+        validate_ref_part("version", &version)
+            .map_err(|error| yaml::with_field_location(source_text, "version", error))?;
+        let validator_profile = raw
+            .validator_profile
+            .clone()
+            .filter(|value| !value.is_empty());
         if let Some(profile) = validator_profile.as_deref() {
-            validate_validator_profile(profile)?;
+            validate_validator_profile(profile).map_err(|error| {
+                yaml::with_field_location(source_text, "validator_profile", error)
+            })?;
         }
-        let mut executable = parse_executable_sections(source_text)?;
-        apply_tool_validator_profile(validator_profile.as_deref(), &mut executable.inputs)?;
-        apply_input_profiles(&mut executable.inputs)?;
-        executable.validate()?;
+        let mut executable = raw.into_executable_sections(source_text)?;
+        apply_tool_validator_profile(validator_profile.as_deref(), &mut executable.inputs)
+            .map_err(|error| yaml::with_field_location(source_text, "validator_profile", error))?;
+        apply_input_profiles(&mut executable.inputs)
+            .map_err(|error| yaml::with_field_location(source_text, "profile", error))?;
+        executable
+            .validate()
+            .map_err(|error| yaml::with_field_location(source_text, "runtime", error))?;
 
         Ok(Self {
             schema_version,
@@ -212,6 +236,333 @@ impl ToolSpec {
             escape_json(&self.source_text)
         )
     }
+}
+
+#[derive(Deserialize)]
+struct RawToolSpec {
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    schema_version: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    namespace: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    name: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    version: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    maturity: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    description: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    validator_profile: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_default_map")]
+    inputs: BTreeMap<String, Option<RawToolPortSpec>>,
+    #[serde(default, deserialize_with = "yaml::deserialize_default_map")]
+    params: BTreeMap<String, Option<RawToolParamSpec>>,
+    #[serde(default, deserialize_with = "yaml::deserialize_default_map")]
+    outputs: BTreeMap<String, Option<RawToolPortSpec>>,
+    #[serde(default)]
+    runtime: Option<RawToolRuntimeSpec>,
+}
+
+impl RawToolSpec {
+    fn into_executable_sections(
+        self,
+        source_text: &str,
+    ) -> Result<ParsedExecutableSections, StorageError> {
+        let inputs = self
+            .inputs
+            .into_iter()
+            .map(|(name, raw)| {
+                validate_ref_part("tool section item", &name)
+                    .map_err(|error| yaml::with_field_location(source_text, &name, error))?;
+                let port = raw.unwrap_or_default().into_input_port(source_text)?;
+                Ok((name, port))
+            })
+            .collect::<Result<BTreeMap<_, _>, StorageError>>()?;
+        let params = self
+            .params
+            .into_iter()
+            .map(|(name, raw)| {
+                validate_ref_part("tool section item", &name)
+                    .map_err(|error| yaml::with_field_location(source_text, &name, error))?;
+                let param = raw.unwrap_or_default().into_param();
+                Ok((name, param))
+            })
+            .collect::<Result<BTreeMap<_, _>, StorageError>>()?;
+        let outputs = self
+            .outputs
+            .into_iter()
+            .map(|(name, raw)| {
+                validate_ref_part("tool section item", &name)
+                    .map_err(|error| yaml::with_field_location(source_text, &name, error))?;
+                let port = raw.unwrap_or_default().into_output_port(source_text)?;
+                Ok((name, port))
+            })
+            .collect::<Result<BTreeMap<_, _>, StorageError>>()?;
+        let runtime = self.runtime.unwrap_or_default().into_runtime(source_text)?;
+
+        Ok(ParsedExecutableSections {
+            inputs,
+            params,
+            outputs,
+            runtime,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawToolPortSpec {
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "yaml::deserialize_optional_scalar_string"
+    )]
+    type_name: Option<String>,
+    #[serde(
+        default = "default_true",
+        deserialize_with = "yaml::deserialize_bool_like"
+    )]
+    required: bool,
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    observer: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    profile: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    min_rows: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_required_columns")]
+    required_columns: Vec<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    sample_id_column: Option<String>,
+}
+
+impl Default for RawToolPortSpec {
+    fn default() -> Self {
+        Self {
+            type_name: None,
+            required: true,
+            observer: None,
+            profile: None,
+            min_rows: None,
+            required_columns: Vec::new(),
+            sample_id_column: None,
+        }
+    }
+}
+
+impl RawToolPortSpec {
+    fn into_input_port(self, source_text: &str) -> Result<ToolPortSpec, StorageError> {
+        if self.observer.is_some() {
+            return Err(yaml::invalid_input_at_field(
+                source_text,
+                "observer",
+                "observer is only supported on output ports",
+            ));
+        }
+        let profile = self
+            .profile
+            .map(|profile| {
+                validate_input_profile(&profile)
+                    .map(|_| profile)
+                    .map_err(|error| yaml::with_field_location(source_text, "profile", error))
+            })
+            .transpose()?;
+        let min_rows = self
+            .min_rows
+            .map(|value| {
+                parse_usize_field("min_rows", &value)
+                    .map_err(|error| yaml::with_field_location(source_text, "min_rows", error))
+            })
+            .transpose()?;
+        let required_columns = parse_raw_columns(self.required_columns)
+            .map_err(|error| yaml::with_field_location(source_text, "required_columns", error))?;
+        let sample_id_column = self
+            .sample_id_column
+            .map(|value| {
+                parse_column_name(&value).map_err(|error| {
+                    yaml::with_field_location(source_text, "sample_id_column", error)
+                })
+            })
+            .transpose()?;
+
+        Ok(ToolPortSpec {
+            type_name: self.type_name.unwrap_or_default(),
+            required: self.required,
+            observer: None,
+            profile,
+            min_rows,
+            required_columns,
+            sample_id_column,
+        })
+    }
+
+    fn into_output_port(self, source_text: &str) -> Result<ToolPortSpec, StorageError> {
+        if self.profile.is_some() {
+            return Err(yaml::invalid_input_at_field(
+                source_text,
+                "profile",
+                "profile is only supported on input ports",
+            ));
+        }
+        if self.sample_id_column.is_some() {
+            return Err(yaml::invalid_input_at_field(
+                source_text,
+                "sample_id_column",
+                "sample_id_column is only supported on input ports",
+            ));
+        }
+        let observer = self
+            .observer
+            .map(|observer| {
+                validate_observer_adapter(&observer)
+                    .map(|_| observer)
+                    .map_err(|error| yaml::with_field_location(source_text, "observer", error))
+            })
+            .transpose()?;
+        let min_rows = self
+            .min_rows
+            .map(|value| {
+                parse_usize_field("min_rows", &value)
+                    .map_err(|error| yaml::with_field_location(source_text, "min_rows", error))
+            })
+            .transpose()?;
+        let required_columns = parse_raw_columns(self.required_columns)
+            .map_err(|error| yaml::with_field_location(source_text, "required_columns", error))?;
+
+        Ok(ToolPortSpec {
+            type_name: self.type_name.unwrap_or_default(),
+            required: self.required,
+            observer,
+            profile: None,
+            min_rows,
+            required_columns,
+            sample_id_column: None,
+        })
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawToolParamSpec {
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "yaml::deserialize_optional_scalar_string"
+    )]
+    type_name: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_bool_like")]
+    required: bool,
+}
+
+impl RawToolParamSpec {
+    fn into_param(self) -> ToolParamSpec {
+        ToolParamSpec {
+            type_name: self.type_name.unwrap_or_default(),
+            required: self.required,
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawToolRuntimeSpec {
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    backend: Option<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_string_vec")]
+    command: Vec<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    timeout_seconds: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "yaml::deserialize_optional_present_scalar_string"
+    )]
+    env_name: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "yaml::deserialize_optional_present_scalar_string"
+    )]
+    env_prefix: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "yaml::deserialize_optional_present_scalar_string"
+    )]
+    env_file: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "yaml::deserialize_optional_present_scalar_string"
+    )]
+    runner: Option<String>,
+}
+
+impl RawToolRuntimeSpec {
+    fn into_runtime(self, source_text: &str) -> Result<ToolRuntimeSpec, StorageError> {
+        Ok(ToolRuntimeSpec {
+            backend: self.backend.unwrap_or_default(),
+            command: self.command,
+            timeout_seconds: self
+                .timeout_seconds
+                .map(|value| {
+                    parse_u64_field("runtime.timeout_seconds", &value).map_err(|error| {
+                        yaml::with_field_location(source_text, "timeout_seconds", error)
+                    })
+                })
+                .transpose()?,
+            env_name: self
+                .env_name
+                .map(|value| {
+                    parse_runtime_string("runtime.env_name", &value)
+                        .map_err(|error| yaml::with_field_location(source_text, "env_name", error))
+                })
+                .transpose()?,
+            env_prefix: self
+                .env_prefix
+                .map(|value| {
+                    parse_runtime_string("runtime.env_prefix", &value).map_err(|error| {
+                        yaml::with_field_location(source_text, "env_prefix", error)
+                    })
+                })
+                .transpose()?,
+            env_file: self
+                .env_file
+                .map(|value| {
+                    parse_runtime_string("runtime.env_file", &value)
+                        .map_err(|error| yaml::with_field_location(source_text, "env_file", error))
+                })
+                .transpose()?,
+            runner: self
+                .runner
+                .map(|value| {
+                    parse_runtime_string("runtime.runner", &value)
+                        .map_err(|error| yaml::with_field_location(source_text, "runner", error))
+                })
+                .transpose()?,
+        })
+    }
+}
+
+fn required_tool_field(
+    value: Option<String>,
+    field_name: &str,
+    source_text: &str,
+) -> Result<String, StorageError> {
+    value.filter(|value| !value.is_empty()).ok_or_else(|| {
+        yaml::invalid_input_at_field(
+            source_text,
+            field_name,
+            format!("tool spec is missing required field {field_name}"),
+        )
+    })
+}
+
+fn parse_raw_columns(columns: Vec<String>) -> Result<Vec<String>, StorageError> {
+    columns
+        .into_iter()
+        .map(|column| parse_column_name_with_label("required_columns", &column))
+        .collect()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 struct ParsedExecutableSections {
@@ -556,303 +907,6 @@ impl ParsedToolRef {
             name: name.to_string(),
             version,
         })
-    }
-}
-
-fn parse_top_level_fields(source_text: &str) -> BTreeMap<String, String> {
-    let mut fields = BTreeMap::new();
-
-    for line in source_text.lines() {
-        let without_comment = line.split_once('#').map_or(line, |(left, _)| left);
-        if without_comment.trim().is_empty() || line.starts_with(char::is_whitespace) {
-            continue;
-        }
-        let Some((key, value)) = without_comment.split_once(':') else {
-            continue;
-        };
-        let key = key.trim();
-        let value = normalize_scalar(value.trim());
-        if !key.is_empty() && !value.is_empty() {
-            fields.insert(key.to_string(), value);
-        }
-    }
-
-    fields
-}
-
-fn parse_executable_sections(source_text: &str) -> Result<ParsedExecutableSections, StorageError> {
-    let mut inputs: BTreeMap<String, ToolPortSpec> = BTreeMap::new();
-    let mut params: BTreeMap<String, ToolParamSpec> = BTreeMap::new();
-    let mut outputs: BTreeMap<String, ToolPortSpec> = BTreeMap::new();
-    let mut runtime = ToolRuntimeSpec {
-        backend: String::new(),
-        command: Vec::new(),
-        timeout_seconds: None,
-        env_name: None,
-        env_prefix: None,
-        env_file: None,
-        runner: None,
-    };
-    let mut section: Option<String> = None;
-    let mut item: Option<String> = None;
-    let mut in_runtime_command = false;
-
-    for line in source_text.lines() {
-        let without_comment = line.split_once('#').map_or(line, |(left, _)| left);
-        if without_comment.trim().is_empty() {
-            continue;
-        }
-        let indent = without_comment
-            .chars()
-            .take_while(|ch| ch.is_whitespace())
-            .count();
-        let trimmed = without_comment.trim();
-
-        if indent == 0 {
-            in_runtime_command = false;
-            item = None;
-            let key = trimmed
-                .split_once(':')
-                .map_or(trimmed, |(key, _)| key)
-                .trim();
-            section = match key {
-                "inputs" | "params" | "outputs" | "runtime" => Some(key.to_string()),
-                _ => None,
-            };
-            continue;
-        }
-
-        match section.as_deref() {
-            Some("inputs") | Some("outputs") | Some("params") => {
-                let section_name = section.as_deref().unwrap();
-                if indent == 2 {
-                    let key = trimmed.trim_end_matches(':').trim();
-                    validate_ref_part("tool section item", key)?;
-                    item = Some(key.to_string());
-                    match section_name {
-                        "inputs" => {
-                            inputs.entry(key.to_string()).or_insert(ToolPortSpec {
-                                type_name: String::new(),
-                                required: true,
-                                observer: None,
-                                profile: None,
-                                min_rows: None,
-                                required_columns: Vec::new(),
-                                sample_id_column: None,
-                            });
-                        }
-                        "outputs" => {
-                            outputs.entry(key.to_string()).or_insert(ToolPortSpec {
-                                type_name: String::new(),
-                                required: true,
-                                observer: None,
-                                profile: None,
-                                min_rows: None,
-                                required_columns: Vec::new(),
-                                sample_id_column: None,
-                            });
-                        }
-                        "params" => {
-                            params.entry(key.to_string()).or_insert(ToolParamSpec {
-                                type_name: String::new(),
-                                required: false,
-                            });
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-
-                if indent >= 4 {
-                    let Some(item_name) = item.as_deref() else {
-                        return Err(StorageError::InvalidInput(format!(
-                            "{section_name} field appears before item name"
-                        )));
-                    };
-                    let Some((key, value)) = trimmed.split_once(':') else {
-                        return Err(StorageError::InvalidInput(format!(
-                            "cannot parse tool {section_name} line: {trimmed}"
-                        )));
-                    };
-                    set_tool_item_field(
-                        section_name,
-                        item_name,
-                        key.trim(),
-                        normalize_scalar(value.trim()),
-                        &mut inputs,
-                        &mut params,
-                        &mut outputs,
-                    )?;
-                }
-            }
-            Some("runtime") => {
-                if indent == 2 {
-                    let Some((key, value)) = trimmed.split_once(':') else {
-                        return Err(StorageError::InvalidInput(format!(
-                            "cannot parse runtime line: {trimmed}"
-                        )));
-                    };
-                    match key.trim() {
-                        "backend" => {
-                            runtime.backend = normalize_scalar(value.trim());
-                            in_runtime_command = false;
-                        }
-                        "command" => {
-                            if !value.trim().is_empty() {
-                                return Err(StorageError::InvalidInput(
-                                    "runtime.command must be a nested argv list".to_string(),
-                                ));
-                            }
-                            in_runtime_command = true;
-                        }
-                        "timeout_seconds" => {
-                            runtime.timeout_seconds = Some(parse_u64_field(
-                                "runtime.timeout_seconds",
-                                &normalize_scalar(value.trim()),
-                            )?);
-                            in_runtime_command = false;
-                        }
-                        "env_name" => {
-                            runtime.env_name =
-                                Some(parse_runtime_string("runtime.env_name", value)?);
-                            in_runtime_command = false;
-                        }
-                        "env_prefix" => {
-                            runtime.env_prefix =
-                                Some(parse_runtime_string("runtime.env_prefix", value)?);
-                            in_runtime_command = false;
-                        }
-                        "env_file" => {
-                            runtime.env_file =
-                                Some(parse_runtime_string("runtime.env_file", value)?);
-                            in_runtime_command = false;
-                        }
-                        "runner" => {
-                            runtime.runner = Some(parse_runtime_string("runtime.runner", value)?);
-                            in_runtime_command = false;
-                        }
-                        other => {
-                            return Err(StorageError::InvalidInput(format!(
-                                "unsupported runtime field {other}"
-                            )));
-                        }
-                    }
-                    continue;
-                }
-
-                if indent >= 4 && in_runtime_command {
-                    let Some(value) = trimmed.strip_prefix("- ") else {
-                        return Err(StorageError::InvalidInput(format!(
-                            "runtime.command entries must use - value syntax: {trimmed}"
-                        )));
-                    };
-                    runtime.command.push(normalize_scalar(value));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(ParsedExecutableSections {
-        inputs,
-        params,
-        outputs,
-        runtime,
-    })
-}
-
-fn set_tool_item_field(
-    section: &str,
-    item_name: &str,
-    key: &str,
-    value: String,
-    inputs: &mut BTreeMap<String, ToolPortSpec>,
-    params: &mut BTreeMap<String, ToolParamSpec>,
-    outputs: &mut BTreeMap<String, ToolPortSpec>,
-) -> Result<(), StorageError> {
-    match section {
-        "inputs" => {
-            let port = inputs.get_mut(item_name).ok_or_else(|| {
-                StorageError::InvalidInput(format!("unknown input item {item_name}"))
-            })?;
-            match key {
-                "type" => port.type_name = value,
-                "required" => port.required = parse_bool(&value)?,
-                "observer" => {
-                    return Err(StorageError::InvalidInput(
-                        "observer is only supported on output ports".to_string(),
-                    ));
-                }
-                "profile" => {
-                    validate_input_profile(&value)?;
-                    port.profile = Some(value);
-                }
-                "min_rows" => port.min_rows = Some(parse_usize_field("min_rows", &value)?),
-                "required_columns" => port.required_columns = parse_columns(&value)?,
-                "sample_id_column" => port.sample_id_column = Some(parse_column_name(&value)?),
-                other => {
-                    return Err(StorageError::InvalidInput(format!(
-                        "unsupported input field {other}"
-                    )));
-                }
-            }
-        }
-        "outputs" => {
-            let port = outputs.get_mut(item_name).ok_or_else(|| {
-                StorageError::InvalidInput(format!("unknown output item {item_name}"))
-            })?;
-            match key {
-                "type" => port.type_name = value,
-                "required" => port.required = parse_bool(&value)?,
-                "observer" => {
-                    validate_observer_adapter(&value)?;
-                    port.observer = Some(value);
-                }
-                "profile" => {
-                    return Err(StorageError::InvalidInput(
-                        "profile is only supported on input ports".to_string(),
-                    ));
-                }
-                "min_rows" => port.min_rows = Some(parse_usize_field("min_rows", &value)?),
-                "required_columns" => port.required_columns = parse_columns(&value)?,
-                "sample_id_column" => {
-                    return Err(StorageError::InvalidInput(
-                        "sample_id_column is only supported on input ports".to_string(),
-                    ));
-                }
-                other => {
-                    return Err(StorageError::InvalidInput(format!(
-                        "unsupported output field {other}"
-                    )));
-                }
-            }
-        }
-        "params" => {
-            let param = params.get_mut(item_name).ok_or_else(|| {
-                StorageError::InvalidInput(format!("unknown param item {item_name}"))
-            })?;
-            match key {
-                "type" => param.type_name = value,
-                "required" => param.required = parse_bool(&value)?,
-                other => {
-                    return Err(StorageError::InvalidInput(format!(
-                        "unsupported param field {other}"
-                    )));
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn parse_bool(value: &str) -> Result<bool, StorageError> {
-    match value {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(StorageError::InvalidInput(format!(
-            "expected boolean true or false, got {value}"
-        ))),
     }
 }
 
@@ -1287,15 +1341,6 @@ fn executable_from_stored_json(
     }
     .validate()?;
     Ok(executable)
-}
-
-fn required_field(
-    fields: &BTreeMap<String, String>,
-    field_name: &str,
-) -> Result<String, StorageError> {
-    fields.get(field_name).cloned().ok_or_else(|| {
-        StorageError::InvalidInput(format!("tool spec is missing required field {field_name}"))
-    })
 }
 
 fn normalize_scalar(input: &str) -> String {
@@ -1744,6 +1789,102 @@ runtime:
         assert_eq!(spec.outputs["report"].type_name, "Markdown");
         assert_eq!(spec.runtime.backend, "local");
         assert_eq!(spec.runtime.command, ["/bin/echo"]);
+    }
+
+    #[test]
+    fn parses_inline_tool_yaml_equivalent_to_block_form() {
+        let block = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: inline_equivalent
+version: 0.1.0
+maturity: wrapped
+description: Inline-equivalent tool
+inputs:
+  expression_table:
+    type: TSV
+    required: true
+    required_columns: sample,TP53
+params:
+  gene:
+    type: string
+    required: true
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - x.sh
+"#,
+        )
+        .unwrap();
+        let mut inline = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: inline_equivalent
+version: 0.1.0
+maturity: wrapped
+description: Inline-equivalent tool
+inputs: {expression_table: {type: TSV, required: true, required_columns: [sample, TP53]}}
+params: {gene: {type: string, required: true}}
+outputs: {report: {type: Markdown}}
+runtime:
+  backend: local
+  command: [/bin/sh, x.sh]
+"#,
+        )
+        .unwrap();
+
+        inline.source_text = block.source_text.clone();
+        assert_eq!(inline, block);
+    }
+
+    #[test]
+    fn yaml_parse_errors_are_invalid_input_with_location() {
+        let err = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: broken
+runtime: [unterminated
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, StorageError::InvalidInput(_)));
+        let message = err.to_string();
+        assert!(message.contains("line"), "{message}");
+        assert!(message.contains("column"), "{message}");
+    }
+
+    #[test]
+    fn yaml_validation_errors_are_invalid_input_with_location() {
+        let err = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: bad_maturity
+version: 0.1.0
+maturity: magic
+description: Bad maturity
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, StorageError::InvalidInput(_)));
+        let message = err.to_string();
+        assert!(message.contains("maturity"), "{message}");
+        assert!(message.contains("line"), "{message}");
+        assert!(message.contains("column"), "{message}");
     }
 
     #[test]

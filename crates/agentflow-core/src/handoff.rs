@@ -1,13 +1,15 @@
 use std::fmt;
 
 use rusqlite::params;
+use serde::{Deserialize, Serialize};
 
 use crate::storage::{EventRecord, ProjectStore, StorageError};
 
 const DECISION_POINT_RAISED_EVENT: &str = "handoff.decision_point_raised";
 const USER_RESOLVED_EVENT: &str = "handoff.user_resolved";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Cost {
     Cheap,
     Moderate,
@@ -39,7 +41,8 @@ impl fmt::Display for Cost {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Risk {
     Low,
     Medium,
@@ -71,7 +74,8 @@ impl fmt::Display for Risk {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DecisionKind {
     DeepenOrStop,
     PremiseChallenged,
@@ -118,7 +122,7 @@ pub enum TaskClass {
     Decision,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffOption {
     pub label: String,
     pub direction: String,
@@ -127,7 +131,7 @@ pub struct HandoffOption {
     pub reversible: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionPoint {
     pub id: String,
     pub kind: DecisionKind,
@@ -139,13 +143,31 @@ pub struct DecisionPoint {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DecisionStatus {
     Pending,
     Resolved,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl DecisionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Resolved => "resolved",
+        }
+    }
+
+    pub fn parse(input: &str) -> Option<Self> {
+        match input {
+            "pending" => Some(Self::Pending),
+            "resolved" => Some(Self::Resolved),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resolution {
     pub chosen_index: usize,
     pub note: String,
@@ -154,28 +176,7 @@ pub struct Resolution {
 
 impl DecisionPoint {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"id\":\"{}\",",
-                "\"kind\":\"{}\",",
-                "\"digest\":\"{}\",",
-                "\"options\":{},",
-                "\"recommendation\":{},",
-                "\"status\":\"{}\",",
-                "\"resolution\":{},",
-                "\"created_at\":{}",
-                "}}"
-            ),
-            escape_json(&self.id),
-            self.kind.as_str(),
-            escape_json(&self.digest),
-            handoff_options_json(&self.options),
-            self.recommendation,
-            decision_status_as_str(self.status),
-            resolution_json(self.resolution.as_ref()),
-            self.created_at
-        )
+        serde_json::to_string(self).expect("decision point serializes to JSON")
     }
 }
 
@@ -276,13 +277,12 @@ impl ProjectStore {
                     )?);
                 }
                 USER_RESOLVED_EVENT => {
-                    let decision_point_id =
-                        required_json_string(&event_id, &payload_json, "decision_point_id")?;
+                    let payload = resolution_payload_from_json(&event_id, &payload_json)?;
                     if let Some(point) = points
                         .iter_mut()
-                        .find(|point: &&mut DecisionPoint| point.id == decision_point_id)
+                        .find(|point: &&mut DecisionPoint| point.id == payload.decision_point_id)
                     {
-                        apply_resolution(point, &event_id, &payload_json, created_at)?;
+                        apply_resolution(point, &event_id, payload, created_at)?;
                     }
                 }
                 _ => {}
@@ -368,107 +368,65 @@ fn validate_non_empty<'a>(label: &str, value: &'a str) -> Result<&'a str, Storag
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct DecisionPointPayload {
+    kind: DecisionKind,
+    digest: String,
+    options: Vec<HandoffOption>,
+    recommendation: usize,
+}
+
 fn decision_point_payload_json(
     kind: DecisionKind,
     digest: &str,
     options: &[HandoffOption],
     recommendation: usize,
 ) -> String {
-    let options_json = options
-        .iter()
-        .map(handoff_option_payload_json)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "{{\"kind\":\"{}\",\"digest\":\"{}\",\"options\":[{}],\"recommendation\":{}}}",
-        kind.as_str(),
-        escape_json(digest),
-        options_json,
-        recommendation
-    )
+    serde_json::to_string(&DecisionPointPayload {
+        kind,
+        digest: digest.to_string(),
+        options: options.to_vec(),
+        recommendation,
+    })
+    .expect("decision point payload serializes to JSON")
 }
 
-fn handoff_option_payload_json(option: &HandoffOption) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"label\":\"{}\",",
-            "\"direction\":\"{}\",",
-            "\"cost\":\"{}\",",
-            "\"risk\":\"{}\",",
-            "\"reversible\":{}",
-            "}}"
-        ),
-        escape_json(&option.label),
-        escape_json(&option.direction),
-        option.cost.as_str(),
-        option.risk.as_str(),
-        option.reversible
-    )
+fn decision_point_payload_from_json(
+    event_id: &str,
+    payload_json: &str,
+) -> Result<DecisionPointPayload, StorageError> {
+    serde_json::from_str(payload_json).map_err(|err| {
+        StorageError::InvalidInput(format!(
+            "decision point event {event_id} has invalid payload: {err}"
+        ))
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ResolutionPayload {
+    decision_point_id: String,
+    chosen_index: usize,
+    note: String,
 }
 
 fn resolution_payload_json(decision_point_id: &str, chosen_index: usize, note: &str) -> String {
-    format!(
-        "{{\"decision_point_id\":\"{}\",\"chosen_index\":{},\"note\":\"{}\"}}",
-        escape_json(decision_point_id),
+    serde_json::to_string(&ResolutionPayload {
+        decision_point_id: decision_point_id.to_string(),
         chosen_index,
-        escape_json(note)
-    )
+        note: note.to_string(),
+    })
+    .expect("resolution payload serializes to JSON")
 }
 
-fn decision_status_as_str(status: DecisionStatus) -> &'static str {
-    match status {
-        DecisionStatus::Pending => "pending",
-        DecisionStatus::Resolved => "resolved",
-    }
-}
-
-fn handoff_options_json(options: &[HandoffOption]) -> String {
-    let items = options
-        .iter()
-        .map(handoff_option_json)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{items}]")
-}
-
-fn handoff_option_json(option: &HandoffOption) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"label\":\"{}\",",
-            "\"direction\":\"{}\",",
-            "\"cost\":\"{}\",",
-            "\"risk\":\"{}\",",
-            "\"reversible\":{}",
-            "}}"
-        ),
-        escape_json(&option.label),
-        escape_json(&option.direction),
-        option.cost.as_str(),
-        option.risk.as_str(),
-        option.reversible
-    )
-}
-
-fn resolution_json(resolution: Option<&Resolution>) -> String {
-    resolution.map_or_else(
-        || "null".to_string(),
-        |resolution| {
-            format!(
-                concat!(
-                    "{{",
-                    "\"chosen_index\":{},",
-                    "\"note\":\"{}\",",
-                    "\"resolved_at\":{}",
-                    "}}"
-                ),
-                resolution.chosen_index,
-                escape_json(&resolution.note),
-                resolution.resolved_at
-            )
-        },
-    )
+fn resolution_payload_from_json(
+    event_id: &str,
+    payload_json: &str,
+) -> Result<ResolutionPayload, StorageError> {
+    serde_json::from_str(payload_json).map_err(|err| {
+        StorageError::InvalidInput(format!(
+            "handoff resolution {event_id} has invalid payload: {err}"
+        ))
+    })
 }
 
 fn decision_point_from_raised_event(
@@ -476,18 +434,15 @@ fn decision_point_from_raised_event(
     payload_json: &str,
     created_at: i64,
 ) -> Result<DecisionPoint, StorageError> {
-    let kind = parse_decision_kind(&id, payload_json, "kind")?;
-    let digest = required_json_string(&id, payload_json, "digest")?;
-    let options = parse_options(&id, payload_json)?;
-    let recommendation = required_json_usize(&id, payload_json, "recommendation")?;
-    validate_raise_input(&digest, &options, recommendation)?;
+    let payload = decision_point_payload_from_json(&id, payload_json)?;
+    validate_raise_input(&payload.digest, &payload.options, payload.recommendation)?;
 
     Ok(DecisionPoint {
         id,
-        kind,
-        digest,
-        options,
-        recommendation,
+        kind: payload.kind,
+        digest: payload.digest,
+        options: payload.options,
+        recommendation: payload.recommendation,
         status: DecisionStatus::Pending,
         resolution: None,
         created_at,
@@ -497,262 +452,33 @@ fn decision_point_from_raised_event(
 fn apply_resolution(
     point: &mut DecisionPoint,
     event_id: &str,
-    payload_json: &str,
+    payload: ResolutionPayload,
     created_at: i64,
 ) -> Result<(), StorageError> {
     if point.status == DecisionStatus::Resolved {
         return Ok(());
     }
 
-    let chosen_index = required_json_usize(event_id, payload_json, "chosen_index")?;
-    if chosen_index >= point.options.len() {
+    if payload.chosen_index >= point.options.len() {
         return Err(StorageError::InvalidInput(format!(
-            "handoff resolution {event_id} has invalid chosen_index {chosen_index}"
+            "handoff resolution {event_id} has invalid chosen_index {}",
+            payload.chosen_index
         )));
     }
     point.status = DecisionStatus::Resolved;
     point.resolution = Some(Resolution {
-        chosen_index,
-        note: required_json_string(event_id, payload_json, "note")?,
+        chosen_index: payload.chosen_index,
+        note: payload.note,
         resolved_at: created_at,
     });
     Ok(())
-}
-
-fn parse_options(event_id: &str, payload_json: &str) -> Result<Vec<HandoffOption>, StorageError> {
-    let objects = json_object_array_field(payload_json, "options").ok_or_else(|| {
-        StorageError::InvalidInput(format!(
-            "decision point event {event_id} is missing options"
-        ))
-    })?;
-    objects
-        .into_iter()
-        .map(|object| {
-            Ok(HandoffOption {
-                label: required_json_string(event_id, &object, "label")?,
-                direction: required_json_string(event_id, &object, "direction")?,
-                cost: parse_cost(event_id, &object, "cost")?,
-                risk: parse_risk(event_id, &object, "risk")?,
-                reversible: required_json_bool(event_id, &object, "reversible")?,
-            })
-        })
-        .collect()
-}
-
-fn parse_decision_kind(
-    event_id: &str,
-    payload_json: &str,
-    field: &str,
-) -> Result<DecisionKind, StorageError> {
-    let value = required_json_string(event_id, payload_json, field)?;
-    DecisionKind::parse(&value).ok_or_else(|| {
-        StorageError::InvalidInput(format!(
-            "decision point event {event_id} has invalid kind {value}"
-        ))
-    })
-}
-
-fn parse_cost(event_id: &str, payload_json: &str, field: &str) -> Result<Cost, StorageError> {
-    let value = required_json_string(event_id, payload_json, field)?;
-    Cost::parse(&value).ok_or_else(|| {
-        StorageError::InvalidInput(format!(
-            "decision point event {event_id} has invalid cost {value}"
-        ))
-    })
-}
-
-fn parse_risk(event_id: &str, payload_json: &str, field: &str) -> Result<Risk, StorageError> {
-    let value = required_json_string(event_id, payload_json, field)?;
-    Risk::parse(&value).ok_or_else(|| {
-        StorageError::InvalidInput(format!(
-            "decision point event {event_id} has invalid risk {value}"
-        ))
-    })
-}
-
-fn required_json_string(
-    event_id: &str,
-    payload_json: &str,
-    field: &str,
-) -> Result<String, StorageError> {
-    json_string_field(payload_json, field).ok_or_else(|| {
-        StorageError::InvalidInput(format!("handoff event {event_id} is missing {field}"))
-    })
-}
-
-fn required_json_usize(
-    event_id: &str,
-    payload_json: &str,
-    field: &str,
-) -> Result<usize, StorageError> {
-    json_usize_field(payload_json, field).ok_or_else(|| {
-        StorageError::InvalidInput(format!("handoff event {event_id} is missing {field}"))
-    })
-}
-
-fn required_json_bool(
-    event_id: &str,
-    payload_json: &str,
-    field: &str,
-) -> Result<bool, StorageError> {
-    json_bool_field(payload_json, field).ok_or_else(|| {
-        StorageError::InvalidInput(format!("handoff event {event_id} is missing {field}"))
-    })
-}
-
-fn json_string_field(json: &str, field: &str) -> Option<String> {
-    let marker = format!("\"{field}\":\"");
-    let start = json.find(&marker)? + marker.len();
-    let rest = &json[start..];
-    let end = find_json_string_end(rest)?;
-    Some(unescape_json_string(&rest[..end]))
-}
-
-fn json_usize_field(json: &str, field: &str) -> Option<usize> {
-    let marker = format!("\"{field}\":");
-    let start = json.find(&marker)? + marker.len();
-    let rest = &json[start..];
-    let end = rest.find([',', '}']).unwrap_or(rest.len());
-    rest[..end].trim().parse().ok()
-}
-
-fn json_bool_field(json: &str, field: &str) -> Option<bool> {
-    let marker = format!("\"{field}\":");
-    let start = json.find(&marker)? + marker.len();
-    let rest = json[start..].trim_start();
-    if rest.starts_with("true") {
-        Some(true)
-    } else if rest.starts_with("false") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn json_object_array_field(json: &str, field: &str) -> Option<Vec<String>> {
-    let marker = format!("\"{field}\":[");
-    let mut index = json.find(&marker)? + marker.len();
-    let mut objects = Vec::new();
-    loop {
-        index = skip_whitespace(json, index);
-        let next = json[index..].chars().next()?;
-        if next == ']' {
-            return Some(objects);
-        }
-        if next != '{' {
-            return None;
-        }
-        let end = find_matching_delimiter(json, index, '{', '}')?;
-        objects.push(json[index..end + 1].to_string());
-        index = skip_whitespace(json, end + 1);
-        match json[index..].chars().next()? {
-            ',' => index += 1,
-            ']' => return Some(objects),
-            _ => return None,
-        }
-    }
-}
-
-fn skip_whitespace(input: &str, mut index: usize) -> usize {
-    while let Some(ch) = input[index..].chars().next() {
-        if ch.is_whitespace() {
-            index += ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-    index
-}
-
-fn find_matching_delimiter(input: &str, start: usize, open: char, close: char) -> Option<usize> {
-    let mut depth = 0_usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (offset, ch) in input[start..].char_indices() {
-        let index = start + offset;
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if ch == '"' {
-            in_string = true;
-        } else if ch == open {
-            depth += 1;
-        } else if ch == close {
-            depth = depth.checked_sub(1)?;
-            if depth == 0 {
-                return Some(index);
-            }
-        }
-    }
-    None
-}
-
-fn find_json_string_end(input: &str) -> Option<usize> {
-    let mut escaped = false;
-    for (index, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(index),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn unescape_json_string(input: &str) -> String {
-    let mut output = String::new();
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('"') => output.push('"'),
-                Some('\\') => output.push('\\'),
-                Some('n') => output.push('\n'),
-                Some('r') => output.push('\r'),
-                Some('t') => output.push('\t'),
-                Some(other) => output.push(other),
-                None => {}
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-    output
-}
-
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => output.push(ch),
-        }
-    }
-    output
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use crate::storage::{now_unix_seconds, ProjectStore, StorageError};
+    use crate::storage::{now_unix_seconds, EventRecord, ProjectStore, StorageError};
 
     use super::{
         classify, Cost, DecisionKind, DecisionStatus, DefaultPolicy, HandoffOption,
@@ -888,6 +614,41 @@ mod tests {
     }
 
     #[test]
+    fn enum_json_strings_match_display_contract() {
+        for cost in [Cost::Cheap, Cost::Moderate, Cost::Expensive] {
+            assert_eq!(
+                serde_json::to_string(&cost).unwrap(),
+                format!("\"{}\"", cost.as_str())
+            );
+        }
+        for risk in [Risk::Low, Risk::Medium, Risk::High] {
+            assert_eq!(
+                serde_json::to_string(&risk).unwrap(),
+                format!("\"{}\"", risk.as_str())
+            );
+        }
+        for kind in [
+            DecisionKind::DeepenOrStop,
+            DecisionKind::PremiseChallenged,
+            DecisionKind::BudgetThreshold,
+            DecisionKind::GoalMutation,
+            DecisionKind::ToolGap,
+            DecisionKind::StanceAssessment,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                format!("\"{}\"", kind.as_str())
+            );
+        }
+        for status in [DecisionStatus::Pending, DecisionStatus::Resolved] {
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{}\"", status.as_str())
+            );
+        }
+    }
+
+    #[test]
     fn raise_rejects_empty_digest() {
         let path = temp_project_path("empty-digest");
         let store = ProjectStore::init(&path, Some("Handoff Demo")).unwrap();
@@ -991,6 +752,120 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn legacy_handwritten_payloads_parse_with_json_whitespace_and_ordering() {
+        let path = temp_project_path("legacy-payload");
+        let store = ProjectStore::init(&path, Some("Handoff Demo")).unwrap();
+        let decision_id = store
+            .append_event(EventRecord {
+                flow_id: None,
+                step_id: None,
+                run_id: None,
+                event_type: super::DECISION_POINT_RAISED_EVENT.to_string(),
+                payload_json: r#"{
+                    "recommendation": 1,
+                    "options": [
+                        {
+                            "risk": "medium",
+                            "reversible": true,
+                            "direction": "continue with \"extra\" evidence",
+                            "cost": "moderate",
+                            "label": "continue"
+                        },
+                        {
+                            "label": "stop",
+                            "direction": "stop and summarize",
+                            "cost": "cheap",
+                            "risk": "low",
+                            "reversible": true
+                        }
+                    ],
+                    "digest": "Legacy payload parses",
+                    "kind": "deepen_or_stop"
+                }"#
+                .to_string(),
+            })
+            .unwrap();
+        store
+            .append_event(EventRecord {
+                flow_id: None,
+                step_id: None,
+                run_id: None,
+                event_type: super::USER_RESOLVED_EVENT.to_string(),
+                payload_json: format!(
+                    r#"{{
+                        "note": "choose stop",
+                        "chosen_index": 1,
+                        "decision_point_id": "{decision_id}"
+                    }}"#
+                ),
+            })
+            .unwrap();
+
+        let inspected = store.inspect_decision_point(&decision_id).unwrap();
+        assert_eq!(inspected.kind, DecisionKind::DeepenOrStop);
+        assert_eq!(inspected.digest, "Legacy payload parses");
+        assert_eq!(inspected.options[0].label, "continue");
+        assert_eq!(inspected.options[0].risk, Risk::Medium);
+        assert_eq!(inspected.recommendation, 1);
+        assert_eq!(inspected.status, DecisionStatus::Resolved);
+        assert_eq!(inspected.resolution.as_ref().unwrap().chosen_index, 1);
+        assert_eq!(inspected.resolution.as_ref().unwrap().note, "choose stop");
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn json_outputs_match_legacy_bytes() {
+        let point = super::DecisionPoint {
+            id: "event_1".to_string(),
+            kind: DecisionKind::ToolGap,
+            digest: "Quote \" and newline\nslash \\ tab\t".to_string(),
+            options: vec![
+                super::HandoffOption {
+                    label: "continue".to_string(),
+                    direction: "Use tool \"A\"\nthen B".to_string(),
+                    cost: Cost::Moderate,
+                    risk: Risk::Medium,
+                    reversible: true,
+                },
+                super::HandoffOption {
+                    label: "stop".to_string(),
+                    direction: "Stop".to_string(),
+                    cost: Cost::Cheap,
+                    risk: Risk::Low,
+                    reversible: false,
+                },
+            ],
+            recommendation: 0,
+            status: DecisionStatus::Resolved,
+            resolution: Some(super::Resolution {
+                chosen_index: 0,
+                note: "accepted \"continue\"".to_string(),
+                resolved_at: 22,
+            }),
+            created_at: 11,
+        };
+
+        assert_eq!(
+            point.to_json(),
+            "{\"id\":\"event_1\",\"kind\":\"tool_gap\",\"digest\":\"Quote \\\" and newline\\nslash \\\\ tab\\t\",\"options\":[{\"label\":\"continue\",\"direction\":\"Use tool \\\"A\\\"\\nthen B\",\"cost\":\"moderate\",\"risk\":\"medium\",\"reversible\":true},{\"label\":\"stop\",\"direction\":\"Stop\",\"cost\":\"cheap\",\"risk\":\"low\",\"reversible\":false}],\"recommendation\":0,\"status\":\"resolved\",\"resolution\":{\"chosen_index\":0,\"note\":\"accepted \\\"continue\\\"\",\"resolved_at\":22},\"created_at\":11}"
+        );
+        assert_eq!(
+            super::decision_point_payload_json(
+                DecisionKind::StanceAssessment,
+                "Digest \"x\"",
+                &point.options,
+                1,
+            ),
+            "{\"kind\":\"stance_assessment\",\"digest\":\"Digest \\\"x\\\"\",\"options\":[{\"label\":\"continue\",\"direction\":\"Use tool \\\"A\\\"\\nthen B\",\"cost\":\"moderate\",\"risk\":\"medium\",\"reversible\":true},{\"label\":\"stop\",\"direction\":\"Stop\",\"cost\":\"cheap\",\"risk\":\"low\",\"reversible\":false}],\"recommendation\":1}"
+        );
+        assert_eq!(
+            super::resolution_payload_json("event_1", 0, "note\nwith tab\t"),
+            "{\"decision_point_id\":\"event_1\",\"chosen_index\":0,\"note\":\"note\\nwith tab\\t\"}"
+        );
     }
 
     #[test]

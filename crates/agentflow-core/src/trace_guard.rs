@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
 use crate::storage::{EventRecord, ProjectStore, StorageError};
 
@@ -16,7 +17,7 @@ const AUTONOMOUS_EVENT_TYPES: [&str; AUTONOMOUS_EVENT_TYPE_COUNT] = [
     "handoff.decision_point_raised",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub id: String,
     pub horizon_event_id: Option<String>,
@@ -24,7 +25,7 @@ pub struct Checkpoint {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriftReport {
     pub from_checkpoint: String,
     pub net_goal_delta: String,
@@ -32,7 +33,7 @@ pub struct DriftReport {
     pub should_surface: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevertRecord {
     pub id: String,
     pub checkpoint_id: String,
@@ -42,58 +43,19 @@ pub struct RevertRecord {
 
 impl Checkpoint {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"id\":\"{}\",",
-                "\"horizon_event_id\":{},",
-                "\"label\":\"{}\",",
-                "\"created_at\":{}",
-                "}}"
-            ),
-            escape_json(&self.id),
-            optional_json_string(self.horizon_event_id.as_deref()),
-            escape_json(&self.label),
-            self.created_at
-        )
+        serde_json::to_string(self).expect("checkpoint serializes to JSON")
     }
 }
 
 impl DriftReport {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"from_checkpoint\":\"{}\",",
-                "\"net_goal_delta\":\"{}\",",
-                "\"autonomous_steps\":{},",
-                "\"should_surface\":{}",
-                "}}"
-            ),
-            escape_json(&self.from_checkpoint),
-            escape_json(&self.net_goal_delta),
-            self.autonomous_steps,
-            self.should_surface
-        )
+        serde_json::to_string(self).expect("drift report serializes to JSON")
     }
 }
 
 impl RevertRecord {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"id\":\"{}\",",
-                "\"checkpoint_id\":\"{}\",",
-                "\"reverted_event_ids\":{},",
-                "\"created_at\":{}",
-                "}}"
-            ),
-            escape_json(&self.id),
-            escape_json(&self.checkpoint_id),
-            json_string_array(&self.reverted_event_ids),
-            self.created_at
-        )
+        serde_json::to_string(self).expect("revert record serializes to JSON")
     }
 }
 
@@ -210,9 +172,8 @@ impl ProjectStore {
         let mut reverted_ids = BTreeSet::new();
         for row in rows {
             let (event_id, payload_json) = row?;
-            for reverted_id in
-                required_json_string_array(&event_id, &payload_json, "reverted_event_ids")?
-            {
+            let payload = revert_record_payload_from_json(&event_id, &payload_json)?;
+            for reverted_id in payload.reverted_event_ids {
                 reverted_ids.insert(reverted_id);
             }
         }
@@ -315,12 +276,21 @@ fn validate_non_empty<'a>(label: &str, value: &'a str) -> Result<&'a str, Storag
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct CheckpointPayload {
+    label: String,
+    #[serde(default)]
+    horizon_event_id: Option<String>,
+}
+
 fn checkpoint_payload_json(label: &str, horizon_event_id: Option<&str>) -> String {
-    format!(
-        "{{\"label\":\"{}\",\"horizon_event_id\":{}}}",
-        escape_json(label),
-        optional_json_string(horizon_event_id)
-    )
+    serde_json::to_string(&CheckpointPayload {
+        label: label.to_string(),
+        horizon_event_id: horizon_event_id
+            .filter(|inner| !inner.trim().is_empty())
+            .map(ToString::to_string),
+    })
+    .expect("checkpoint payload serializes to JSON")
 }
 
 fn checkpoint_from_event(
@@ -328,20 +298,36 @@ fn checkpoint_from_event(
     payload_json: &str,
     created_at: i64,
 ) -> Result<Checkpoint, StorageError> {
+    let payload = checkpoint_payload_from_json(&id, payload_json)?;
     Ok(Checkpoint {
-        id: id.clone(),
-        horizon_event_id: json_nullable_string_field(payload_json, "horizon_event_id"),
-        label: required_json_string(&id, payload_json, "label")?,
+        id,
+        horizon_event_id: payload.horizon_event_id,
+        label: payload.label,
         created_at,
     })
 }
 
+fn checkpoint_payload_from_json(
+    event_id: &str,
+    payload_json: &str,
+) -> Result<CheckpointPayload, StorageError> {
+    serde_json::from_str(payload_json).map_err(|err| {
+        StorageError::InvalidInput(format!("trace event {event_id} has invalid payload: {err}"))
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RevertRecordPayload {
+    checkpoint_id: String,
+    reverted_event_ids: Vec<String>,
+}
+
 fn revert_record_payload_json(checkpoint_id: &str, reverted_event_ids: &[String]) -> String {
-    format!(
-        "{{\"checkpoint_id\":\"{}\",\"reverted_event_ids\":{}}}",
-        escape_json(checkpoint_id),
-        json_string_array(reverted_event_ids)
-    )
+    serde_json::to_string(&RevertRecordPayload {
+        checkpoint_id: checkpoint_id.to_string(),
+        reverted_event_ids: reverted_event_ids.to_vec(),
+    })
+    .expect("revert record payload serializes to JSON")
 }
 
 fn revert_record_from_event(
@@ -349,11 +335,21 @@ fn revert_record_from_event(
     payload_json: &str,
     created_at: i64,
 ) -> Result<RevertRecord, StorageError> {
+    let payload = revert_record_payload_from_json(&id, payload_json)?;
     Ok(RevertRecord {
-        id: id.clone(),
-        checkpoint_id: required_json_string(&id, payload_json, "checkpoint_id")?,
-        reverted_event_ids: required_json_string_array(&id, payload_json, "reverted_event_ids")?,
+        id,
+        checkpoint_id: payload.checkpoint_id,
+        reverted_event_ids: payload.reverted_event_ids,
         created_at,
+    })
+}
+
+fn revert_record_payload_from_json(
+    event_id: &str,
+    payload_json: &str,
+) -> Result<RevertRecordPayload, StorageError> {
+    serde_json::from_str(payload_json).map_err(|err| {
+        StorageError::InvalidInput(format!("trace event {event_id} has invalid payload: {err}"))
     })
 }
 
@@ -372,160 +368,16 @@ fn net_goal_delta(counts: &[u32; AUTONOMOUS_EVENT_TYPE_COUNT]) -> String {
         .join(", ")
 }
 
-fn required_json_string(
-    event_id: &str,
-    payload_json: &str,
-    field: &str,
-) -> Result<String, StorageError> {
-    json_string_field(payload_json, field).ok_or_else(|| {
-        StorageError::InvalidInput(format!("trace event {event_id} is missing {field}"))
-    })
-}
-
-fn required_json_string_array(
-    event_id: &str,
-    payload_json: &str,
-    field: &str,
-) -> Result<Vec<String>, StorageError> {
-    json_string_array_field(payload_json, field).ok_or_else(|| {
-        StorageError::InvalidInput(format!("trace event {event_id} is missing {field}"))
-    })
-}
-
-fn optional_json_string(value: Option<&str>) -> String {
-    value.filter(|inner| !inner.trim().is_empty()).map_or_else(
-        || "null".to_string(),
-        |inner| format!("\"{}\"", escape_json(inner)),
-    )
-}
-
-fn json_string_array(values: &[String]) -> String {
-    let items = values
-        .iter()
-        .map(|value| format!("\"{}\"", escape_json(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{items}]")
-}
-
-fn json_string_field(json: &str, field: &str) -> Option<String> {
-    let marker = format!("\"{field}\":\"");
-    let start = json.find(&marker)? + marker.len();
-    let rest = &json[start..];
-    let end = find_json_string_end(rest)?;
-    Some(unescape_json_string(&rest[..end]))
-}
-
-fn json_nullable_string_field(json: &str, field: &str) -> Option<String> {
-    json_string_field(json, field)
-}
-
-fn json_string_array_field(json: &str, field: &str) -> Option<Vec<String>> {
-    let marker = format!("\"{field}\":[");
-    let start = json.find(&marker)? + marker.len();
-    let rest = &json[start..];
-    let end = find_json_array_end(rest)?;
-    parse_json_string_array(&rest[..end])
-}
-
-fn parse_json_string_array(input: &str) -> Option<Vec<String>> {
-    let mut values = Vec::new();
-    let mut rest = input.trim();
-    if rest.is_empty() {
-        return Some(values);
-    }
-
-    loop {
-        rest = rest.trim_start();
-        let string_body = rest.strip_prefix('"')?;
-        let end = find_json_string_end(string_body)?;
-        values.push(unescape_json_string(&string_body[..end]));
-        rest = string_body[end + 1..].trim_start();
-        if rest.is_empty() {
-            return Some(values);
-        }
-        rest = rest.strip_prefix(',')?;
-    }
-}
-
-fn find_json_string_end(input: &str) -> Option<usize> {
-    let mut escaped = false;
-    for (index, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(index),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn find_json_array_end(input: &str) -> Option<usize> {
-    let mut escaped = false;
-    let mut in_string = false;
-    for (index, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' if in_string => escaped = true,
-            '"' => in_string = !in_string,
-            ']' if !in_string => return Some(index),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn unescape_json_string(input: &str) -> String {
-    let mut output = String::new();
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('"') => output.push('"'),
-                Some('\\') => output.push('\\'),
-                Some('n') => output.push('\n'),
-                Some('r') => output.push('\r'),
-                Some('t') => output.push('\t'),
-                Some(other) => output.push(other),
-                None => {}
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-    output
-}
-
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => output.push(ch),
-        }
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use crate::storage::{now_unix_seconds, EventRecord, ProjectStore};
 
-    use super::{revert_record_payload_json, AUTONOMOUS_EVENT_TYPES, TRACE_REVERTED_EVENT};
+    use super::{
+        revert_record_payload_json, AUTONOMOUS_EVENT_TYPES, TRACE_CHECKPOINT_CREATED_EVENT,
+        TRACE_REVERTED_EVENT,
+    };
 
     fn temp_project_path(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -571,6 +423,111 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn legacy_handwritten_payloads_parse_with_json_whitespace_and_ordering() {
+        let path = temp_project_path("legacy-payload");
+        let store = ProjectStore::init(&path, Some("Trace Demo")).unwrap();
+        let checkpoint_id = store
+            .append_event(EventRecord {
+                flow_id: None,
+                step_id: None,
+                run_id: None,
+                event_type: TRACE_CHECKPOINT_CREATED_EVENT.to_string(),
+                payload_json: r#"{
+                    "horizon_event_id": "event_horizon",
+                    "label": "Legacy \"checkpoint\"\nlabel"
+                }"#
+                .to_string(),
+            })
+            .unwrap();
+        store
+            .append_event(EventRecord {
+                flow_id: None,
+                step_id: None,
+                run_id: None,
+                event_type: TRACE_REVERTED_EVENT.to_string(),
+                payload_json: r#"{
+                    "reverted_event_ids": ["event_b", "event_a"],
+                    "checkpoint_id": "checkpoint_legacy"
+                }"#
+                .to_string(),
+            })
+            .unwrap();
+
+        let checkpoint = store.inspect_checkpoint(&checkpoint_id).unwrap();
+        assert_eq!(
+            checkpoint.horizon_event_id.as_deref(),
+            Some("event_horizon")
+        );
+        assert_eq!(checkpoint.label, "Legacy \"checkpoint\"\nlabel");
+        assert_eq!(
+            store.reverted_event_ids().unwrap(),
+            vec!["event_a".to_string(), "event_b".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn json_outputs_match_legacy_bytes() {
+        let checkpoint = super::Checkpoint {
+            id: "event_1".to_string(),
+            horizon_event_id: Some("event_0".to_string()),
+            label: "Quote \" and newline\nslash \\ tab\t".to_string(),
+            created_at: 11,
+        };
+        let checkpoint_without_horizon = super::Checkpoint {
+            id: "event_2".to_string(),
+            horizon_event_id: None,
+            label: "baseline".to_string(),
+            created_at: 12,
+        };
+        let drift = super::DriftReport {
+            from_checkpoint: "event_1".to_string(),
+            net_goal_delta: "hypothesis.transitioned=1\nargument.evidence_linked=0".to_string(),
+            autonomous_steps: 3,
+            should_surface: false,
+        };
+        let revert = super::RevertRecord {
+            id: "event_3".to_string(),
+            checkpoint_id: "event_1".to_string(),
+            reverted_event_ids: vec!["event_2".to_string(), "event_4".to_string()],
+            created_at: 13,
+        };
+
+        assert_eq!(
+            checkpoint.to_json(),
+            "{\"id\":\"event_1\",\"horizon_event_id\":\"event_0\",\"label\":\"Quote \\\" and newline\\nslash \\\\ tab\\t\",\"created_at\":11}"
+        );
+        assert_eq!(
+            checkpoint_without_horizon.to_json(),
+            "{\"id\":\"event_2\",\"horizon_event_id\":null,\"label\":\"baseline\",\"created_at\":12}"
+        );
+        assert_eq!(
+            drift.to_json(),
+            "{\"from_checkpoint\":\"event_1\",\"net_goal_delta\":\"hypothesis.transitioned=1\\nargument.evidence_linked=0\",\"autonomous_steps\":3,\"should_surface\":false}"
+        );
+        assert_eq!(
+            revert.to_json(),
+            "{\"id\":\"event_3\",\"checkpoint_id\":\"event_1\",\"reverted_event_ids\":[\"event_2\",\"event_4\"],\"created_at\":13}"
+        );
+        assert_eq!(
+            super::checkpoint_payload_json("Quote \"\n", Some("event_0")),
+            "{\"label\":\"Quote \\\"\\n\",\"horizon_event_id\":\"event_0\"}"
+        );
+        assert_eq!(
+            super::checkpoint_payload_json("baseline", None),
+            "{\"label\":\"baseline\",\"horizon_event_id\":null}"
+        );
+        assert_eq!(
+            super::revert_record_payload_json(
+                "checkpoint_1",
+                &["event_2".to_string(), "event_3".to_string()]
+            ),
+            "{\"checkpoint_id\":\"checkpoint_1\",\"reverted_event_ids\":[\"event_2\",\"event_3\"]}"
+        );
     }
 
     #[test]

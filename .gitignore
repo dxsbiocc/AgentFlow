@@ -2,4 +2,6 @@
 /.agentflow/
 /.omx/
 /.codegraph/
+/.claude/
+/.mcp.json
 *.log

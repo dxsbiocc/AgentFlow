@@ -87,12 +87,16 @@ impl ProjectStore {
 
             let name_lower = summary.name.to_ascii_lowercase();
             let description_lower = description.to_ascii_lowercase();
+            let mut name_keyword_hits = BTreeSet::new();
+            let mut description_keyword_hits = BTreeSet::new();
             for keyword in &keywords {
                 if name_lower.contains(keyword) {
+                    name_keyword_hits.insert(keyword.as_str());
                     score += SCORE_KEYWORD_NAME;
                     reasons.push(format!("keyword:name:{keyword}"));
                 }
                 if description_lower.contains(keyword) {
+                    description_keyword_hits.insert(keyword.as_str());
                     score += SCORE_KEYWORD_DESCRIPTION;
                     reasons.push(format!("keyword:description:{keyword}"));
                 }
@@ -116,9 +120,15 @@ impl ProjectStore {
             let all_required_inputs_satisfied = satisfied_required_inputs == required_count;
             let majority_required_inputs_satisfied =
                 required_count > 0 && satisfied_required_inputs * 2 > required_count;
+            let name_kw = name_keyword_hits.len();
+            let desc_kw = description_keyword_hits.len();
+            let strong_keyword_relevance = name_kw >= 1 || desc_kw >= 2;
             let fit = if output_match && all_required_inputs_satisfied {
                 Fit::High
             } else if output_match || majority_required_inputs_satisfied {
+                Fit::Medium
+            } else if strong_keyword_relevance {
+                reasons.push("relevance:keyword".to_string());
                 Fit::Medium
             } else {
                 Fit::Low
@@ -481,6 +491,137 @@ runtime:
         assert_eq!(candidates[1].tool_ref, "tie/z_tool");
         assert_eq!(candidates[0].score, candidates[1].score);
         assert_eq!(candidates[0].fit, Fit::High);
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn match_tools_promotes_name_keyword_relevance_without_io_match_to_medium() {
+        let (path, store) = init_store("name-keyword-fit");
+        register_tool(
+            &store,
+            &tool_yaml(
+                "omics",
+                "tcga_survival_scan",
+                "exploratory",
+                "Evaluate cohort statistics",
+                no_inputs(),
+                no_params(),
+                markdown_output(),
+            ),
+        );
+
+        let candidates = store
+            .match_tools(&CapabilityQuery {
+                desired_output_type: None,
+                available_input_types: Vec::new(),
+                keywords: vec!["THRSP".to_string(), "tcga".to_string()],
+            })
+            .unwrap();
+
+        assert_eq!(candidates[0].tool_ref, "omics/tcga_survival_scan");
+        assert_eq!(candidates[0].fit, Fit::Medium);
+        assert!(candidates[0].reason.contains("keyword:name:tcga"));
+        assert!(candidates[0].reason.contains("relevance:keyword"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn match_tools_keeps_single_description_keyword_without_io_match_low() {
+        let (path, store) = init_store("single-description-keyword-fit");
+        register_tool(
+            &store,
+            &tool_yaml(
+                "omics",
+                "cohort_scan",
+                "exploratory",
+                "Evaluate tcga cohort statistics",
+                no_inputs(),
+                no_params(),
+                markdown_output(),
+            ),
+        );
+
+        let candidates = store
+            .match_tools(&CapabilityQuery {
+                desired_output_type: None,
+                available_input_types: Vec::new(),
+                keywords: vec!["tcga".to_string()],
+            })
+            .unwrap();
+
+        assert_eq!(candidates[0].tool_ref, "omics/cohort_scan");
+        assert_eq!(candidates[0].fit, Fit::Low);
+        assert!(candidates[0].reason.contains("keyword:description:tcga"));
+        assert!(!candidates[0].reason.contains("relevance:keyword"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn match_tools_promotes_two_description_keywords_without_io_match_to_medium() {
+        let (path, store) = init_store("two-description-keywords-fit");
+        register_tool(
+            &store,
+            &tool_yaml(
+                "omics",
+                "cohort_scan",
+                "exploratory",
+                "Evaluate tcga survival statistics",
+                no_inputs(),
+                no_params(),
+                markdown_output(),
+            ),
+        );
+
+        let candidates = store
+            .match_tools(&CapabilityQuery {
+                desired_output_type: None,
+                available_input_types: Vec::new(),
+                keywords: vec!["tcga".to_string(), "survival".to_string()],
+            })
+            .unwrap();
+
+        assert_eq!(candidates[0].tool_ref, "omics/cohort_scan");
+        assert_eq!(candidates[0].fit, Fit::Medium);
+        assert!(candidates[0].reason.contains("keyword:description:tcga"));
+        assert!(candidates[0]
+            .reason
+            .contains("keyword:description:survival"));
+        assert!(candidates[0].reason.contains("relevance:keyword"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn match_tools_keyword_relevance_without_io_match_never_promotes_to_high() {
+        let (path, store) = init_store("keyword-fit-not-high");
+        register_tool(
+            &store,
+            &tool_yaml(
+                "omics",
+                "tcga_survival_scan",
+                "exploratory",
+                "Evaluate tcga survival statistics",
+                no_inputs(),
+                no_params(),
+                markdown_output(),
+            ),
+        );
+
+        let candidates = store
+            .match_tools(&CapabilityQuery {
+                desired_output_type: None,
+                available_input_types: Vec::new(),
+                keywords: vec!["tcga".to_string(), "survival".to_string()],
+            })
+            .unwrap();
+
+        assert_eq!(candidates[0].tool_ref, "omics/tcga_survival_scan");
+        assert_eq!(candidates[0].fit, Fit::Medium);
+        assert_ne!(candidates[0].fit, Fit::High);
+        assert!(candidates[0].reason.contains("relevance:keyword"));
 
         let _ = fs::remove_dir_all(path);
     }

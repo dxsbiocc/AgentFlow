@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::path::PathBuf;
 
 use agentflow_core::argument::{
@@ -7,18 +6,17 @@ use agentflow_core::argument::{
 };
 use agentflow_core::hypothesis::{Confidence, Hypothesis, HypothesisRequest, HypothesisStatus};
 
-use crate::{next_arg, require_value, CliError};
+use crate::cli_args::{
+    EvidenceArgs, EvidenceCommand, EvidenceLinkArgs, EvidenceListArgs, HypothesisArgs,
+    HypothesisCommand, HypothesisCreateArgs, HypothesisShowArgs, HypothesisTransitionArgs,
+    PathJsonArgs, VerdictArgs, VerdictCommand, VerdictRenderArgs, VerdictShowArgs,
+};
+use crate::{last_value, project_path_from_json, CliError};
 
 #[derive(Debug, Default)]
 struct PathJsonOptions {
     path: Option<PathBuf>,
     json: bool,
-}
-
-#[derive(Debug, Default)]
-struct SingleIdOptions {
-    project: PathJsonOptions,
-    id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -80,64 +78,31 @@ struct GateOptions {
     not_yet_claimable: Option<String>,
 }
 
-pub(crate) fn hypothesis_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "create" => hypothesis_create_command(args),
-        Some(command) if command == "list" => hypothesis_list_command(args),
-        Some(command) if command == "show" => hypothesis_show_command(args),
-        Some(command) if command == "transition" => hypothesis_transition_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown hypothesis command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "hypothesis requires a command: create, list, show, or transition".to_string(),
-        )),
+pub(crate) fn hypothesis_command(args: HypothesisArgs) -> Result<String, CliError> {
+    match args.command {
+        HypothesisCommand::Create(args) => hypothesis_create_command(args),
+        HypothesisCommand::List(args) => hypothesis_list_command(args),
+        HypothesisCommand::Show(args) => hypothesis_show_command(args),
+        HypothesisCommand::Transition(args) => hypothesis_transition_command(args),
     }
 }
 
-pub(crate) fn evidence_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "link" => evidence_link_command(args),
-        Some(command) if command == "list" => evidence_list_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown evidence command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "evidence requires a command: link or list".to_string(),
-        )),
+pub(crate) fn evidence_command(args: EvidenceArgs) -> Result<String, CliError> {
+    match args.command {
+        EvidenceCommand::Link(args) => evidence_link_command(args),
+        EvidenceCommand::List(args) => evidence_list_command(args),
     }
 }
 
-pub(crate) fn verdict_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "render" => verdict_render_command(args),
-        Some(command) if command == "show" => verdict_show_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown verdict command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "verdict requires a command: render or show".to_string(),
-        )),
+pub(crate) fn verdict_command(args: VerdictArgs) -> Result<String, CliError> {
+    match args.command {
+        VerdictCommand::Render(args) => verdict_render_command(args),
+        VerdictCommand::Show(args) => verdict_show_command(args),
     }
 }
 
-fn hypothesis_create_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_hypothesis_create_options(args)?;
+fn hypothesis_create_command(args: HypothesisCreateArgs) -> Result<String, CliError> {
+    let options = HypothesisCreateOptions::from(args);
     let statement = options.statement.ok_or_else(|| {
         CliError::InvalidArgument("hypothesis create requires --statement".to_string())
     })?;
@@ -162,11 +127,8 @@ where
     }
 }
 
-fn hypothesis_list_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_path_json_options(args, "hypothesis list")?;
+fn hypothesis_list_command(args: PathJsonArgs) -> Result<String, CliError> {
+    let options = PathJsonOptions::from(args);
     let path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let hypotheses = store.list_hypotheses()?;
@@ -184,33 +146,23 @@ where
     }
 }
 
-fn hypothesis_show_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_id_options(args, "hypothesis id")?;
-    let hypothesis_id = options.id.ok_or_else(|| {
-        CliError::InvalidArgument("hypothesis show requires <hypothesis-id>".to_string())
-    })?;
-    let path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn hypothesis_show_command(args: HypothesisShowArgs) -> Result<String, CliError> {
+    let hypothesis_id = args.hypothesis_id;
+    let json = args.project.json;
+    let path = project_path_from_json(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let hypothesis = store.inspect_hypothesis(&hypothesis_id)?;
 
-    if options.project.json {
+    if json {
         Ok(hypothesis.to_json())
     } else {
         Ok(format_hypothesis("Hypothesis", &hypothesis))
     }
 }
 
-fn hypothesis_transition_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_hypothesis_transition_options(args)?;
-    let hypothesis_id = options.hypothesis_id.ok_or_else(|| {
-        CliError::InvalidArgument("hypothesis transition requires <hypothesis-id>".to_string())
-    })?;
+fn hypothesis_transition_command(args: HypothesisTransitionArgs) -> Result<String, CliError> {
+    let options = HypothesisTransitionOptions::try_from(args)?;
+    let hypothesis_id = options.hypothesis_id.expect("clap requires hypothesis id");
     let to = options.to.ok_or_else(|| {
         CliError::InvalidArgument("hypothesis transition requires --to".to_string())
     })?;
@@ -226,11 +178,8 @@ where
     }
 }
 
-fn evidence_link_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_evidence_link_options(args)?;
+fn evidence_link_command(args: EvidenceLinkArgs) -> Result<String, CliError> {
+    let options = EvidenceLinkOptions::try_from(args)?;
     let hypothesis_id = options.hypothesis_id.ok_or_else(|| {
         CliError::InvalidArgument("evidence link requires --hypothesis".to_string())
     })?;
@@ -261,11 +210,8 @@ where
     }
 }
 
-fn evidence_list_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_evidence_list_options(args)?;
+fn evidence_list_command(args: EvidenceListArgs) -> Result<String, CliError> {
+    let options = EvidenceListOptions::from(args);
     let hypothesis_id = options.hypothesis_id.ok_or_else(|| {
         CliError::InvalidArgument("evidence list requires --hypothesis".to_string())
     })?;
@@ -286,11 +232,8 @@ where
     }
 }
 
-fn verdict_render_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_verdict_render_options(args)?;
+fn verdict_render_command(args: VerdictRenderArgs) -> Result<String, CliError> {
+    let options = VerdictRenderOptions::try_from(args)?;
     let hypothesis_id = options.hypothesis_id.ok_or_else(|| {
         CliError::InvalidArgument("verdict render requires --hypothesis".to_string())
     })?;
@@ -307,11 +250,8 @@ where
     }
 }
 
-fn verdict_show_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_verdict_hypothesis_options(args, "verdict show")?;
+fn verdict_show_command(args: VerdictShowArgs) -> Result<String, CliError> {
+    let options = VerdictHypothesisOptions::from(args);
     let hypothesis_id = options.hypothesis_id.ok_or_else(|| {
         CliError::InvalidArgument("verdict show requires --hypothesis".to_string())
     })?;
@@ -331,325 +271,112 @@ where
     }
 }
 
-fn parse_hypothesis_create_options<I>(args: I) -> Result<HypothesisCreateOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = HypothesisCreateOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--statement" => {
-                options.statement = Some(require_value("--statement", &mut args)?);
-            }
-            "--origin" => {
-                options.origin = Some(require_value("--origin", &mut args)?);
-            }
-            "--goal" => {
-                options.goal_id = Some(require_value("--goal", &mut args)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "hypothesis create does not accept positional argument: {arg}"
-                )));
-            }
+impl From<PathJsonArgs> for PathJsonOptions {
+    fn from(args: PathJsonArgs) -> Self {
+        Self {
+            path: last_value(args.path),
+            json: args.json,
         }
     }
-
-    Ok(options)
 }
 
-fn parse_hypothesis_transition_options<I>(args: I) -> Result<HypothesisTransitionOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = HypothesisTransitionOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--to" => {
-                let status = require_value("--to", &mut args)?;
-                options.to = Some(parse_hypothesis_status(&status)?);
-            }
-            "--confidence" => {
-                let confidence = require_value("--confidence", &mut args)?;
-                options.confidence = Some(parse_confidence(&confidence)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                if options.hypothesis_id.is_some() {
-                    return Err(CliError::InvalidArgument(format!(
-                        "expected one hypothesis id, got extra argument: {arg}"
-                    )));
-                }
-                options.hypothesis_id = Some(arg);
-            }
+impl From<HypothesisCreateArgs> for HypothesisCreateOptions {
+    fn from(args: HypothesisCreateArgs) -> Self {
+        Self {
+            project: PathJsonOptions::from(args.project),
+            statement: last_value(args.statement),
+            origin: last_value(args.origin),
+            goal_id: last_value(args.goal),
         }
     }
-
-    Ok(options)
 }
 
-fn parse_evidence_link_options<I>(args: I) -> Result<EvidenceLinkOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = EvidenceLinkOptions::default();
-    let mut args = args.into_iter();
+impl TryFrom<HypothesisTransitionArgs> for HypothesisTransitionOptions {
+    type Error = CliError;
 
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--hypothesis" => {
-                options.hypothesis_id = Some(require_value("--hypothesis", &mut args)?);
-            }
-            "--observation" => {
-                options.observation_id = Some(require_value("--observation", &mut args)?);
-            }
-            "--source" => {
-                options.source = Some(require_value("--source", &mut args)?);
-            }
-            "--grade" => {
-                let grade = require_value("--grade", &mut args)?;
-                options.grade = Some(parse_evidence_grade(&grade)?);
-            }
-            "--stance" => {
-                let stance = require_value("--stance", &mut args)?;
-                options.stance = Some(parse_stance(&stance)?);
-            }
-            "--note" => {
-                options.note = Some(require_value("--note", &mut args)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "evidence link does not accept positional argument: {arg}"
-                )));
-            }
-        }
+    fn try_from(args: HypothesisTransitionArgs) -> Result<Self, Self::Error> {
+        Ok(Self {
+            project: PathJsonOptions::from(args.project),
+            hypothesis_id: Some(args.hypothesis_id),
+            to: last_value(args.to)
+                .map(|status| parse_hypothesis_status(&status))
+                .transpose()?,
+            confidence: last_value(args.confidence)
+                .map(|confidence| parse_confidence(&confidence))
+                .transpose()?,
+        })
     }
-
-    Ok(options)
 }
 
-fn parse_evidence_list_options<I>(args: I) -> Result<EvidenceListOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = EvidenceListOptions::default();
-    let mut args = args.into_iter();
+impl TryFrom<EvidenceLinkArgs> for EvidenceLinkOptions {
+    type Error = CliError;
 
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--hypothesis" => {
-                options.hypothesis_id = Some(require_value("--hypothesis", &mut args)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "evidence list does not accept positional argument: {arg}"
-                )));
-            }
-        }
+    fn try_from(args: EvidenceLinkArgs) -> Result<Self, Self::Error> {
+        Ok(Self {
+            project: PathJsonOptions::from(args.project),
+            hypothesis_id: last_value(args.hypothesis),
+            observation_id: last_value(args.observation),
+            source: last_value(args.source),
+            grade: last_value(args.grade)
+                .map(|grade| parse_evidence_grade(&grade))
+                .transpose()?,
+            stance: last_value(args.stance)
+                .map(|stance| parse_stance(&stance))
+                .transpose()?,
+            note: last_value(args.note),
+        })
     }
-
-    Ok(options)
 }
 
-fn parse_verdict_render_options<I>(args: I) -> Result<VerdictRenderOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = VerdictRenderOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--hypothesis" => {
-                options.hypothesis_id = Some(require_value("--hypothesis", &mut args)?);
-            }
-            "--gate-supports" => {
-                options.gate.provided = true;
-                options.gate.supports = Some(require_value("--gate-supports", &mut args)?);
-            }
-            "--gate-against" => {
-                options.gate.provided = true;
-                options.gate.against = Some(require_value("--gate-against", &mut args)?);
-            }
-            "--gate-alternatives" => {
-                options.gate.provided = true;
-                options.gate.alternatives = Some(require_value("--gate-alternatives", &mut args)?);
-            }
-            "--gate-data-risks" => {
-                options.gate.provided = true;
-                options.gate.data_quality_risks =
-                    Some(require_value("--gate-data-risks", &mut args)?);
-            }
-            "--gate-assumptions" => {
-                options.gate.provided = true;
-                options.gate.assumptions = Some(require_value("--gate-assumptions", &mut args)?);
-            }
-            "--gate-falsifier" => {
-                options.gate.provided = true;
-                options.gate.falsifier = Some(require_value("--gate-falsifier", &mut args)?);
-            }
-            "--gate-claim-basis" => {
-                options.gate.provided = true;
-                let value = require_value("--gate-claim-basis", &mut args)?;
-                options.gate.claim_basis = Some(parse_claim_basis(&value)?);
-            }
-            "--gate-not-yet" => {
-                options.gate.provided = true;
-                options.gate.not_yet_claimable = Some(require_value("--gate-not-yet", &mut args)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "verdict render does not accept positional argument: {arg}"
-                )));
-            }
+impl From<EvidenceListArgs> for EvidenceListOptions {
+    fn from(args: EvidenceListArgs) -> Self {
+        Self {
+            project: PathJsonOptions::from(args.project),
+            hypothesis_id: last_value(args.hypothesis),
         }
     }
-
-    Ok(options)
 }
 
-fn parse_verdict_hypothesis_options<I>(
-    args: I,
-    command: &str,
-) -> Result<VerdictHypothesisOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = VerdictHypothesisOptions::default();
-    let mut args = args.into_iter();
+impl TryFrom<VerdictRenderArgs> for VerdictRenderOptions {
+    type Error = CliError;
 
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--hypothesis" => {
-                options.hypothesis_id = Some(require_value("--hypothesis", &mut args)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "{command} does not accept positional argument: {arg}"
-                )));
-            }
-        }
+    fn try_from(args: VerdictRenderArgs) -> Result<Self, Self::Error> {
+        let gate = GateOptions {
+            provided: !args.gate_supports.is_empty()
+                || !args.gate_against.is_empty()
+                || !args.gate_alternatives.is_empty()
+                || !args.gate_data_risks.is_empty()
+                || !args.gate_assumptions.is_empty()
+                || !args.gate_falsifier.is_empty()
+                || !args.gate_claim_basis.is_empty()
+                || !args.gate_not_yet.is_empty(),
+            supports: last_value(args.gate_supports),
+            against: last_value(args.gate_against),
+            alternatives: last_value(args.gate_alternatives),
+            data_quality_risks: last_value(args.gate_data_risks),
+            assumptions: last_value(args.gate_assumptions),
+            falsifier: last_value(args.gate_falsifier),
+            claim_basis: last_value(args.gate_claim_basis)
+                .map(|value| parse_claim_basis(&value))
+                .transpose()?,
+            not_yet_claimable: last_value(args.gate_not_yet),
+        };
+
+        Ok(Self {
+            project: PathJsonOptions::from(args.project),
+            hypothesis_id: last_value(args.hypothesis),
+            gate,
+        })
     }
-
-    Ok(options)
 }
 
-fn parse_path_json_options<I>(args: I, command: &str) -> Result<PathJsonOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = PathJsonOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.json = true;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "{command} does not accept positional argument: {arg}"
-                )));
-            }
+impl From<VerdictShowArgs> for VerdictHypothesisOptions {
+    fn from(args: VerdictShowArgs) -> Self {
+        Self {
+            project: PathJsonOptions::from(args.project),
+            hypothesis_id: last_value(args.hypothesis),
         }
     }
-
-    Ok(options)
-}
-
-fn parse_single_id_options<I>(args: I, label: &str) -> Result<SingleIdOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = SingleIdOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                if options.id.is_some() {
-                    return Err(CliError::InvalidArgument(format!(
-                        "expected one {label}, got extra argument: {arg}"
-                    )));
-                }
-                options.id = Some(arg);
-            }
-        }
-    }
-
-    Ok(options)
 }
 
 impl GateOptions {
@@ -838,6 +565,8 @@ fn verdict_label(verdict: &Verdict) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
     use crate::run;
 

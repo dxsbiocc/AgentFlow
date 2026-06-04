@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -8,7 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agentflow_core::domain::ToolMaturity;
 use agentflow_core::storage::{ProjectStore, ToolSpec};
 
-use crate::{next_arg, require_value, CliError};
+use crate::cli_args::SynthArgs;
+use crate::{last_value, CliError};
 
 pub(crate) const DEFAULT_SYNTHESIZER: &str = "claude -p";
 const SYNTH_VERSION: &str = "0.1.0";
@@ -32,11 +32,15 @@ struct ValidationOutput {
     timed_out: bool,
 }
 
-pub(crate) fn synth_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_synth_options(args)?;
+pub(crate) fn synth_command(args: SynthArgs) -> Result<String, CliError> {
+    let options = SynthOptions {
+        name: last_value(args.name),
+        description: last_value(args.description),
+        fixture: last_value(args.fixture),
+        expect: last_value(args.expect),
+        synthesizer: last_value(args.synthesizer),
+        path: last_value(args.project.path),
+    };
     run_synth(options)
 }
 
@@ -128,41 +132,6 @@ fn run_synth(options: SynthOptions) -> Result<String, CliError> {
         script_path.display(),
         registration.spec_hash
     ))
-}
-
-fn parse_synth_options<I>(args: I) -> Result<SynthOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = SynthOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--name" => options.name = Some(require_value("--name", &mut args)?),
-            "--description" => {
-                options.description = Some(require_value("--description", &mut args)?);
-            }
-            "--fixture" => {
-                options.fixture = Some(PathBuf::from(require_value("--fixture", &mut args)?));
-            }
-            "--expect" => options.expect = Some(require_value("--expect", &mut args)?),
-            "--synthesizer" => {
-                options.synthesizer = Some(require_value("--synthesizer", &mut args)?);
-            }
-            "--path" => options.path = Some(PathBuf::from(require_value("--path", &mut args)?)),
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "synth does not accept positional arguments: {arg}"
-                )));
-            }
-        }
-    }
-
-    Ok(options)
 }
 
 fn require_option<T>(value: Option<T>, flag: &str) -> Result<T, CliError> {
@@ -390,6 +359,8 @@ fn stderr_summary(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
 
     fn args(items: Vec<String>) -> Vec<OsString> {

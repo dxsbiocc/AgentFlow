@@ -1,10 +1,13 @@
 mod agent_commands;
 mod agent_ops_commands;
+mod cli_args;
 mod synth_commands;
 
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::cli_args::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliError {
@@ -40,46 +43,7 @@ pub fn run<I>(args: I) -> Result<String, CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let mut args = args.into_iter();
-    let _program = args.next();
-
-    match next_arg(&mut args)? {
-        None => Ok(usage()),
-        Some(command) if matches!(command.as_str(), "--help" | "-h" | "help") => Ok(usage()),
-        Some(command) if matches!(command.as_str(), "--version" | "-V" | "version") => {
-            Ok(agentflow_core::version_line())
-        }
-        Some(command) if command == "init" => init_command(args),
-        Some(command) if command == "status" => status_command(args),
-        Some(command) if command == "doctor" => doctor_command(args),
-        Some(command) if command == "tools" => tools_command(args),
-        Some(command) if command == "synth" => synth_commands::synth_command(args),
-        Some(command) if command == "env" => env_command(args),
-        Some(command) if command == "import" => import_command(args),
-        Some(command) if command == "artifacts" => artifacts_command(args),
-        Some(command) if command == "flow" => flow_command(args),
-        Some(command) if command == "run" => run_command(args),
-        Some(command) if command == "run-step" => run_step_command(args),
-        Some(command) if command == "report" => report_command(args),
-        Some(command) if command == "cache" => cache_command(args),
-        Some(command) if command == "retry" => retry_command(args),
-        Some(command) if command == "observe" => observe_command(args),
-        Some(command) if command == "observations" => observations_command(args),
-        Some(command) if command == "research" => research_command(args),
-        Some(command) if command == "agent" => agent_ops_commands::agent_command(args),
-        Some(command) if command == "hypothesis" => agent_commands::hypothesis_command(args),
-        Some(command) if command == "evidence" => agent_commands::evidence_command(args),
-        Some(command) if command == "verdict" => agent_commands::verdict_command(args),
-        Some(command) if command == "branch" => agent_ops_commands::branch_command(args),
-        Some(command) if command == "decision" => agent_ops_commands::decision_command(args),
-        Some(command) if command == "forage" => agent_ops_commands::forage_command(args),
-        Some(command) if command == "trace" => agent_ops_commands::trace_command(args),
-        Some(command) if command == "patch" => patch_command(args),
-        Some(command) if command == "compare" => compare_command(args),
-        Some(command) if command == "runs" => runs_command(args),
-        Some(command) if command == "logs" => logs_command(args),
-        Some(command) => Err(CliError::UnknownCommand(command)),
-    }
+    cli_args::run(args)
 }
 
 pub fn usage() -> String {
@@ -163,11 +127,8 @@ pub fn usage() -> String {
     .join("\n")
 }
 
-fn init_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_project_options(args, true)?;
+fn init_command(args: InitArgs) -> Result<String, CliError> {
+    let options = ProjectOptions::from(args);
     let path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::init(&path, options.name.as_deref())?;
     let summary = store.summary()?;
@@ -179,11 +140,8 @@ where
     ))
 }
 
-fn status_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_project_options(args, false)?;
+fn status_command(args: PathJsonArgs) -> Result<String, CliError> {
+    let options = ProjectOptions::from(args);
     let path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let summary = store.summary()?;
@@ -201,15 +159,9 @@ where
     }
 }
 
-fn run_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "flow id", false)?;
-    let flow_id = options
-        .positional
-        .ok_or_else(|| CliError::InvalidArgument("run requires <flow-id>".to_string()))?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn run_command(args: RunArgs) -> Result<String, CliError> {
+    let flow_id = args.flow_id;
+    let project_path = project_path_from_only(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let summary = store.run_flow(&flow_id)?;
     Ok(format!(
@@ -221,15 +173,9 @@ where
     ))
 }
 
-fn run_step_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "step id", false)?;
-    let step_id = options
-        .positional
-        .ok_or_else(|| CliError::InvalidArgument("run-step requires <step-id>".to_string()))?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn run_step_command(args: StepRefArgs) -> Result<String, CliError> {
+    let step_id = args.step_id;
+    let project_path = project_path_from_only(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let summary = store.run_step_ref(&step_id)?;
     Ok(format!(
@@ -241,28 +187,18 @@ where
     ))
 }
 
-fn runs_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "list" => runs_list_command(args),
-        Some(command) if command == "inspect" => runs_inspect_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown runs command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "runs requires a command: list or inspect".to_string(),
-        )),
+fn runs_command(args: RunsArgs) -> Result<String, CliError> {
+    match args.command {
+        RunsCommand::List(args) => runs_list_command(args),
+        RunsCommand::Inspect(args) => runs_inspect_command(args),
     }
 }
 
-fn runs_list_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_runs_list_options(args)?;
+fn runs_list_command(args: RunsListArgs) -> Result<String, CliError> {
+    let options = RunsListOptions {
+        project: ProjectOptions::from(args.project),
+        flow_id: last_value(args.flow),
+    };
     let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let runs = store.list_runs(options.flow_id.as_deref())?;
@@ -275,18 +211,13 @@ where
     }
 }
 
-fn runs_inspect_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "run or attempt id", true)?;
-    let id = options.positional.ok_or_else(|| {
-        CliError::InvalidArgument("runs inspect requires <run-or-attempt-id>".to_string())
-    })?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn runs_inspect_command(args: RunsInspectArgs) -> Result<String, CliError> {
+    let id = args.id;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let inspection = store.inspect_run_or_attempt(&id)?;
-    if options.project.json {
+    if options.json {
         Ok(run_inspection_json(&inspection))
     } else {
         Ok(format!(
@@ -300,15 +231,9 @@ where
     }
 }
 
-fn logs_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "run or attempt id", false)?;
-    let id = options.positional.ok_or_else(|| {
-        CliError::InvalidArgument("logs requires <run-or-attempt-id>".to_string())
-    })?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn logs_command(args: LogsArgs) -> Result<String, CliError> {
+    let id = args.id;
+    let project_path = project_path_from_only(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let logs = store.read_logs(&id)?;
     Ok(format!(
@@ -321,15 +246,9 @@ where
     ))
 }
 
-fn report_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "flow id", false)?;
-    let flow_id = options
-        .positional
-        .ok_or_else(|| CliError::InvalidArgument("report requires <flow-id>".to_string()))?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn report_command(args: ReportArgs) -> Result<String, CliError> {
+    let flow_id = args.flow_id;
+    let project_path = project_path_from_only(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     if flow_id == "research" {
         store
@@ -340,44 +259,25 @@ where
     }
 }
 
-fn cache_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "explain" => cache_explain_command(args),
-        Some(command) if command == "list" => cache_list_command(args),
-        Some(command) if command == "prune" => cache_prune_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown cache command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "cache requires a command: explain, list, or prune".to_string(),
-        )),
+fn cache_command(args: CacheArgs) -> Result<String, CliError> {
+    match args.command {
+        CacheCommand::Explain(args) => cache_explain_command(args),
+        CacheCommand::List(args) => cache_list_command(args),
+        CacheCommand::Prune(args) => cache_prune_command(args),
     }
 }
 
-fn cache_explain_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "flow id or step id", false)?;
-    let target = options.positional.ok_or_else(|| {
-        CliError::InvalidArgument("cache explain requires <flow-id|step-id>".to_string())
-    })?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn cache_explain_command(args: CacheExplainArgs) -> Result<String, CliError> {
+    let target = args.target;
+    let project_path = project_path_from_only(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
 
     let explanations = store.cache_explain_target(&target)?;
     Ok(format_cache_explanations(&target, &explanations))
 }
 
-fn cache_list_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_project_options(args, false)?;
+fn cache_list_command(args: PathJsonArgs) -> Result<String, CliError> {
+    let options = ProjectOptions::from(args);
     let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let entries = store.list_cache_entries()?;
@@ -406,11 +306,8 @@ where
     }
 }
 
-fn cache_prune_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_cache_prune_options(args)?;
+fn cache_prune_command(args: CachePruneArgs) -> Result<String, CliError> {
+    let options = CachePruneOptions::try_from(args)?;
     let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let summary = store.prune_cache_entries(options.older_than_seconds)?;
@@ -427,15 +324,9 @@ where
     }
 }
 
-fn retry_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "step id", false)?;
-    let step_id = options
-        .positional
-        .ok_or_else(|| CliError::InvalidArgument("retry requires <step-id>".to_string()))?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn retry_command(args: StepRefArgs) -> Result<String, CliError> {
+    let step_id = args.step_id;
+    let project_path = project_path_from_only(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let summary = store.retry_step_ref(&step_id)?;
     Ok(format!(
@@ -447,14 +338,14 @@ where
     ))
 }
 
-fn observe_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_observe_options(args)?;
-    let artifact_id = options
-        .artifact_id
-        .ok_or_else(|| CliError::InvalidArgument("observe requires <artifact-id>".to_string()))?;
+fn observe_command(args: ObserveArgs) -> Result<String, CliError> {
+    let options = ObserveOptions {
+        project_path: last_value(args.project.path),
+        artifact_id: Some(args.artifact_id),
+        adapter: last_value(args.adapter),
+        json: args.project.json,
+    };
+    let artifact_id = options.artifact_id.expect("clap requires artifact id");
     let project_path = options.project_path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let observation = match options.adapter.as_deref() {
@@ -469,28 +360,15 @@ where
     }
 }
 
-fn observations_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "list" => observations_list_command(args),
-        Some(command) if command == "inspect" => observations_inspect_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown observations command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "observations requires a command: list or inspect".to_string(),
-        )),
+fn observations_command(args: ObservationsArgs) -> Result<String, CliError> {
+    match args.command {
+        ObservationsCommand::List(args) => observations_list_command(args),
+        ObservationsCommand::Inspect(args) => observations_inspect_command(args),
     }
 }
 
-fn observations_list_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_project_options(args, false)?;
+fn observations_list_command(args: PathJsonArgs) -> Result<String, CliError> {
+    let options = ProjectOptions::from(args);
     let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let observations = store.list_observations()?;
@@ -513,48 +391,37 @@ where
     }
 }
 
-fn observations_inspect_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "observation id", true)?;
-    let observation_id = options.positional.ok_or_else(|| {
-        CliError::InvalidArgument("observations inspect requires <observation-id>".to_string())
-    })?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn observations_inspect_command(args: ObservationInspectArgs) -> Result<String, CliError> {
+    let observation_id = args.observation_id;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let observation = store.inspect_observation(&observation_id)?;
 
-    if options.project.json {
+    if options.json {
         Ok(observation_json(&observation))
     } else {
         Ok(format_observation(&observation))
     }
 }
 
-fn research_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "note" => research_note_command(args),
-        Some(command) if command == "list" => research_list_command(args),
-        Some(command) if command == "inspect" => research_inspect_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown research command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "research requires a command: note, list, or inspect".to_string(),
-        )),
+fn research_command(args: ResearchArgs) -> Result<String, CliError> {
+    match args.command {
+        ResearchCommand::Note(args) => research_note_command(args),
+        ResearchCommand::List(args) => research_list_command(args),
+        ResearchCommand::Inspect(args) => research_inspect_command(args),
     }
 }
 
-fn research_note_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_research_note_options(args)?;
+fn research_note_command(args: ResearchNoteArgs) -> Result<String, CliError> {
+    let options = ResearchNoteOptions {
+        project_path: last_value(args.project.path),
+        problem: last_value(args.problem),
+        question: last_value(args.question),
+        finding: last_value(args.finding),
+        confidence: last_value(args.confidence),
+        source: last_value(args.source),
+    };
     let problem = options
         .problem
         .ok_or_else(|| CliError::InvalidArgument("research note requires --problem".to_string()))?;
@@ -579,11 +446,8 @@ where
     ))
 }
 
-fn research_list_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_project_options(args, false)?;
+fn research_list_command(args: PathJsonArgs) -> Result<String, CliError> {
+    let options = ProjectOptions::from(args);
     let path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let notes = store.list_research_notes()?;
@@ -605,18 +469,13 @@ where
     }
 }
 
-fn research_inspect_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "research note id", true)?;
-    let note_id = options.positional.ok_or_else(|| {
-        CliError::InvalidArgument("research inspect requires <note-id>".to_string())
-    })?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn research_inspect_command(args: ResearchInspectArgs) -> Result<String, CliError> {
+    let note_id = args.note_id;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let note = store.inspect_research_note(&note_id)?;
-    if options.project.json {
+    if options.json {
         Ok(note.to_json())
     } else {
         Ok(format!(
@@ -632,34 +491,27 @@ where
     }
 }
 
-fn patch_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "propose" => patch_propose_command(args),
-        Some(command) if command == "list" => patch_list_command(args),
-        Some(command) if command == "approve" => patch_approve_command(args),
-        Some(command) if command == "reject" => patch_reject_command(args),
-        Some(command) if command == "apply" => patch_apply_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown patch command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "patch requires a command: propose, list, approve, reject, or apply".to_string(),
-        )),
+fn patch_command(args: PatchArgs) -> Result<String, CliError> {
+    match args.command {
+        PatchCommand::Propose(args) => patch_propose_command(args),
+        PatchCommand::List(args) => patch_list_command(args),
+        PatchCommand::Approve(args) => patch_approve_command(args),
+        PatchCommand::Reject(args) => patch_reject_command(args),
+        PatchCommand::Apply(args) => patch_apply_command(args),
     }
 }
 
-fn patch_propose_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_graph_patch_propose_options(args)?;
-    let flow_id = options
-        .flow_id
-        .ok_or_else(|| CliError::InvalidArgument("patch propose requires <flow-id>".to_string()))?;
+fn patch_propose_command(args: PatchProposeArgs) -> Result<String, CliError> {
+    let options = GraphPatchProposeOptions {
+        project_path: last_value(args.project.path),
+        flow_id: Some(args.flow_id),
+        title: last_value(args.title),
+        reason: last_value(args.reason),
+        patch_json: last_value(args.patch_json),
+        patch_file: last_value(args.patch_file),
+        json: args.project.json,
+    };
+    let flow_id = options.flow_id.expect("clap requires flow id");
     let title = options
         .title
         .ok_or_else(|| CliError::InvalidArgument("patch propose requires --title".to_string()))?;
@@ -691,19 +543,14 @@ where
     }
 }
 
-fn patch_list_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "flow id", true)?;
-    let flow_id = options
-        .positional
-        .ok_or_else(|| CliError::InvalidArgument("patch list requires <flow-id>".to_string()))?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn patch_list_command(args: PatchListArgs) -> Result<String, CliError> {
+    let flow_id = args.flow_id;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let patches = store.list_graph_patches(&flow_id)?;
 
-    if options.project.json {
+    if options.json {
         Ok(graph_patches_json(&flow_id, &patches))
     } else if patches.is_empty() {
         Ok(format!("No graph patches recorded for flow {flow_id}"))
@@ -721,33 +568,28 @@ where
     }
 }
 
-fn patch_approve_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "patch id", true)?;
-    let patch_id = options.positional.ok_or_else(|| {
-        CliError::InvalidArgument("patch approve requires <patch-id>".to_string())
-    })?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn patch_approve_command(args: PatchIdArgs) -> Result<String, CliError> {
+    let patch_id = args.patch_id;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let patch = store.approve_graph_patch(&patch_id)?;
 
-    if options.project.json {
+    if options.json {
         Ok(graph_patch_json(&patch))
     } else {
         Ok(format_graph_patch("Approved graph patch", &patch))
     }
 }
 
-fn patch_reject_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_graph_patch_reject_options(args)?;
-    let patch_id = options
-        .patch_id
-        .ok_or_else(|| CliError::InvalidArgument("patch reject requires <patch-id>".to_string()))?;
+fn patch_reject_command(args: PatchRejectArgs) -> Result<String, CliError> {
+    let options = GraphPatchRejectOptions {
+        project_path: last_value(args.project.path),
+        patch_id: Some(args.patch_id),
+        reason: last_value(args.reason),
+        json: args.project.json,
+    };
+    let patch_id = options.patch_id.expect("clap requires patch id");
     let reason = options
         .reason
         .ok_or_else(|| CliError::InvalidArgument("patch reject requires --reason".to_string()))?;
@@ -762,19 +604,14 @@ where
     }
 }
 
-fn patch_apply_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "patch id", true)?;
-    let patch_id = options
-        .positional
-        .ok_or_else(|| CliError::InvalidArgument("patch apply requires <patch-id>".to_string()))?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn patch_apply_command(args: PatchIdArgs) -> Result<String, CliError> {
+    let patch_id = args.patch_id;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let application = store.apply_graph_patch(&patch_id)?;
 
-    if options.project.json {
+    if options.json {
         Ok(graph_patch_application_json(&application))
     } else {
         Ok(format!(
@@ -794,33 +631,27 @@ where
     }
 }
 
-fn compare_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "steps" => compare_steps_command(args),
-        Some(command) if command == "metrics" => compare_metrics_command(args),
-        Some(command) if command == "list" => compare_list_command(args),
-        Some(command) if command == "inspect" => compare_inspect_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown compare command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "compare requires a command: steps, metrics, list, or inspect".to_string(),
-        )),
+fn compare_command(args: CompareArgs) -> Result<String, CliError> {
+    match args.command {
+        CompareCommand::Steps(args) => compare_steps_command(args),
+        CompareCommand::Metrics(args) => compare_metrics_command(args),
+        CompareCommand::List(args) => compare_list_command(args),
+        CompareCommand::Inspect(args) => compare_inspect_command(args),
     }
 }
 
-fn compare_steps_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_compare_steps_options(args)?;
-    let flow_id = options
-        .flow_id
-        .ok_or_else(|| CliError::InvalidArgument("compare steps requires <flow-id>".to_string()))?;
+fn compare_steps_command(args: CompareStepsArgs) -> Result<String, CliError> {
+    let options = CompareStepsOptions {
+        project_path: last_value(args.project.path),
+        flow_id: Some(args.flow_id),
+        baseline_step: last_value(args.baseline),
+        candidate_step: last_value(args.candidate),
+        summary: last_value(args.summary),
+        winner: last_value(args.winner),
+        reason: last_value(args.reason),
+        json: args.project.json,
+    };
+    let flow_id = options.flow_id.expect("clap requires flow id");
     let baseline_step = options.baseline_step.ok_or_else(|| {
         CliError::InvalidArgument("compare steps requires --baseline".to_string())
     })?;
@@ -852,14 +683,17 @@ where
     }
 }
 
-fn compare_metrics_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_compare_metrics_options(args)?;
-    let flow_id = options.flow_id.ok_or_else(|| {
-        CliError::InvalidArgument("compare metrics requires <flow-id>".to_string())
-    })?;
+fn compare_metrics_command(args: CompareMetricsArgs) -> Result<String, CliError> {
+    let options = CompareMetricsOptions {
+        project_path: last_value(args.project.path),
+        flow_id: Some(args.flow_id),
+        baseline_step: last_value(args.baseline),
+        candidate_step: last_value(args.candidate),
+        metric: last_value(args.metric),
+        direction: last_value(args.direction),
+        json: args.project.json,
+    };
+    let flow_id = options.flow_id.expect("clap requires flow id");
     let baseline_step = options.baseline_step.ok_or_else(|| {
         CliError::InvalidArgument("compare metrics requires --baseline".to_string())
     })?;
@@ -895,19 +729,14 @@ where
     }
 }
 
-fn compare_list_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "flow id", true)?;
-    let flow_id = options
-        .positional
-        .ok_or_else(|| CliError::InvalidArgument("compare list requires <flow-id>".to_string()))?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn compare_list_command(args: CompareListArgs) -> Result<String, CliError> {
+    let flow_id = args.flow_id;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let comparisons = store.list_branch_comparisons(&flow_id)?;
 
-    if options.project.json {
+    if options.json {
         Ok(branch_comparisons_json(&flow_id, &comparisons))
     } else if comparisons.is_empty() {
         Ok(format!("No branch comparisons recorded for flow {flow_id}"))
@@ -920,30 +749,22 @@ where
     }
 }
 
-fn compare_inspect_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "comparison id", true)?;
-    let comparison_id = options.positional.ok_or_else(|| {
-        CliError::InvalidArgument("compare inspect requires <comparison-id>".to_string())
-    })?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn compare_inspect_command(args: CompareInspectArgs) -> Result<String, CliError> {
+    let comparison_id = args.comparison_id;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let comparison = store.inspect_branch_comparison(&comparison_id)?;
 
-    if options.project.json {
+    if options.json {
         Ok(comparison.to_json())
     } else {
         Ok(format_branch_comparison("Branch comparison", &comparison))
     }
 }
 
-fn doctor_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_project_options(args, false)?;
+fn doctor_command(args: PathJsonArgs) -> Result<String, CliError> {
+    let options = ProjectOptions::from(args);
     let path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let migrations = store.applied_migrations()?;
@@ -954,35 +775,19 @@ where
     ))
 }
 
-fn tools_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "register" => tools_register_command(args),
-        Some(command) if command == "list" => tools_list_command(args),
-        Some(command) if command == "inspect" => tools_inspect_command(args),
-        Some(command) if command == "match" => tools_match_command(args),
-        Some(command) if command == "draft-step" => tools_draft_step_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown tools command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "tools requires a command: register, list, inspect, match, or draft-step".to_string(),
-        )),
+fn tools_command(args: ToolsArgs) -> Result<String, CliError> {
+    match args.command {
+        ToolsCommand::Register(args) => tools_register_command(args),
+        ToolsCommand::List(args) => tools_list_command(args),
+        ToolsCommand::Inspect(args) => tools_inspect_command(args),
+        ToolsCommand::Match(args) => tools_match_command(args),
+        ToolsCommand::DraftStep(args) => tools_draft_step_command(args),
     }
 }
 
-fn tools_register_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "tool spec path", false)?;
-    let spec_path = options.positional.ok_or_else(|| {
-        CliError::InvalidArgument("tools register requires <tool.yaml>".to_string())
-    })?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn tools_register_command(args: ToolsRegisterArgs) -> Result<String, CliError> {
+    let spec_path = args.tool_yaml;
+    let project_path = project_path_from_only(args.project)?;
     let source = fs::read_to_string(&spec_path)?;
     let spec = agentflow_core::storage::ToolSpec::from_simple_yaml(&source)?;
     let spec = resolve_tool_runtime_paths(spec, Path::new(&spec_path))?;
@@ -1042,11 +847,8 @@ fn resolve_runtime_path_field(value: &mut Option<String>, spec_dir: &Path) -> Re
     Ok(())
 }
 
-fn tools_list_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_project_options(args, false)?;
+fn tools_list_command(args: PathJsonArgs) -> Result<String, CliError> {
+    let options = ProjectOptions::from(args);
     let path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let tools = store.list_tools()?;
@@ -1071,19 +873,14 @@ where
     }
 }
 
-fn tools_inspect_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "tool ref", true)?;
-    let tool_ref = options.positional.ok_or_else(|| {
-        CliError::InvalidArgument("tools inspect requires <tool-ref>".to_string())
-    })?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn tools_inspect_command(args: ToolsInspectArgs) -> Result<String, CliError> {
+    let tool_ref = args.tool_ref;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let inspection = store.inspect_tool(&tool_ref)?;
 
-    if options.project.json {
+    if options.json {
         Ok(inspection.to_json())
     } else {
         Ok(format!(
@@ -1099,11 +896,8 @@ where
     }
 }
 
-fn tools_match_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_tools_match_options(args)?;
+fn tools_match_command(args: ToolsMatchArgs) -> Result<String, CliError> {
+    let options = ToolsMatchOptions::try_from(args)?;
     let path = options.project.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let candidates = store.match_tools(&agentflow_core::tool_select::CapabilityQuery {
@@ -1119,14 +913,9 @@ where
     }
 }
 
-fn tools_draft_step_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_tools_draft_step_options(args)?;
-    let tool_ref = options.tool_ref.ok_or_else(|| {
-        CliError::InvalidArgument("tools draft-step requires <tool-ref>".to_string())
-    })?;
+fn tools_draft_step_command(args: ToolsDraftStepArgs) -> Result<String, CliError> {
+    let options = ToolsDraftStepOptions::try_from(args)?;
+    let tool_ref = options.tool_ref.expect("clap requires tool ref");
     let path = options.project.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let mut step = store.draft_step_for(&tool_ref, &options.inputs)?;
@@ -1177,86 +966,56 @@ fn first_non_empty_line(value: &str) -> Option<&str> {
     value.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
-fn env_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "check" => env_check_command(args),
-        Some(command) if command == "prepare" => env_prepare_command(args),
-        Some(command) if command == "export" => env_export_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown env command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "env requires a command: check, prepare, or export".to_string(),
-        )),
+fn env_command(args: EnvArgs) -> Result<String, CliError> {
+    match args.command {
+        EnvCommand::Check(args) => env_check_command(args),
+        EnvCommand::Prepare(args) => env_prepare_command(args),
+        EnvCommand::Export(args) => env_export_command(args),
     }
 }
 
-fn env_check_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "tool ref", true)?;
-    let tool_ref = options
-        .positional
-        .ok_or_else(|| CliError::InvalidArgument("env check requires <tool-ref>".to_string()))?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn env_check_command(args: ToolRefJsonArgs) -> Result<String, CliError> {
+    let tool_ref = args.tool_ref;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let check = store.check_tool_environment(&tool_ref)?;
-    if options.project.json {
+    if options.json {
         Ok(environment_check_json(&check))
     } else {
         Ok(format_environment_check(&check))
     }
 }
 
-fn env_prepare_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "tool ref", true)?;
-    let tool_ref = options
-        .positional
-        .ok_or_else(|| CliError::InvalidArgument("env prepare requires <tool-ref>".to_string()))?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn env_prepare_command(args: ToolRefJsonArgs) -> Result<String, CliError> {
+    let tool_ref = args.tool_ref;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let prepare = store.prepare_tool_environment(&tool_ref)?;
-    if options.project.json {
+    if options.json {
         Ok(environment_prepare_json(&prepare))
     } else {
         Ok(format_environment_prepare(&prepare))
     }
 }
 
-fn env_export_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "tool ref", true)?;
-    let tool_ref = options
-        .positional
-        .ok_or_else(|| CliError::InvalidArgument("env export requires <tool-ref>".to_string()))?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn env_export_command(args: ToolRefJsonArgs) -> Result<String, CliError> {
+    let tool_ref = args.tool_ref;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let export = store.export_tool_environment(&tool_ref)?;
-    if options.project.json {
+    if options.json {
         Ok(environment_export_json(&export))
     } else {
         Ok(format_environment_export(&export))
     }
 }
 
-fn import_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_import_options(args)?;
-    let source_path = options.source_path.ok_or_else(|| {
-        CliError::InvalidArgument("import requires <file> before options".to_string())
-    })?;
+fn import_command(args: ImportArgs) -> Result<String, CliError> {
+    let options = ImportOptions::try_from(args)?;
+    let source_path = options.source_path.expect("clap requires import file");
     let artifact_type = options.artifact_type.ok_or_else(|| {
         CliError::InvalidArgument("import requires --type <artifact-type>".to_string())
     })?;
@@ -1278,28 +1037,15 @@ where
     ))
 }
 
-fn artifacts_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "list" => artifacts_list_command(args),
-        Some(command) if command == "inspect" => artifacts_inspect_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown artifacts command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "artifacts requires a command: list or inspect".to_string(),
-        )),
+fn artifacts_command(args: ArtifactsArgs) -> Result<String, CliError> {
+    match args.command {
+        ArtifactsCommand::List(args) => artifacts_list_command(args),
+        ArtifactsCommand::Inspect(args) => artifacts_inspect_command(args),
     }
 }
 
-fn artifacts_list_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_project_options(args, false)?;
+fn artifacts_list_command(args: PathJsonArgs) -> Result<String, CliError> {
+    let options = ProjectOptions::from(args);
     let path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let artifacts = store.list_artifacts()?;
@@ -1325,19 +1071,14 @@ where
     }
 }
 
-fn artifacts_inspect_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "artifact id", true)?;
-    let artifact_id = options.positional.ok_or_else(|| {
-        CliError::InvalidArgument("artifacts inspect requires <artifact-id>".to_string())
-    })?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn artifacts_inspect_command(args: ArtifactInspectArgs) -> Result<String, CliError> {
+    let artifact_id = args.artifact_id;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let inspection = store.inspect_artifact(&artifact_id)?;
 
-    if options.project.json {
+    if options.json {
         Ok(inspection.to_json())
     } else {
         Ok(format!(
@@ -1357,39 +1098,24 @@ where
     }
 }
 
-fn flow_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "validate" => flow_validate_command(args),
-        Some(command) if command == "approve" => flow_approve_command(args),
-        Some(command) if command == "inspect" => flow_inspect_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown flow command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "flow requires a command: validate, approve, or inspect".to_string(),
-        )),
+fn flow_command(args: FlowArgs) -> Result<String, CliError> {
+    match args.command {
+        FlowCommand::Validate(args) => flow_validate_command(args),
+        FlowCommand::Approve(args) => flow_approve_command(args),
+        FlowCommand::Inspect(args) => flow_inspect_command(args),
     }
 }
 
-fn flow_validate_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "flow spec path", true)?;
-    let flow_path = options.positional.ok_or_else(|| {
-        CliError::InvalidArgument("flow validate requires <flow.yaml>".to_string())
-    })?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn flow_validate_command(args: FlowValidateArgs) -> Result<String, CliError> {
+    let flow_path = args.flow_yaml;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let source = fs::read_to_string(&flow_path)?;
     let draft = agentflow_core::storage::FlowDraft::from_simple_yaml(&source)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let report = store.validate_flow(&draft);
 
-    if options.project.json {
+    if options.json {
         Ok(report.to_json())
     } else if report.valid {
         Ok(format!(
@@ -1409,15 +1135,9 @@ where
     }
 }
 
-fn flow_approve_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "flow spec path", false)?;
-    let flow_path = options.positional.ok_or_else(|| {
-        CliError::InvalidArgument("flow approve requires <flow.yaml>".to_string())
-    })?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn flow_approve_command(args: FlowApproveArgs) -> Result<String, CliError> {
+    let flow_path = args.flow_yaml;
+    let project_path = project_path_from_only(args.project)?;
     let source = fs::read_to_string(&flow_path)?;
     let draft = agentflow_core::storage::FlowDraft::from_simple_yaml(&source)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
@@ -1429,19 +1149,14 @@ where
     ))
 }
 
-fn flow_inspect_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_positional_options(args, "flow id", true)?;
-    let flow_id = options
-        .positional
-        .ok_or_else(|| CliError::InvalidArgument("flow inspect requires <flow-id>".to_string()))?;
-    let project_path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn flow_inspect_command(args: FlowInspectArgs) -> Result<String, CliError> {
+    let flow_id = args.flow_id;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let inspection = store.inspect_flow(&flow_id)?;
 
-    if options.project.json {
+    if options.json {
         Ok(inspection.to_json())
     } else {
         Ok(format!(
@@ -1460,12 +1175,6 @@ struct ProjectOptions {
     name: Option<String>,
     path: Option<PathBuf>,
     json: bool,
-}
-
-#[derive(Debug, Default)]
-struct SinglePositionalOptions {
-    project: ProjectOptions,
-    positional: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1578,421 +1287,132 @@ impl Default for ImportOptions {
     }
 }
 
-fn parse_import_options<I>(args: I) -> Result<ImportOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = ImportOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project_path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--type" => {
-                options.artifact_type = Some(require_value("--type", &mut args)?);
-            }
-            "--mode" => {
-                let mode = require_value("--mode", &mut args)?;
-                options.mode = agentflow_core::storage::ArtifactImportMode::parse(&mode)
-                    .ok_or_else(|| {
-                        CliError::InvalidArgument("--mode must be reference or copy".to_string())
-                    })?;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                if options.source_path.is_some() {
-                    return Err(CliError::InvalidArgument(format!(
-                        "expected one file to import, got extra argument: {arg}"
-                    )));
-                }
-                options.source_path = Some(arg);
-            }
-        }
-    }
-
-    Ok(options)
+pub(crate) fn last_value<T>(mut values: Vec<T>) -> Option<T> {
+    values.pop()
 }
 
-fn parse_observe_options<I>(args: I) -> Result<ObserveOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = ObserveOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project_path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--adapter" => {
-                options.adapter = Some(require_value("--adapter", &mut args)?);
-            }
-            "--json" => {
-                options.json = true;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                if options.artifact_id.is_some() {
-                    return Err(CliError::InvalidArgument(format!(
-                        "expected one artifact id, got extra argument: {arg}"
-                    )));
-                }
-                options.artifact_id = Some(arg);
-            }
-        }
-    }
-
-    Ok(options)
+pub(crate) fn project_path_from_only(args: PathOnlyArgs) -> Result<PathBuf, CliError> {
+    Ok(last_value(args.path).unwrap_or(std::env::current_dir()?))
 }
 
-fn parse_graph_patch_propose_options<I>(args: I) -> Result<GraphPatchProposeOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = GraphPatchProposeOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project_path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--title" => {
-                options.title = Some(require_value("--title", &mut args)?);
-            }
-            "--reason" => {
-                options.reason = Some(require_value("--reason", &mut args)?);
-            }
-            "--patch-json" => {
-                options.patch_json = Some(require_value("--patch-json", &mut args)?);
-            }
-            "--patch-file" => {
-                options.patch_file = Some(PathBuf::from(require_value("--patch-file", &mut args)?));
-            }
-            "--json" => {
-                options.json = true;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                if options.flow_id.is_some() {
-                    return Err(CliError::InvalidArgument(format!(
-                        "expected one flow id, got extra argument: {arg}"
-                    )));
-                }
-                options.flow_id = Some(arg);
-            }
-        }
-    }
-
-    Ok(options)
+pub(crate) fn project_path_from_json(args: PathJsonArgs) -> Result<PathBuf, CliError> {
+    Ok(last_value(args.path).unwrap_or(std::env::current_dir()?))
 }
 
-fn parse_graph_patch_reject_options<I>(args: I) -> Result<GraphPatchRejectOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = GraphPatchRejectOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project_path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--reason" => {
-                options.reason = Some(require_value("--reason", &mut args)?);
-            }
-            "--json" => {
-                options.json = true;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                if options.patch_id.is_some() {
-                    return Err(CliError::InvalidArgument(format!(
-                        "expected one patch id, got extra argument: {arg}"
-                    )));
-                }
-                options.patch_id = Some(arg);
-            }
-        }
-    }
-
-    Ok(options)
+pub(crate) fn parse_usize_value(flag: &str, value: &str) -> Result<usize, CliError> {
+    value
+        .parse::<usize>()
+        .map_err(|_| CliError::InvalidArgument(format!("{flag} must be a non-negative integer")))
 }
 
-fn parse_compare_steps_options<I>(args: I) -> Result<CompareStepsOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = CompareStepsOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project_path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--baseline" => {
-                options.baseline_step = Some(require_value("--baseline", &mut args)?);
-            }
-            "--candidate" => {
-                options.candidate_step = Some(require_value("--candidate", &mut args)?);
-            }
-            "--summary" => {
-                options.summary = Some(require_value("--summary", &mut args)?);
-            }
-            "--winner" => {
-                options.winner = Some(require_value("--winner", &mut args)?);
-            }
-            "--reason" => {
-                options.reason = Some(require_value("--reason", &mut args)?);
-            }
-            "--json" => {
-                options.json = true;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                if options.flow_id.is_some() {
-                    return Err(CliError::InvalidArgument(format!(
-                        "expected one flow id, got extra argument: {arg}"
-                    )));
-                }
-                options.flow_id = Some(arg);
-            }
-        }
-    }
-
-    Ok(options)
+pub(crate) fn parse_u32_value(flag: &str, value: &str) -> Result<u32, CliError> {
+    let value = parse_usize_value(flag, value)?;
+    u32::try_from(value).map_err(|_| {
+        CliError::InvalidArgument(format!("{flag} must fit in an unsigned 32-bit integer"))
+    })
 }
 
-fn parse_compare_metrics_options<I>(args: I) -> Result<CompareMetricsOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = CompareMetricsOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project_path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--baseline" => {
-                options.baseline_step = Some(require_value("--baseline", &mut args)?);
-            }
-            "--candidate" => {
-                options.candidate_step = Some(require_value("--candidate", &mut args)?);
-            }
-            "--metric" => {
-                options.metric = Some(require_value("--metric", &mut args)?);
-            }
-            "--direction" => {
-                options.direction = Some(require_value("--direction", &mut args)?);
-            }
-            "--json" => {
-                options.json = true;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                if options.flow_id.is_some() {
-                    return Err(CliError::InvalidArgument(format!(
-                        "expected one flow id, got extra argument: {arg}"
-                    )));
-                }
-                options.flow_id = Some(arg);
-            }
+impl From<PathOnlyArgs> for ProjectOptions {
+    fn from(args: PathOnlyArgs) -> Self {
+        Self {
+            name: None,
+            path: last_value(args.path),
+            json: false,
         }
     }
-
-    Ok(options)
 }
 
-fn parse_research_note_options<I>(args: I) -> Result<ResearchNoteOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = ResearchNoteOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project_path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--problem" => {
-                options.problem = Some(require_value("--problem", &mut args)?);
-            }
-            "--question" => {
-                options.question = Some(require_value("--question", &mut args)?);
-            }
-            "--finding" => {
-                options.finding = Some(require_value("--finding", &mut args)?);
-            }
-            "--confidence" => {
-                options.confidence = Some(require_value("--confidence", &mut args)?);
-            }
-            "--source" => {
-                options.source = Some(require_value("--source", &mut args)?);
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
+impl From<PathJsonArgs> for ProjectOptions {
+    fn from(args: PathJsonArgs) -> Self {
+        Self {
+            name: None,
+            path: last_value(args.path),
+            json: args.json,
         }
     }
-
-    Ok(options)
 }
 
-fn parse_single_positional_options<I>(
-    args: I,
-    label: &str,
-    allow_json: bool,
-) -> Result<SinglePositionalOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = SinglePositionalOptions::default();
-    let mut args = args.into_iter();
+impl From<InitArgs> for ProjectOptions {
+    fn from(args: InitArgs) -> Self {
+        Self {
+            name: last_value(args.name),
+            path: last_value(args.project.path),
+            json: args.project.json,
+        }
+    }
+}
 
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
+impl TryFrom<ImportArgs> for ImportOptions {
+    type Error = CliError;
+
+    fn try_from(args: ImportArgs) -> Result<Self, Self::Error> {
+        let mode = match last_value(args.mode) {
+            Some(mode) => {
+                agentflow_core::storage::ArtifactImportMode::parse(&mode).ok_or_else(|| {
+                    CliError::InvalidArgument("--mode must be reference or copy".to_string())
+                })?
             }
-            "--json" if allow_json => {
-                options.project.json = true;
-            }
-            "--json" => {
+            None => agentflow_core::storage::ArtifactImportMode::Reference,
+        };
+
+        Ok(Self {
+            project_path: last_value(args.project.path),
+            source_path: Some(args.file.display().to_string()),
+            artifact_type: last_value(args.artifact_type),
+            mode,
+        })
+    }
+}
+
+impl TryFrom<ToolsMatchArgs> for ToolsMatchOptions {
+    type Error = CliError;
+
+    fn try_from(args: ToolsMatchArgs) -> Result<Self, Self::Error> {
+        let output = match args.output.len() {
+            0 => None,
+            1 => last_value(args.output),
+            _ => {
                 return Err(CliError::InvalidArgument(
-                    "--json is not valid for this command".to_string(),
+                    "--output may only be provided once".to_string(),
                 ));
             }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                if options.positional.is_some() {
-                    return Err(CliError::InvalidArgument(format!(
-                        "expected one {label}, got extra argument: {arg}"
-                    )));
-                }
-                options.positional = Some(arg);
-            }
-        }
-    }
+        };
 
-    Ok(options)
+        Ok(Self {
+            project: ProjectOptions::from(args.project),
+            output,
+            inputs: args.input,
+            keywords: args.keyword,
+        })
+    }
 }
 
-fn parse_tools_match_options<I>(args: I) -> Result<ToolsMatchOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = ToolsMatchOptions::default();
-    let mut args = args.into_iter();
+impl TryFrom<ToolsDraftStepArgs> for ToolsDraftStepOptions {
+    type Error = CliError;
 
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--output" => {
-                if options.output.is_some() {
-                    return Err(CliError::InvalidArgument(
-                        "--output may only be provided once".to_string(),
-                    ));
-                }
-                options.output = Some(require_value("--output", &mut args)?);
-            }
-            "--input" => {
-                options.inputs.push(require_value("--input", &mut args)?);
-            }
-            "--keyword" => {
-                options
-                    .keywords
-                    .push(require_value("--keyword", &mut args)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "tools match does not accept positional argument: {arg}"
-                )));
-            }
+    fn try_from(args: ToolsDraftStepArgs) -> Result<Self, Self::Error> {
+        let inputs = args
+            .input
+            .iter()
+            .map(|input| parse_draft_step_input(input))
+            .collect::<Result<Vec<_>, _>>()?;
+        let options = Self {
+            project: ProjectOptions::from(args.project),
+            tool_ref: Some(args.tool_ref),
+            inputs,
+            hypothesis_id: last_value(args.hypothesis),
+            infer_params: args.infer_params,
+            synthesizer: last_value(args.synthesizer),
+        };
+
+        if options.infer_params && options.hypothesis_id.is_none() {
+            return Err(CliError::InvalidArgument(
+                "--infer-params requires --hypothesis <id>".to_string(),
+            ));
         }
+
+        Ok(options)
     }
-
-    Ok(options)
-}
-
-fn parse_tools_draft_step_options<I>(args: I) -> Result<ToolsDraftStepOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = ToolsDraftStepOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--input" => {
-                let input = require_value("--input", &mut args)?;
-                options.inputs.push(parse_draft_step_input(&input)?);
-            }
-            "--hypothesis" => {
-                options.hypothesis_id = Some(require_value("--hypothesis", &mut args)?);
-            }
-            "--infer-params" => {
-                options.infer_params = true;
-            }
-            "--synthesizer" => {
-                options.synthesizer = Some(require_value("--synthesizer", &mut args)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                if options.tool_ref.is_some() {
-                    return Err(CliError::InvalidArgument(format!(
-                        "expected one tool ref, got extra argument: {arg}"
-                    )));
-                }
-                options.tool_ref = Some(arg);
-            }
-        }
-    }
-
-    if options.infer_params && options.hypothesis_id.is_none() {
-        return Err(CliError::InvalidArgument(
-            "--infer-params requires --hypothesis <id>".to_string(),
-        ));
-    }
-
-    Ok(options)
 }
 
 fn parse_draft_step_input(value: &str) -> Result<(String, String), CliError> {
@@ -2009,26 +1429,12 @@ fn parse_draft_step_input(value: &str) -> Result<(String, String), CliError> {
     Ok((type_name.to_string(), artifact_id.to_string()))
 }
 
-fn parse_cache_prune_options<I>(args: I) -> Result<CachePruneOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = CachePruneOptions::default();
-    let mut args = args.into_iter();
+impl TryFrom<CachePruneArgs> for CachePruneOptions {
+    type Error = CliError;
 
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--all" => {
-                options.all = true;
-            }
-            "--older-than-seconds" => {
-                let value = require_value("--older-than-seconds", &mut args)?;
+    fn try_from(args: CachePruneArgs) -> Result<Self, Self::Error> {
+        let older_than_seconds = last_value(args.older_than_seconds)
+            .map(|value| {
                 let seconds = value.parse::<u64>().map_err(|_| {
                     CliError::InvalidArgument(
                         "--older-than-seconds must be a positive integer".to_string(),
@@ -2039,114 +1445,29 @@ where
                         "--older-than-seconds must be greater than zero".to_string(),
                     ));
                 }
-                options.older_than_seconds = Some(seconds);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "cache prune does not accept positional argument: {arg}"
-                )));
-            }
+                Ok(seconds)
+            })
+            .transpose()?;
+
+        let options = Self {
+            project: ProjectOptions::from(args.project),
+            all: args.all,
+            older_than_seconds,
+        };
+
+        if options.all && options.older_than_seconds.is_some() {
+            return Err(CliError::InvalidArgument(
+                "use either cache prune --all or --older-than-seconds, not both".to_string(),
+            ));
         }
-    }
-
-    if options.all && options.older_than_seconds.is_some() {
-        return Err(CliError::InvalidArgument(
-            "use either cache prune --all or --older-than-seconds, not both".to_string(),
-        ));
-    }
-    if !options.all && options.older_than_seconds.is_none() {
-        return Err(CliError::InvalidArgument(
-            "cache prune requires --all or --older-than-seconds <seconds>".to_string(),
-        ));
-    }
-
-    Ok(options)
-}
-
-fn parse_runs_list_options<I>(args: I) -> Result<RunsListOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = RunsListOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--flow" => {
-                options.flow_id = Some(require_value("--flow", &mut args)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "runs list does not accept positional argument: {arg}"
-                )));
-            }
+        if !options.all && options.older_than_seconds.is_none() {
+            return Err(CliError::InvalidArgument(
+                "cache prune requires --all or --older-than-seconds <seconds>".to_string(),
+            ));
         }
+
+        Ok(options)
     }
-
-    Ok(options)
-}
-
-fn parse_project_options<I>(args: I, allow_name: bool) -> Result<ProjectOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = ProjectOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--name" if allow_name => {
-                options.name = Some(require_value("--name", &mut args)?);
-            }
-            "--name" => {
-                return Err(CliError::InvalidArgument(
-                    "--name is only valid for init".to_string(),
-                ));
-            }
-            "--path" => {
-                options.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.json = true;
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-        }
-    }
-
-    Ok(options)
-}
-
-pub(crate) fn require_value<I>(flag: &str, args: &mut I) -> Result<String, CliError>
-where
-    I: Iterator<Item = OsString>,
-{
-    next_arg(args)?.ok_or_else(|| CliError::InvalidArgument(format!("{flag} requires a value")))
-}
-
-pub(crate) fn next_arg<I>(args: &mut I) -> Result<Option<String>, CliError>
-where
-    I: Iterator<Item = OsString>,
-{
-    args.next()
-        .map(|arg| {
-            arg.into_string()
-                .map_err(|_| CliError::InvalidArgument("argument is not valid UTF-8".to_string()))
-        })
-        .transpose()
 }
 
 fn format_observation(observation: &agentflow_core::ObservationRecord) -> String {
@@ -3319,7 +2640,7 @@ steps:
     #[test]
     fn unknown_command_is_error() {
         let err = run(args(&["agentflow", "unknown"])).unwrap_err();
-        assert!(err.message().contains("unknown command: unknown"));
+        assert!(err.message().contains("unrecognized subcommand 'unknown'"));
     }
 
     #[test]

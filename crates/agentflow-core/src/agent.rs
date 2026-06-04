@@ -15,7 +15,7 @@ use crate::storage::{
     validate_param_value, ArtifactSummary, EventRecord, FlowDraft, FlowStepDraft, ProjectStore,
     StorageError, ToolParamSpec,
 };
-use crate::tool_select::{CapabilityQuery, Fit};
+use crate::tool_select::{CapabilityQuery, Fit, ToolCandidate};
 
 const AGENT_CYCLE_COMPLETED_EVENT: &str = "agent.cycle_completed";
 const PARAMS_INFERRED_EVENT: &str = "agent.params_inferred";
@@ -85,6 +85,29 @@ pub struct NoopParamInferer;
 
 impl ParamInferer for NoopParamInferer {
     fn infer(&self, _hypothesis_statement: &str, _param_name: &str) -> Option<String> {
+        None
+    }
+}
+
+pub trait RelevanceScorer {
+    fn is_relevant(
+        &self,
+        hypothesis_statement: &str,
+        tool_ref: &str,
+        tool_description: &str,
+    ) -> Option<bool>;
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct NoopRelevanceScorer;
+
+impl RelevanceScorer for NoopRelevanceScorer {
+    fn is_relevant(
+        &self,
+        _hypothesis_statement: &str,
+        _tool_ref: &str,
+        _tool_description: &str,
+    ) -> Option<bool> {
         None
     }
 }
@@ -207,6 +230,15 @@ impl ProjectStore {
         config: ApplyConfig,
         inferer: &dyn ParamInferer,
     ) -> Result<CycleReport, StorageError> {
+        self.run_cycle_with_scorer(config, inferer, &NoopRelevanceScorer)
+    }
+
+    pub fn run_cycle_with_scorer(
+        &self,
+        config: ApplyConfig,
+        inferer: &dyn ParamInferer,
+        scorer: &dyn RelevanceScorer,
+    ) -> Result<CycleReport, StorageError> {
         let checkpoint = self.create_checkpoint("agent_cycle")?;
         let engine = RuleBasedEngine;
         let policy = DefaultPolicy;
@@ -303,6 +335,7 @@ impl ProjectStore {
                         &available_input_types,
                         &available,
                         inferer,
+                        scorer,
                     )?;
                     if config.propose_synth && proposal.matched_tool.is_none() {
                         let hypothesis_id = &proposal.decision.candidate.hypothesis_id;
@@ -449,6 +482,71 @@ impl ProjectStore {
     }
 }
 
+const SEMANTIC_RELEVANCE_TOP_K: usize = 3;
+const SEMANTIC_RELEVANCE_REASON: &str = "relevance:semantic";
+
+fn apply_semantic_relevance_to_candidates(
+    store: &ProjectStore,
+    candidates: &mut [ToolCandidate],
+    hypothesis_statement: &str,
+    scorer: &dyn RelevanceScorer,
+) -> Result<bool, StorageError> {
+    let mut promoted = false;
+    for candidate in candidates.iter_mut().take(SEMANTIC_RELEVANCE_TOP_K) {
+        if candidate.fit != Fit::Low {
+            continue;
+        }
+        let tool_description = tool_description(store, &candidate.tool_ref)?;
+        if scorer.is_relevant(hypothesis_statement, &candidate.tool_ref, &tool_description)
+            == Some(true)
+        {
+            candidate.fit = Fit::Medium;
+            candidate.reason = append_match_reason(&candidate.reason, SEMANTIC_RELEVANCE_REASON);
+            promoted = true;
+        }
+    }
+
+    if promoted {
+        candidates.sort_by(|left, right| {
+            fit_rank(right.fit)
+                .cmp(&fit_rank(left.fit))
+                .then_with(|| right.score.cmp(&left.score))
+                .then_with(|| left.tool_ref.cmp(&right.tool_ref))
+        });
+    }
+
+    Ok(promoted)
+}
+
+fn tool_description(store: &ProjectStore, tool_ref: &str) -> Result<String, StorageError> {
+    let inspection = store.inspect_tool(tool_ref)?;
+    let spec: serde_json::Value = serde_json::from_str(&inspection.spec_json).map_err(|error| {
+        StorageError::InvalidInput(format!("stored tool spec JSON is invalid: {error}"))
+    })?;
+    spec.get("description")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            StorageError::InvalidInput("stored tool spec is missing description".to_string())
+        })
+}
+
+fn append_match_reason(existing: &str, reason: &str) -> String {
+    if existing.trim().is_empty() {
+        reason.to_string()
+    } else {
+        format!("{existing}, {reason}")
+    }
+}
+
+fn fit_rank(fit: Fit) -> u8 {
+    match fit {
+        Fit::High => 3,
+        Fit::Medium => 2,
+        Fit::Low => 1,
+    }
+}
+
 impl ProjectStore {
     fn pending_tool_gap_hypothesis_ids(&self) -> Result<BTreeSet<String>, StorageError> {
         Ok(self
@@ -474,13 +572,21 @@ impl ProjectStore {
         available_input_types: &[String],
         available: &[(String, String)],
         inferer: &dyn ParamInferer,
+        scorer: &dyn RelevanceScorer,
     ) -> Result<(EnrichedProposal, Vec<String>), StorageError> {
         let query = CapabilityQuery {
             desired_output_type: None,
             available_input_types: available_input_types.to_vec(),
             keywords: proposal_keywords(&decision.candidate.statement),
         };
-        let top = self.match_tools(&query)?.into_iter().next();
+        let mut candidates = self.match_tools(&query)?;
+        apply_semantic_relevance_to_candidates(
+            self,
+            &mut candidates,
+            &decision.candidate.statement,
+            scorer,
+        )?;
+        let top = candidates.into_iter().next();
 
         let Some(candidate) = top else {
             return Ok((
@@ -1300,6 +1406,7 @@ struct CycleCompletedPayload {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::path::PathBuf;
 
     use rusqlite::params;
@@ -1314,9 +1421,11 @@ mod tests {
         now_unix_seconds, ArtifactImportMode, ArtifactImportRequest, ComputedArtifactRequest,
         FlowDraft, ProjectStore, ToolSpec,
     };
+    use crate::tool_select::{Fit, ToolCandidate};
 
     use super::{
-        proposal_keywords, AppliedAction, ApplyConfig, CycleOutcome, NoopParamInferer, ParamInferer,
+        proposal_keywords, AppliedAction, ApplyConfig, CycleOutcome, NoopParamInferer,
+        NoopRelevanceScorer, ParamInferer, RelevanceScorer,
     };
 
     fn temp_project_path(test_name: &str) -> PathBuf {
@@ -1777,6 +1886,133 @@ runtime:
             assert_eq!(param_name, "gene");
             Some("THRSP!".to_string())
         }
+    }
+
+    struct StubRelevanceScorer {
+        relevant_tool: Option<&'static str>,
+        fallback: Option<bool>,
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl StubRelevanceScorer {
+        fn relevant(tool_ref: &'static str) -> Self {
+            Self {
+                relevant_tool: Some(tool_ref),
+                fallback: Some(false),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn always(result: Option<bool>) -> Self {
+            Self {
+                relevant_tool: None,
+                fallback: result,
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl RelevanceScorer for StubRelevanceScorer {
+        fn is_relevant(
+            &self,
+            hypothesis_statement: &str,
+            tool_ref: &str,
+            tool_description: &str,
+        ) -> Option<bool> {
+            assert!(hypothesis_statement.contains("THRSP"));
+            assert!(!tool_description.trim().is_empty());
+            self.calls.borrow_mut().push(tool_ref.to_string());
+            if self.relevant_tool == Some(tool_ref) {
+                Some(true)
+            } else {
+                self.fallback
+            }
+        }
+    }
+
+    fn register_semantic_tool(
+        store: &ProjectStore,
+        name: &str,
+        maturity: &str,
+        description: &str,
+        inputs: &[(&str, &str)],
+    ) {
+        let input_yaml = if inputs.is_empty() {
+            String::new()
+        } else {
+            let entries = inputs
+                .iter()
+                .map(|(name, type_name)| {
+                    format!("  {name}:\n    type: {type_name}\n    required: true\n")
+                })
+                .collect::<String>();
+            format!("inputs:\n{entries}")
+        };
+        let spec = ToolSpec::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: {name}
+version: 0.1.0
+maturity: {maturity}
+description: {description}
+{input_yaml}outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#
+        ))
+        .unwrap();
+        store.register_tool(spec).unwrap();
+    }
+
+    fn register_semantic_rerank_tools(store: &ProjectStore) {
+        register_semantic_tool(
+            store,
+            "score_low_current",
+            "verified",
+            "validation helper for unrelated prioritization",
+            &[
+                ("expression_table", "ExpressionTable"),
+                ("cohort_table", "CohortTable"),
+            ],
+        );
+        register_semantic_tool(
+            store,
+            "latent_assoc",
+            "verified",
+            "mechanism analysis for latent association",
+            &[],
+        );
+        register_semantic_tool(
+            store,
+            "io_medium",
+            "exploratory",
+            "generic assay runner",
+            &[("expression_table", "ExpressionTable")],
+        );
+    }
+
+    fn setup_semantic_project(test_name: &str) -> (PathBuf, ProjectStore) {
+        let (path, store) = init_project(test_name);
+        register_semantic_rerank_tools(&store);
+        import_expression_artifact(&store, &path);
+        let hypothesis_id = record_hypothesis(&store, "THRSP survival mechanism needs validation");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is below the decision margin.",
+        );
+        (path, store)
     }
 
     fn import_expression_artifact(store: &ProjectStore, root: &std::path::Path) -> String {
@@ -2952,6 +3188,198 @@ steps:
 
         let step = report.branch_proposals[0].drafted_step.as_ref().unwrap();
         assert_eq!(step.params, vec![("gene".to_string(), "THRSP".to_string())]);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn semantic_relevance_true_promotes_low_candidate_and_changes_top_choice() {
+        let (path, store) = setup_semantic_project("semantic-true-rerank");
+        let scorer = StubRelevanceScorer::relevant("analysis/latent_assoc");
+
+        let report = store
+            .run_cycle_with_scorer(ApplyConfig::default(), &NoopParamInferer, &scorer)
+            .unwrap();
+
+        let proposal = &report.branch_proposals[0];
+        assert_eq!(
+            proposal.matched_tool.as_deref(),
+            Some("analysis/latent_assoc")
+        );
+        assert_eq!(proposal.matched_fit.as_deref(), Some("medium"));
+        assert!(proposal
+            .match_reason
+            .as_deref()
+            .unwrap()
+            .contains("relevance:semantic"));
+        assert_eq!(
+            scorer.calls(),
+            vec![
+                "analysis/score_low_current".to_string(),
+                "analysis/latent_assoc".to_string()
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn semantic_relevance_false_or_none_do_not_promote_or_rerank() {
+        for (suffix, result) in [("false", Some(false)), ("none", None)] {
+            let (path, store) = setup_semantic_project(&format!("semantic-{suffix}-no-promote"));
+            let scorer = StubRelevanceScorer::always(result);
+
+            let report = store
+                .run_cycle_with_scorer(ApplyConfig::default(), &NoopParamInferer, &scorer)
+                .unwrap();
+
+            let proposal = &report.branch_proposals[0];
+            assert_eq!(
+                proposal.matched_tool.as_deref(),
+                Some("analysis/score_low_current")
+            );
+            assert_eq!(proposal.matched_fit.as_deref(), Some("low"));
+            assert!(!proposal
+                .match_reason
+                .as_deref()
+                .unwrap()
+                .contains("relevance:semantic"));
+
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[test]
+    fn run_cycle_with_uses_noop_relevance_scorer_by_default() {
+        let (path, store) = setup_semantic_project("semantic-noop-default");
+
+        let report = store
+            .run_cycle_with(ApplyConfig::default(), &NoopParamInferer)
+            .unwrap();
+
+        let proposal = &report.branch_proposals[0];
+        assert_eq!(
+            proposal.matched_tool.as_deref(),
+            Some("analysis/score_low_current")
+        );
+        assert_eq!(proposal.matched_fit.as_deref(), Some("low"));
+        assert!(!proposal
+            .match_reason
+            .as_deref()
+            .unwrap()
+            .contains("relevance:semantic"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn noop_relevance_scorer_preserves_existing_branch_matching() {
+        let (path, store) = setup_semantic_project("semantic-noop-explicit");
+        let scorer = NoopRelevanceScorer;
+
+        let report = store
+            .run_cycle_with_scorer(ApplyConfig::default(), &NoopParamInferer, &scorer)
+            .unwrap();
+
+        let proposal = &report.branch_proposals[0];
+        assert_eq!(
+            proposal.matched_tool.as_deref(),
+            Some("analysis/score_low_current")
+        );
+        assert_eq!(proposal.matched_fit.as_deref(), Some("low"));
+        assert!(!proposal
+            .match_reason
+            .as_deref()
+            .unwrap()
+            .contains("relevance:semantic"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn semantic_relevance_does_not_trigger_for_high_fit_candidates() {
+        let (path, store) = init_project("semantic-high-skip");
+        let scorer = StubRelevanceScorer::always(Some(true));
+        let mut candidates = vec![ToolCandidate {
+            tool_ref: "analysis/unregistered_high".to_string(),
+            fit: Fit::High,
+            score: 1,
+            reason: "io:exact".to_string(),
+        }];
+
+        let promoted = super::apply_semantic_relevance_to_candidates(
+            &store,
+            &mut candidates,
+            "THRSP survival mechanism needs validation",
+            &scorer,
+        )
+        .unwrap();
+
+        assert!(!promoted);
+        assert_eq!(candidates[0].fit, Fit::High);
+        assert!(scorer.calls().is_empty());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn semantic_relevance_calls_are_capped_to_top_three_low_candidates() {
+        let (path, store) = init_project("semantic-top-k");
+        for name in ["low_one", "low_two", "low_three", "outside_target"] {
+            register_semantic_tool(
+                &store,
+                name,
+                "verified",
+                "validation helper for bounded semantic scoring",
+                &[],
+            );
+        }
+        let scorer = StubRelevanceScorer::relevant("analysis/outside_target");
+        let mut candidates = vec![
+            ToolCandidate {
+                tool_ref: "analysis/low_one".to_string(),
+                fit: Fit::Low,
+                score: 8,
+                reason: "candidate one".to_string(),
+            },
+            ToolCandidate {
+                tool_ref: "analysis/low_two".to_string(),
+                fit: Fit::Low,
+                score: 7,
+                reason: "candidate two".to_string(),
+            },
+            ToolCandidate {
+                tool_ref: "analysis/low_three".to_string(),
+                fit: Fit::Low,
+                score: 6,
+                reason: "candidate three".to_string(),
+            },
+            ToolCandidate {
+                tool_ref: "analysis/outside_target".to_string(),
+                fit: Fit::Low,
+                score: 5,
+                reason: "candidate four".to_string(),
+            },
+        ];
+
+        let promoted = super::apply_semantic_relevance_to_candidates(
+            &store,
+            &mut candidates,
+            "THRSP survival mechanism needs validation",
+            &scorer,
+        )
+        .unwrap();
+
+        assert!(!promoted);
+        assert_eq!(
+            scorer.calls(),
+            vec![
+                "analysis/low_one".to_string(),
+                "analysis/low_two".to_string(),
+                "analysis/low_three".to_string()
+            ]
+        );
+        assert_eq!(candidates[3].fit, Fit::Low);
 
         let _ = std::fs::remove_dir_all(path);
     }

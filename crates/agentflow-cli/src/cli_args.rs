@@ -554,6 +554,8 @@ pub(crate) struct AgentRunArgs {
     pub(crate) propose_synth: bool,
     #[arg(long)]
     pub(crate) infer_params: bool,
+    #[arg(long)]
+    pub(crate) semantic_match: bool,
     #[arg(long, value_name = "cmd")]
     pub(crate) synthesizer: Vec<String>,
     #[arg(long)]

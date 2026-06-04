@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
 use crate::domain::StepStatus;
 use crate::storage::{EventRecord, ProjectStore, StorageError};
@@ -110,11 +111,7 @@ impl ProjectStore {
                 | GRAPH_PATCH_REJECTED_EVENT
                 | GRAPH_PATCH_APPLIED_EVENT => {
                     let patch_id =
-                        json_string_field(&payload_json, "patch_id").ok_or_else(|| {
-                            StorageError::InvalidInput(format!(
-                                "graph patch decision {event_id} is missing patch_id"
-                            ))
-                        })?;
+                        graph_patch_decision_payload_from_json(&event_id, &payload_json)?.patch_id;
                     if let Some(patch) = patches.iter_mut().find(|patch| patch.id == patch_id) {
                         apply_decision(patch, &event_type, &payload_json, created_at)?;
                     }
@@ -252,7 +249,8 @@ impl ProjectStore {
 
         for row in rows {
             let (event_type, payload_json, created_at) = row?;
-            if json_string_field(&payload_json, "patch_id").as_deref() == Some(patch_id) {
+            if graph_patch_decision_payload_from_json(patch_id, &payload_json)?.patch_id == patch_id
+            {
                 apply_decision(&mut patch, &event_type, &payload_json, created_at)?;
             }
         }
@@ -284,26 +282,69 @@ fn graph_patch_from_proposal(
     payload_json: &str,
     created_at: i64,
 ) -> Result<GraphPatchRecord, StorageError> {
-    let title = json_string_field(payload_json, "title").ok_or_else(|| {
-        StorageError::InvalidInput(format!("graph patch proposal {id} is missing title"))
-    })?;
-    let reason = json_string_field(payload_json, "reason").ok_or_else(|| {
-        StorageError::InvalidInput(format!("graph patch proposal {id} is missing reason"))
-    })?;
-    let patch_json = json_string_field(payload_json, "patch_json").ok_or_else(|| {
-        StorageError::InvalidInput(format!("graph patch proposal {id} is missing patch_json"))
-    })?;
+    let payload = graph_patch_proposal_payload_from_json(&id, payload_json)?;
 
     Ok(GraphPatchRecord {
         id,
         flow_id,
-        title,
-        reason,
-        patch_json,
+        title: payload.title,
+        reason: payload.reason,
+        patch_json: payload.patch_json,
         status: "pending".to_string(),
         decision_reason: None,
         created_at,
         decided_at: None,
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GraphPatchProposalPayload {
+    title: String,
+    reason: String,
+    patch_json: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GraphPatchDecisionPayload {
+    patch_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GraphPatchApplicationPayload {
+    patch_id: String,
+    applied_steps: Vec<String>,
+    applied_edges: Vec<GraphPatchEdgePayload>,
+    updated_steps: Vec<String>,
+    invalidated_steps: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GraphPatchEdgePayload {
+    from: String,
+    to: String,
+}
+
+fn graph_patch_proposal_payload_from_json(
+    event_id: &str,
+    payload_json: &str,
+) -> Result<GraphPatchProposalPayload, StorageError> {
+    serde_json::from_str(payload_json).map_err(|err| {
+        StorageError::InvalidInput(format!(
+            "graph patch proposal {event_id} has invalid payload: {err}"
+        ))
+    })
+}
+
+fn graph_patch_decision_payload_from_json(
+    event_id: &str,
+    payload_json: &str,
+) -> Result<GraphPatchDecisionPayload, StorageError> {
+    serde_json::from_str(payload_json).map_err(|err| {
+        StorageError::InvalidInput(format!(
+            "graph patch decision {event_id} has invalid payload: {err}"
+        ))
     })
 }
 
@@ -329,7 +370,8 @@ fn apply_decision(
         }
         GRAPH_PATCH_REJECTED_EVENT => {
             patch.status = "rejected".to_string();
-            patch.decision_reason = json_string_field(payload_json, "reason");
+            patch.decision_reason =
+                graph_patch_decision_payload_from_json(&patch.id, payload_json)?.reason;
             patch.decided_at = Some(created_at);
             Ok(())
         }
@@ -734,197 +776,118 @@ fn invalidate_steps(
 fn parse_graph_patch_operations(
     patch_json: &str,
 ) -> Result<Vec<GraphPatchOperation>, StorageError> {
-    let root = JsonParser::new(patch_json).parse()?;
-    let root = root.as_object().ok_or_else(|| {
-        StorageError::InvalidInput("graph patch JSON must be an object".to_string())
+    let payload: GraphPatchOperationsPayload = serde_json::from_str(patch_json).map_err(|err| {
+        StorageError::InvalidInput(format!("graph patch JSON has invalid payload: {err}"))
     })?;
-    let ops = root
-        .get("ops")
-        .ok_or_else(|| StorageError::InvalidInput("graph patch JSON is missing ops".to_string()))?
-        .as_array()
-        .ok_or_else(|| {
-            StorageError::InvalidInput("graph patch ops must be an array".to_string())
-        })?;
-
-    ops.iter()
-        .map(|op| {
-            let op = op.as_object().ok_or_else(|| {
-                StorageError::InvalidInput("graph patch operation must be an object".to_string())
-            })?;
-            let op_name = required_json_string(op, "op")?;
-            match op_name.as_str() {
-                "add_step" => Ok(GraphPatchOperation::AddStep(FlowStepDraft {
-                    id: required_json_string(op, "id")?,
-                    tool_ref: required_json_string(op, "tool")?,
-                    needs: optional_json_string_array(op, "needs")?,
-                    reason: optional_json_string(op, "reason")?,
-                    inputs: optional_json_string_map(op, "inputs")?,
-                    params: optional_json_string_map(op, "params")?,
-                    outputs: optional_json_string_map(op, "outputs")?,
-                })),
-                "add_edge" => Ok(GraphPatchOperation::AddEdge {
-                    from: required_json_string(op, "from")?,
-                    to: required_json_string(op, "to")?,
-                }),
-                "update_params" => Ok(GraphPatchOperation::UpdateParams {
-                    step: required_json_string(op, "step")?,
-                    params: required_json_string_map(op, "params")?,
-                }),
-                other => Err(StorageError::InvalidInput(format!(
-                    "unsupported graph patch op {other}"
-                ))),
-            }
-        })
+    payload
+        .ops
+        .into_iter()
+        .map(GraphPatchOperationPayload::into_operation)
         .collect()
 }
 
-fn required_json_string(
-    object: &BTreeMap<String, JsonValue>,
-    field: &str,
-) -> Result<String, StorageError> {
-    object
-        .get(field)
-        .and_then(JsonValue::as_string)
-        .map(str::to_string)
+#[derive(Debug, Deserialize)]
+struct GraphPatchOperationsPayload {
+    ops: Vec<GraphPatchOperationPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphPatchOperationPayload {
+    op: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "tool")]
+    tool_ref: Option<String>,
+    #[serde(default)]
+    needs: Vec<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    inputs: BTreeMap<String, String>,
+    #[serde(default)]
+    params: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    outputs: BTreeMap<String, String>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    step: Option<String>,
+}
+
+impl GraphPatchOperationPayload {
+    fn into_operation(self) -> Result<GraphPatchOperation, StorageError> {
+        match self.op.as_str() {
+            "add_step" => Ok(GraphPatchOperation::AddStep(FlowStepDraft {
+                id: self.required_string("id")?,
+                tool_ref: self.required_string("tool")?,
+                needs: self.needs,
+                reason: self.reason,
+                inputs: self.inputs,
+                params: self.params.unwrap_or_default(),
+                outputs: self.outputs,
+            })),
+            "add_edge" => Ok(GraphPatchOperation::AddEdge {
+                from: self.required_string("from")?,
+                to: self.required_string("to")?,
+            }),
+            "update_params" => Ok(GraphPatchOperation::UpdateParams {
+                step: self.required_string("step")?,
+                params: self.required_params()?,
+            }),
+            other => Err(StorageError::InvalidInput(format!(
+                "unsupported graph patch op {other}"
+            ))),
+        }
+    }
+
+    fn required_string(&self, field: &str) -> Result<String, StorageError> {
+        match field {
+            "id" => self.id.clone(),
+            "tool" => self.tool_ref.clone(),
+            "from" => self.from.clone(),
+            "to" => self.to.clone(),
+            "step" => self.step.clone(),
+            _ => None,
+        }
         .ok_or_else(|| {
             StorageError::InvalidInput(format!("graph patch operation is missing string {field}"))
         })
-}
-
-fn optional_json_string(
-    object: &BTreeMap<String, JsonValue>,
-    field: &str,
-) -> Result<Option<String>, StorageError> {
-    object
-        .get(field)
-        .map(|value| {
-            value.as_string().map(str::to_string).ok_or_else(|| {
-                StorageError::InvalidInput(format!("graph patch field {field} must be a string"))
-            })
-        })
-        .transpose()
-}
-
-fn optional_json_string_array(
-    object: &BTreeMap<String, JsonValue>,
-    field: &str,
-) -> Result<Vec<String>, StorageError> {
-    let Some(value) = object.get(field) else {
-        return Ok(Vec::new());
-    };
-    let values = value.as_array().ok_or_else(|| {
-        StorageError::InvalidInput(format!("graph patch field {field} must be an array"))
-    })?;
-    values
-        .iter()
-        .map(|value| {
-            value.as_string().map(str::to_string).ok_or_else(|| {
-                StorageError::InvalidInput(format!(
-                    "graph patch field {field} must contain only strings"
-                ))
-            })
-        })
-        .collect()
-}
-
-fn optional_json_string_map(
-    object: &BTreeMap<String, JsonValue>,
-    field: &str,
-) -> Result<BTreeMap<String, String>, StorageError> {
-    let Some(value) = object.get(field) else {
-        return Ok(BTreeMap::new());
-    };
-    let map = value.as_object().ok_or_else(|| {
-        StorageError::InvalidInput(format!("graph patch field {field} must be an object"))
-    })?;
-    map.iter()
-        .map(|(key, value)| {
-            let value = value.as_string().ok_or_else(|| {
-                StorageError::InvalidInput(format!(
-                    "graph patch field {field}.{key} must be a string"
-                ))
-            })?;
-            Ok((key.clone(), value.to_string()))
-        })
-        .collect()
-}
-
-fn required_json_string_map(
-    object: &BTreeMap<String, JsonValue>,
-    field: &str,
-) -> Result<BTreeMap<String, String>, StorageError> {
-    if !object.contains_key(field) {
-        return Err(StorageError::InvalidInput(format!(
-            "graph patch operation is missing object {field}"
-        )));
     }
-    optional_json_string_map(object, field)
+
+    fn required_params(&self) -> Result<BTreeMap<String, String>, StorageError> {
+        self.params.clone().ok_or_else(|| {
+            StorageError::InvalidInput("graph patch operation is missing object params".to_string())
+        })
+    }
 }
 
 fn application_payload_json(application: &GraphPatchApplication) -> String {
-    let steps = application
-        .applied_steps
-        .iter()
-        .map(|step| format!("\"{}\"", escape_json(step)))
-        .collect::<Vec<_>>()
-        .join(",");
-    let edges = application
-        .applied_edges
-        .iter()
-        .map(|(from, to)| {
-            format!(
-                "{{\"from\":\"{}\",\"to\":\"{}\"}}",
-                escape_json(from),
-                escape_json(to)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let updated_steps = application
-        .updated_steps
-        .iter()
-        .map(|step| format!("\"{}\"", escape_json(step)))
-        .collect::<Vec<_>>()
-        .join(",");
-    let invalidated_steps = application
-        .invalidated_steps
-        .iter()
-        .map(|step| format!("\"{}\"", escape_json(step)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "{{\"patch_id\":\"{}\",\"applied_steps\":[{}],\"applied_edges\":[{}],\"updated_steps\":[{}],\"invalidated_steps\":[{}]}}",
-        escape_json(&application.patch_id),
-        steps,
-        edges,
-        updated_steps,
-        invalidated_steps
-    )
+    serde_json::to_string(&GraphPatchApplicationPayload {
+        patch_id: application.patch_id.clone(),
+        applied_steps: application.applied_steps.clone(),
+        applied_edges: application
+            .applied_edges
+            .iter()
+            .map(|(from, to)| GraphPatchEdgePayload {
+                from: from.clone(),
+                to: to.clone(),
+            })
+            .collect(),
+        updated_steps: application.updated_steps.clone(),
+        invalidated_steps: application.invalidated_steps.clone(),
+    })
+    .expect("graph patch application payload serializes to JSON")
 }
 
 fn parse_json_map(input: &str) -> Result<BTreeMap<String, String>, StorageError> {
-    let root = JsonParser::new(input).parse()?;
-    let object = root
-        .as_object()
-        .ok_or_else(|| StorageError::InvalidInput("expected JSON object".to_string()))?;
-    object
-        .iter()
-        .map(|(key, value)| {
-            let value = value.as_string().ok_or_else(|| {
-                StorageError::InvalidInput(format!("JSON map field {key} must be a string"))
-            })?;
-            Ok((key.clone(), value.to_string()))
-        })
-        .collect()
+    serde_json::from_str(input)
+        .map_err(|err| StorageError::InvalidInput(format!("cannot parse JSON map: {err}")))
 }
 
 fn map_json(map: &BTreeMap<String, String>) -> String {
-    let fields = map
-        .iter()
-        .map(|(key, value)| format!("\"{}\":\"{}\"", escape_json(key), escape_json(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{fields}}}")
+    serde_json::to_string(map).expect("graph patch map serializes to JSON")
 }
 
 fn db_step_id(flow_id: &str, step_id: &str) -> String {
@@ -936,29 +899,20 @@ fn edge_id(flow_id: &str, from_step_id: &str, to_step_id: &str) -> String {
 }
 
 fn proposal_payload_json(title: &str, reason: &str, patch_json: &str) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"title\":\"{}\",",
-            "\"reason\":\"{}\",",
-            "\"patch_json\":\"{}\"",
-            "}}"
-        ),
-        escape_json(title),
-        escape_json(reason),
-        escape_json(patch_json),
-    )
+    serde_json::to_string(&GraphPatchProposalPayload {
+        title: title.to_string(),
+        reason: reason.to_string(),
+        patch_json: patch_json.to_string(),
+    })
+    .expect("graph patch proposal payload serializes to JSON")
 }
 
 fn decision_payload_json(patch_id: &str, reason: Option<&str>) -> String {
-    match reason {
-        Some(reason) => format!(
-            "{{\"patch_id\":\"{}\",\"reason\":\"{}\"}}",
-            escape_json(patch_id),
-            escape_json(reason),
-        ),
-        None => format!("{{\"patch_id\":\"{}\"}}", escape_json(patch_id)),
-    }
+    serde_json::to_string(&GraphPatchDecisionPayload {
+        patch_id: patch_id.to_string(),
+        reason: reason.map(str::to_string),
+    })
+    .expect("graph patch decision payload serializes to JSON")
 }
 
 fn validate_flow_id(flow_id: &str) -> Result<&str, StorageError> {
@@ -993,288 +947,9 @@ fn validate_non_empty<'a>(label: &str, value: &'a str) -> Result<&'a str, Storag
     }
 }
 
-fn json_string_field(json: &str, field: &str) -> Option<String> {
-    let needle = format!("\"{field}\":\"");
-    let start = json.find(&needle)? + needle.len();
-    let rest = &json[start..];
-    let end = find_json_string_end(rest)?;
-    Some(unescape_json_string(&rest[..end]))
-}
-
-fn find_json_string_end(input: &str) -> Option<usize> {
-    let mut escaped = false;
-    for (index, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(index),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn unescape_json_string(input: &str) -> String {
-    let mut output = String::new();
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            output.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('"') => output.push('"'),
-            Some('\\') => output.push('\\'),
-            Some('n') => output.push('\n'),
-            Some('r') => output.push('\r'),
-            Some('t') => output.push('\t'),
-            Some('u') => {
-                let digits = chars.by_ref().take(4).collect::<String>();
-                if let Ok(code) = u32::from_str_radix(&digits, 16) {
-                    if let Some(decoded) = char::from_u32(code) {
-                        output.push(decoded);
-                    }
-                }
-            }
-            Some(other) => output.push(other),
-            None => break,
-        }
-    }
-    output
-}
-
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => output.push(ch),
-        }
-    }
-    output
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum JsonValue {
-    Object(BTreeMap<String, JsonValue>),
-    Array(Vec<JsonValue>),
-    String(String),
-    Null,
-}
-
-impl JsonValue {
-    fn as_object(&self) -> Option<&BTreeMap<String, JsonValue>> {
-        match self {
-            Self::Object(value) => Some(value),
-            _ => None,
-        }
-    }
-
-    fn as_array(&self) -> Option<&[JsonValue]> {
-        match self {
-            Self::Array(value) => Some(value),
-            _ => None,
-        }
-    }
-
-    fn as_string(&self) -> Option<&str> {
-        match self {
-            Self::String(value) => Some(value),
-            _ => None,
-        }
-    }
-}
-
-struct JsonParser<'a> {
-    input: &'a str,
-    index: usize,
-}
-
-impl<'a> JsonParser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self { input, index: 0 }
-    }
-
-    fn parse(mut self) -> Result<JsonValue, StorageError> {
-        let value = self.parse_value()?;
-        self.skip_whitespace();
-        if self.index == self.input.len() {
-            Ok(value)
-        } else {
-            Err(StorageError::InvalidInput(format!(
-                "unexpected trailing JSON in graph patch: {}",
-                self.input
-            )))
-        }
-    }
-
-    fn parse_value(&mut self) -> Result<JsonValue, StorageError> {
-        self.skip_whitespace();
-        match self.peek_char() {
-            Some('{') => self.parse_object(),
-            Some('[') => self.parse_array(),
-            Some('"') => self.parse_string().map(JsonValue::String),
-            Some('n') => self.parse_null(),
-            Some(other) => Err(StorageError::InvalidInput(format!(
-                "unsupported JSON value starting with {other}"
-            ))),
-            None => Err(StorageError::InvalidInput(
-                "unexpected end of JSON".to_string(),
-            )),
-        }
-    }
-
-    fn parse_object(&mut self) -> Result<JsonValue, StorageError> {
-        self.expect_char('{')?;
-        let mut object = BTreeMap::new();
-        self.skip_whitespace();
-        if self.consume_char('}') {
-            return Ok(JsonValue::Object(object));
-        }
-
-        loop {
-            self.skip_whitespace();
-            let key = self.parse_string()?;
-            self.skip_whitespace();
-            self.expect_char(':')?;
-            let value = self.parse_value()?;
-            object.insert(key, value);
-            self.skip_whitespace();
-            if self.consume_char(',') {
-                continue;
-            }
-            self.expect_char('}')?;
-            break;
-        }
-
-        Ok(JsonValue::Object(object))
-    }
-
-    fn parse_array(&mut self) -> Result<JsonValue, StorageError> {
-        self.expect_char('[')?;
-        let mut values = Vec::new();
-        self.skip_whitespace();
-        if self.consume_char(']') {
-            return Ok(JsonValue::Array(values));
-        }
-
-        loop {
-            values.push(self.parse_value()?);
-            self.skip_whitespace();
-            if self.consume_char(',') {
-                continue;
-            }
-            self.expect_char(']')?;
-            break;
-        }
-
-        Ok(JsonValue::Array(values))
-    }
-
-    fn parse_string(&mut self) -> Result<String, StorageError> {
-        self.expect_char('"')?;
-        let mut output = String::new();
-        while let Some(ch) = self.next_char() {
-            match ch {
-                '"' => return Ok(output),
-                '\\' => output.push(self.parse_escape()?),
-                ch => output.push(ch),
-            }
-        }
-        Err(StorageError::InvalidInput(
-            "unterminated JSON string".to_string(),
-        ))
-    }
-
-    fn parse_escape(&mut self) -> Result<char, StorageError> {
-        match self.next_char() {
-            Some('"') => Ok('"'),
-            Some('\\') => Ok('\\'),
-            Some('/') => Ok('/'),
-            Some('n') => Ok('\n'),
-            Some('r') => Ok('\r'),
-            Some('t') => Ok('\t'),
-            Some('b') => Ok('\u{0008}'),
-            Some('f') => Ok('\u{000c}'),
-            Some('u') => {
-                let mut code = String::new();
-                for _ in 0..4 {
-                    code.push(self.next_char().ok_or_else(|| {
-                        StorageError::InvalidInput("incomplete JSON unicode escape".to_string())
-                    })?);
-                }
-                let value = u32::from_str_radix(&code, 16).map_err(|_| {
-                    StorageError::InvalidInput(format!("invalid JSON unicode escape {code}"))
-                })?;
-                char::from_u32(value).ok_or_else(|| {
-                    StorageError::InvalidInput(format!("invalid JSON unicode scalar {code}"))
-                })
-            }
-            Some(other) => Err(StorageError::InvalidInput(format!(
-                "unsupported JSON escape {other}"
-            ))),
-            None => Err(StorageError::InvalidInput(
-                "incomplete JSON escape".to_string(),
-            )),
-        }
-    }
-
-    fn parse_null(&mut self) -> Result<JsonValue, StorageError> {
-        if self.input[self.index..].starts_with("null") {
-            self.index += 4;
-            Ok(JsonValue::Null)
-        } else {
-            Err(StorageError::InvalidInput("invalid JSON null".to_string()))
-        }
-    }
-
-    fn expect_char(&mut self, expected: char) -> Result<(), StorageError> {
-        if self.consume_char(expected) {
-            Ok(())
-        } else {
-            Err(StorageError::InvalidInput(format!(
-                "expected JSON char {expected}"
-            )))
-        }
-    }
-
-    fn consume_char(&mut self, expected: char) -> bool {
-        if self.peek_char().is_some_and(|actual| actual == expected) {
-            self.index += expected.len_utf8();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn skip_whitespace(&mut self) {
-        while self.peek_char().is_some_and(char::is_whitespace) {
-            let ch = self.peek_char().expect("checked above");
-            self.index += ch.len_utf8();
-        }
-    }
-
-    fn peek_char(&self) -> Option<char> {
-        self.input.get(self.index..)?.chars().next()
-    }
-
-    fn next_char(&mut self) -> Option<char> {
-        let ch = self.peek_char()?;
-        self.index += ch.len_utf8();
-        Some(ch)
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
 
@@ -1397,6 +1072,130 @@ steps:
             )
             .unwrap();
         (store, path, expression_id, survival_id)
+    }
+
+    #[test]
+    fn payload_json_outputs_match_legacy_bytes() {
+        assert_eq!(
+            super::proposal_payload_json(
+                "Add \"QC\" branch",
+                "Reason with newline\n",
+                r#"{"ops":[{"op":"add_edge","from":"scan","to":"qc"}]}"#,
+            ),
+            "{\"title\":\"Add \\\"QC\\\" branch\",\"reason\":\"Reason with newline\\n\",\"patch_json\":\"{\\\"ops\\\":[{\\\"op\\\":\\\"add_edge\\\",\\\"from\\\":\\\"scan\\\",\\\"to\\\":\\\"qc\\\"}]}\"}"
+        );
+        assert_eq!(
+            super::decision_payload_json("event_1", None),
+            "{\"patch_id\":\"event_1\"}"
+        );
+        assert_eq!(
+            super::decision_payload_json("event_1", Some("Needs\treview")),
+            "{\"patch_id\":\"event_1\",\"reason\":\"Needs\\treview\"}"
+        );
+
+        let application = super::GraphPatchApplication {
+            patch_id: "event_1".to_string(),
+            flow_id: "flow_1".to_string(),
+            applied_steps: vec!["branch".to_string()],
+            applied_edges: vec![("scan".to_string(), "branch".to_string())],
+            updated_steps: vec!["scan".to_string()],
+            invalidated_steps: vec!["scan".to_string(), "branch".to_string()],
+        };
+        assert_eq!(
+            super::application_payload_json(&application),
+            "{\"patch_id\":\"event_1\",\"applied_steps\":[\"branch\"],\"applied_edges\":[{\"from\":\"scan\",\"to\":\"branch\"}],\"updated_steps\":[\"scan\"],\"invalidated_steps\":[\"scan\",\"branch\"]}"
+        );
+        assert_eq!(
+            super::map_json(&BTreeMap::from([
+                ("gene".to_string(), "TP53".to_string()),
+                ("note".to_string(), "Quote \"".to_string()),
+            ])),
+            "{\"gene\":\"TP53\",\"note\":\"Quote \\\"\"}"
+        );
+    }
+
+    #[test]
+    fn legacy_handwritten_payloads_and_ops_deserialize() {
+        let proposal: super::GraphPatchProposalPayload = serde_json::from_str(
+            r#"{
+                "patch_json": "{\"ops\":[{\"op\":\"add_edge\",\"from\":\"scan\",\"to\":\"branch\"}]}",
+                "reason": "legacy reason",
+                "title": "legacy title"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(proposal.title, "legacy title");
+        assert!(proposal.patch_json.contains("\"add_edge\""));
+
+        let decision: super::GraphPatchDecisionPayload = serde_json::from_str(
+            r#"{
+                "patch_id": "event_1",
+                "applied_steps": ["branch"],
+                "applied_edges": [{"from": "scan", "to": "branch"}],
+                "updated_steps": [],
+                "invalidated_steps": []
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(decision.patch_id, "event_1");
+        assert!(decision.reason.is_none());
+
+        let application: super::GraphPatchApplicationPayload = serde_json::from_str(
+            r#"{
+                "patch_id": "event_1",
+                "applied_steps": ["branch"],
+                "applied_edges": [{"from": "scan", "to": "branch"}],
+                "updated_steps": ["scan"],
+                "invalidated_steps": ["scan", "branch"]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(application.applied_edges[0].from, "scan");
+        assert_eq!(application.updated_steps, vec!["scan"]);
+
+        let operations = super::parse_graph_patch_operations(
+            r#"{
+                "ops": [
+                    {
+                        "op": "add_step",
+                        "id": "branch",
+                        "tool": "marker/marker_survival_scan",
+                        "needs": ["scan"],
+                        "reason": "branch reason",
+                        "inputs": {"expression_table": "artifact_1"},
+                        "params": {"gene": "EGFR"},
+                        "outputs": {"report": "branch_report"}
+                    },
+                    {"op": "add_edge", "from": "scan", "to": "branch"},
+                    {"op": "update_params", "step": "scan", "params": {"gene": "ALK"}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(operations.len(), 3);
+        match &operations[0] {
+            super::GraphPatchOperation::AddStep(step) => {
+                assert_eq!(step.id, "branch");
+                assert_eq!(step.tool_ref, "marker/marker_survival_scan");
+                assert_eq!(step.needs, vec!["scan"]);
+                assert_eq!(step.params["gene"], "EGFR");
+            }
+            other => panic!("expected add_step, got {other:?}"),
+        }
+        match &operations[1] {
+            super::GraphPatchOperation::AddEdge { from, to } => {
+                assert_eq!(from, "scan");
+                assert_eq!(to, "branch");
+            }
+            other => panic!("expected add_edge, got {other:?}"),
+        }
+        match &operations[2] {
+            super::GraphPatchOperation::UpdateParams { step, params } => {
+                assert_eq!(step, "scan");
+                assert_eq!(params["gene"], "ALK");
+            }
+            other => panic!("expected update_params, got {other:?}"),
+        }
     }
 
     #[test]

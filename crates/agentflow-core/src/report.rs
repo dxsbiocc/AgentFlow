@@ -843,125 +843,8 @@ fn observation_belongs_to_flow(
 }
 
 fn parse_json_map(input: &str) -> Result<BTreeMap<String, String>, StorageError> {
-    let mut map = BTreeMap::new();
-    let mut index = 0;
-    skip_json_whitespace(input, &mut index);
-    expect_json_char(input, &mut index, '{')?;
-    skip_json_whitespace(input, &mut index);
-    if consume_json_char(input, &mut index, '}') {
-        return Ok(map);
-    }
-
-    loop {
-        let key = parse_json_string(input, &mut index)?;
-        skip_json_whitespace(input, &mut index);
-        expect_json_char(input, &mut index, ':')?;
-        skip_json_whitespace(input, &mut index);
-        let value = parse_json_string(input, &mut index)?;
-        map.insert(key, value);
-        skip_json_whitespace(input, &mut index);
-        if consume_json_char(input, &mut index, ',') {
-            skip_json_whitespace(input, &mut index);
-            continue;
-        }
-        if consume_json_char(input, &mut index, '}') {
-            break;
-        }
-        return Err(StorageError::InvalidInput(format!(
-            "cannot parse report map: {input}"
-        )));
-    }
-
-    skip_json_whitespace(input, &mut index);
-    if index != input.len() {
-        return Err(StorageError::InvalidInput(format!(
-            "cannot parse report map: {input}"
-        )));
-    }
-    Ok(map)
-}
-
-fn parse_json_string(input: &str, index: &mut usize) -> Result<String, StorageError> {
-    expect_json_char(input, index, '"')?;
-    let rest = input.get(*index..).ok_or_else(|| {
-        StorageError::InvalidInput(format!("cannot parse json string in report map: {input}"))
-    })?;
-    let end = find_json_string_end(rest)
-        .ok_or_else(|| StorageError::InvalidInput(format!("cannot parse report map: {input}")))?;
-    let value = unescape_json_string(&rest[..end]);
-    *index += end + 1;
-    Ok(value)
-}
-
-fn expect_json_char(input: &str, index: &mut usize, expected: char) -> Result<(), StorageError> {
-    if consume_json_char(input, index, expected) {
-        Ok(())
-    } else {
-        Err(StorageError::InvalidInput(format!(
-            "expected '{expected}' while parsing report map: {input}"
-        )))
-    }
-}
-
-fn consume_json_char(input: &str, index: &mut usize, expected: char) -> bool {
-    if input
-        .get(*index..)
-        .and_then(|rest| rest.chars().next())
-        .is_some_and(|actual| actual == expected)
-    {
-        *index += expected.len_utf8();
-        true
-    } else {
-        false
-    }
-}
-
-fn skip_json_whitespace(input: &str, index: &mut usize) {
-    while input
-        .get(*index..)
-        .and_then(|rest| rest.chars().next())
-        .is_some_and(char::is_whitespace)
-    {
-        let ch = input[*index..].chars().next().expect("checked above");
-        *index += ch.len_utf8();
-    }
-}
-
-fn find_json_string_end(input: &str) -> Option<usize> {
-    let mut escaped = false;
-    for (index, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(index),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn unescape_json_string(input: &str) -> String {
-    let mut output = String::new();
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('"') => output.push('"'),
-                Some('\\') => output.push('\\'),
-                Some('n') => output.push('\n'),
-                Some('r') => output.push('\r'),
-                Some('t') => output.push('\t'),
-                Some(other) => output.push(other),
-                None => {}
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-    output
+    serde_json::from_str(input)
+        .map_err(|err| StorageError::InvalidInput(format!("cannot parse report map: {err}")))
 }
 
 fn format_optional_i32(value: Option<i32>) -> String {
@@ -1097,6 +980,22 @@ fi
             parse_json_map(r#"{"gene":"TP53,EGFR:ALK","label":"quoted \"value\""}"#).unwrap();
         assert_eq!(parsed["gene"], "TP53,EGFR:ALK");
         assert_eq!(parsed["label"], "quoted \"value\"");
+    }
+
+    #[test]
+    fn legacy_json_map_payloads_parse_with_whitespace_and_escapes() {
+        let parsed = parse_json_map(
+            r#"{
+                "label": "quoted \"value\"",
+                "path": "C:\\work\\report",
+                "line": "first\nsecond"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed["label"], "quoted \"value\"");
+        assert_eq!(parsed["path"], r#"C:\work\report"#);
+        assert_eq!(parsed["line"], "first\nsecond");
     }
 
     #[test]

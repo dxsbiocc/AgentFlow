@@ -1,4 +1,5 @@
 use rusqlite::params;
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::observer::normalize_metric_name;
 use crate::storage::{ArtifactSummary, EventRecord, ProjectStore, StorageError};
@@ -15,7 +16,7 @@ pub struct BranchComparisonRequest {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchComparisonRecord {
     pub id: String,
     pub flow_id: String,
@@ -36,12 +37,14 @@ pub struct MetricComparisonRequest {
     pub direction: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricComparisonResult {
     pub comparison: BranchComparisonRecord,
     pub metric: String,
     pub direction: String,
+    #[serde(serialize_with = "serialize_metric_value")]
     pub baseline_value: f64,
+    #[serde(serialize_with = "serialize_metric_value")]
     pub candidate_value: f64,
     pub baseline_artifact_id: String,
     pub candidate_artifact_id: String,
@@ -49,53 +52,13 @@ pub struct MetricComparisonResult {
 
 impl MetricComparisonResult {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"comparison\":{},",
-                "\"metric\":\"{}\",",
-                "\"direction\":\"{}\",",
-                "\"baseline_value\":{},",
-                "\"candidate_value\":{},",
-                "\"baseline_artifact_id\":\"{}\",",
-                "\"candidate_artifact_id\":\"{}\"",
-                "}}"
-            ),
-            self.comparison.to_json(),
-            escape_json(&self.metric),
-            escape_json(&self.direction),
-            format_metric_value(self.baseline_value),
-            format_metric_value(self.candidate_value),
-            escape_json(&self.baseline_artifact_id),
-            escape_json(&self.candidate_artifact_id)
-        )
+        serde_json::to_string(self).expect("metric comparison result serializes to JSON")
     }
 }
 
 impl BranchComparisonRecord {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"id\":\"{}\",",
-                "\"flow_id\":\"{}\",",
-                "\"baseline_step\":\"{}\",",
-                "\"candidate_step\":\"{}\",",
-                "\"summary\":\"{}\",",
-                "\"winner\":{},",
-                "\"reason\":{},",
-                "\"created_at\":{}",
-                "}}"
-            ),
-            escape_json(&self.id),
-            escape_json(&self.flow_id),
-            escape_json(&self.baseline_step),
-            escape_json(&self.candidate_step),
-            escape_json(&self.summary),
-            optional_json_string(self.winner.as_deref()),
-            optional_json_string(self.reason.as_deref()),
-            self.created_at
-        )
+        serde_json::to_string(self).expect("branch comparison record serializes to JSON")
     }
 }
 
@@ -414,23 +377,44 @@ fn format_metric_value(value: f64) -> String {
     }
 }
 
+fn serialize_metric_value<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if value.is_finite()
+        && value.fract() == 0.0
+        && *value >= i64::MIN as f64
+        && *value <= i64::MAX as f64
+    {
+        serializer.serialize_i64(*value as i64)
+    } else {
+        serializer.serialize_f64(*value)
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct BranchComparisonPayload {
+    #[serde(default)]
+    baseline_step: String,
+    #[serde(default)]
+    candidate_step: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    winner: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 fn comparison_payload_json(request: &BranchComparisonRequest) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"baseline_step\":\"{}\",",
-            "\"candidate_step\":\"{}\",",
-            "\"summary\":\"{}\",",
-            "\"winner\":{},",
-            "\"reason\":{}",
-            "}}"
-        ),
-        escape_json(request.baseline_step.trim()),
-        escape_json(request.candidate_step.trim()),
-        escape_json(request.summary.trim()),
-        optional_json_string(request.winner.as_deref().map(str::trim)),
-        optional_json_string(request.reason.as_deref().map(str::trim))
-    )
+    serde_json::to_string(&BranchComparisonPayload {
+        baseline_step: request.baseline_step.trim().to_string(),
+        candidate_step: request.candidate_step.trim().to_string(),
+        summary: request.summary.trim().to_string(),
+        winner: trimmed_non_empty(request.winner.as_deref()),
+        reason: trimmed_non_empty(request.reason.as_deref()),
+    })
+    .expect("branch comparison payload serializes to JSON")
 }
 
 fn comparison_from_event(
@@ -439,88 +423,32 @@ fn comparison_from_event(
     payload_json: &str,
     created_at: i64,
 ) -> Result<BranchComparisonRecord, rusqlite::Error> {
+    let payload = comparison_payload_from_json(payload_json)?;
     Ok(BranchComparisonRecord {
         id,
         flow_id,
-        baseline_step: json_string_field(payload_json, "baseline_step").unwrap_or_default(),
-        candidate_step: json_string_field(payload_json, "candidate_step").unwrap_or_default(),
-        summary: json_string_field(payload_json, "summary").unwrap_or_default(),
-        winner: json_nullable_string_field(payload_json, "winner"),
-        reason: json_nullable_string_field(payload_json, "reason"),
+        baseline_step: payload.baseline_step,
+        candidate_step: payload.candidate_step,
+        summary: payload.summary,
+        winner: payload.winner,
+        reason: payload.reason,
         created_at,
     })
 }
 
-fn optional_json_string(value: Option<&str>) -> String {
-    value.filter(|inner| !inner.trim().is_empty()).map_or_else(
-        || "null".to_string(),
-        |inner| format!("\"{}\"", escape_json(inner)),
-    )
+fn comparison_payload_from_json(
+    payload_json: &str,
+) -> Result<BranchComparisonPayload, rusqlite::Error> {
+    serde_json::from_str(payload_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err))
+    })
 }
 
-fn json_nullable_string_field(json: &str, field: &str) -> Option<String> {
-    json_string_field(json, field)
-}
-
-fn json_string_field(json: &str, field: &str) -> Option<String> {
-    let marker = format!("\"{field}\":\"");
-    let start = json.find(&marker)? + marker.len();
-    let rest = &json[start..];
-    let end = find_json_string_end(rest)?;
-    Some(unescape_json_string(&rest[..end]))
-}
-
-fn find_json_string_end(input: &str) -> Option<usize> {
-    let mut escaped = false;
-    for (index, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(index),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn unescape_json_string(input: &str) -> String {
-    let mut output = String::new();
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            output.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('"') => output.push('"'),
-            Some('\\') => output.push('\\'),
-            Some('n') => output.push('\n'),
-            Some('r') => output.push('\r'),
-            Some('t') => output.push('\t'),
-            Some(other) => output.push(other),
-            None => break,
-        }
-    }
-    output
-}
-
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => output.push(ch),
-        }
-    }
-    output
+fn trimmed_non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|inner| !inner.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -533,7 +461,10 @@ mod tests {
         ProjectStore, ToolSpec,
     };
 
-    use super::{BranchComparisonRequest, MetricComparisonRequest};
+    use super::{
+        BranchComparisonPayload, BranchComparisonRecord, BranchComparisonRequest,
+        MetricComparisonRequest, MetricComparisonResult,
+    };
 
     fn temp_project_path(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -621,6 +552,84 @@ steps:
             )
             .unwrap();
         (store, path)
+    }
+
+    #[test]
+    fn json_outputs_match_legacy_bytes() {
+        let comparison = BranchComparisonRecord {
+            id: "event_1".to_string(),
+            flow_id: "flow_1".to_string(),
+            baseline_step: "baseline".to_string(),
+            candidate_step: "candidate".to_string(),
+            summary: "Quote \" and newline\nslash \\ tab".to_string(),
+            winner: Some("candidate".to_string()),
+            reason: Some("Clearer metric\ttrace".to_string()),
+            created_at: 42,
+        };
+        assert_eq!(
+            comparison.to_json(),
+            "{\"id\":\"event_1\",\"flow_id\":\"flow_1\",\"baseline_step\":\"baseline\",\"candidate_step\":\"candidate\",\"summary\":\"Quote \\\" and newline\\nslash \\\\ tab\",\"winner\":\"candidate\",\"reason\":\"Clearer metric\\ttrace\",\"created_at\":42}"
+        );
+
+        let result = MetricComparisonResult {
+            comparison,
+            metric: "score".to_string(),
+            direction: "higher".to_string(),
+            baseline_value: 1.0,
+            candidate_value: 1.25,
+            baseline_artifact_id: "artifact_base".to_string(),
+            candidate_artifact_id: "artifact_candidate".to_string(),
+        };
+        assert_eq!(
+            result.to_json(),
+            "{\"comparison\":{\"id\":\"event_1\",\"flow_id\":\"flow_1\",\"baseline_step\":\"baseline\",\"candidate_step\":\"candidate\",\"summary\":\"Quote \\\" and newline\\nslash \\\\ tab\",\"winner\":\"candidate\",\"reason\":\"Clearer metric\\ttrace\",\"created_at\":42},\"metric\":\"score\",\"direction\":\"higher\",\"baseline_value\":1,\"candidate_value\":1.25,\"baseline_artifact_id\":\"artifact_base\",\"candidate_artifact_id\":\"artifact_candidate\"}"
+        );
+
+        assert_eq!(
+            super::comparison_payload_json(&BranchComparisonRequest {
+                flow_id: " flow_1 ".to_string(),
+                baseline_step: " baseline ".to_string(),
+                candidate_step: " candidate ".to_string(),
+                summary: " Summary \"quoted\"\n ".to_string(),
+                winner: Some(" ".to_string()),
+                reason: Some(" reason\t ".to_string()),
+            }),
+            "{\"baseline_step\":\"baseline\",\"candidate_step\":\"candidate\",\"summary\":\"Summary \\\"quoted\\\"\",\"winner\":null,\"reason\":\"reason\"}"
+        );
+    }
+
+    #[test]
+    fn legacy_handwritten_payloads_deserialize() {
+        let payload: BranchComparisonPayload = serde_json::from_str(
+            "{\"reason\":\"Needs external validation.\",\"winner\":\"inconclusive\",\"summary\":\"Candidate has cleaner separation.\",\"candidate_step\":\"candidate\",\"baseline_step\":\"baseline\"}",
+        )
+        .unwrap();
+        assert_eq!(payload.baseline_step, "baseline");
+        assert_eq!(payload.candidate_step, "candidate");
+        assert_eq!(payload.winner.as_deref(), Some("inconclusive"));
+        assert_eq!(
+            payload.reason.as_deref(),
+            Some("Needs external validation.")
+        );
+
+        let parsed = super::comparison_from_event(
+            "event_legacy".to_string(),
+            "flow_legacy".to_string(),
+            r#"{
+                "baseline_step": "baseline",
+                "candidate_step": "candidate",
+                "summary": "legacy whitespace payload",
+                "winner": null,
+                "reason": null
+            }"#,
+            99,
+        )
+        .unwrap();
+        assert_eq!(parsed.id, "event_legacy");
+        assert_eq!(parsed.flow_id, "flow_legacy");
+        assert_eq!(parsed.summary, "legacy whitespace payload");
+        assert!(parsed.winner.is_none());
+        assert!(parsed.reason.is_none());
     }
 
     #[test]

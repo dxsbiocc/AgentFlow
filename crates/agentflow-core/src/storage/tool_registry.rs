@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use rusqlite::{params, OptionalExtension};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::ToolMaturity;
 
@@ -158,84 +158,99 @@ impl ToolSpec {
         let required_inputs = self
             .inputs
             .iter()
-            .filter_map(|(name, port)| port.required.then_some(name.as_str()))
+            .filter_map(|(name, port)| port.required.then_some(name.clone()))
             .collect::<Vec<_>>();
-        format!(
-            concat!(
-                "{{",
-                "\"schema_version\":\"{}\",",
-                "\"namespace\":\"{}\",",
-                "\"name\":\"{}\",",
-                "\"version\":\"{}\",",
-                "\"maturity\":\"{}\",",
-                "\"description\":\"{}\",",
-                "\"validator_profile\":{},",
-                "\"input_types\":{},",
-                "\"required_inputs\":{},",
-                "\"input_profiles\":{},",
-                "\"param_types\":{},",
-                "\"required_params\":{},",
-                "\"output_types\":{},",
-                "\"output_observers\":{},",
-                "\"input_min_rows\":{},",
-                "\"input_required_columns\":{},",
-                "\"input_sample_id_columns\":{},",
-                "\"output_min_rows\":{},",
-                "\"output_required_columns\":{},",
-                "\"runtime_backend\":\"{}\",",
-                "\"runtime_command\":{},",
-                "\"runtime_timeout_seconds\":{},",
-                "\"runtime_env_name\":{},",
-                "\"runtime_env_prefix\":{},",
-                "\"runtime_env_file\":{},",
-                "\"runtime_runner\":{},",
-                "\"source_format\":\"{}\",",
-                "\"source_text\":\"{}\"",
-                "}}"
-            ),
-            escape_json(&self.schema_version),
-            escape_json(&self.namespace),
-            escape_json(&self.name),
-            escape_json(&self.version),
-            self.maturity,
-            escape_json(&self.description),
-            optional_string_json(self.validator_profile.as_deref()),
-            type_map_json(&self.inputs),
-            string_array_json(&required_inputs),
-            profile_map_json(&self.inputs),
-            param_type_map_json(&self.params),
-            string_array_json(
-                &self
-                    .params
-                    .iter()
-                    .filter_map(|(name, param)| param.required.then_some(name.as_str()))
-                    .collect::<Vec<_>>()
-            ),
-            type_map_json(&self.outputs),
-            observer_map_json(&self.outputs),
-            min_rows_map_json(&self.inputs),
-            required_columns_map_json(&self.inputs),
-            sample_id_column_map_json(&self.inputs),
-            min_rows_map_json(&self.outputs),
-            required_columns_map_json(&self.outputs),
-            escape_json(&self.runtime.backend),
-            string_array_json(
-                &self
-                    .runtime
-                    .command
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-            ),
-            optional_u64_json(self.runtime.timeout_seconds),
-            optional_string_json(self.runtime.env_name.as_deref()),
-            optional_string_json(self.runtime.env_prefix.as_deref()),
-            optional_string_json(self.runtime.env_file.as_deref()),
-            optional_string_json(self.runtime.runner.as_deref()),
-            SIMPLE_YAML_SOURCE_FORMAT,
-            escape_json(&self.source_text)
-        )
+        let required_params = self
+            .params
+            .iter()
+            .filter_map(|(name, param)| param.required.then_some(name.clone()))
+            .collect::<Vec<_>>();
+
+        serde_json::to_string(&StoredToolSpecJson {
+            schema_version: self.schema_version.clone(),
+            namespace: self.namespace.clone(),
+            name: self.name.clone(),
+            version: self.version.clone(),
+            maturity: self.maturity.as_str().to_string(),
+            description: self.description.clone(),
+            validator_profile: self.validator_profile.clone(),
+            input_types: port_type_map(&self.inputs),
+            required_inputs,
+            input_profiles: profile_map(&self.inputs),
+            param_types: param_type_map(&self.params),
+            required_params,
+            output_types: port_type_map(&self.outputs),
+            output_observers: observer_map(&self.outputs),
+            input_min_rows: min_rows_map(&self.inputs),
+            input_required_columns: required_columns_map(&self.inputs),
+            input_sample_id_columns: sample_id_column_map(&self.inputs),
+            output_min_rows: min_rows_map(&self.outputs),
+            output_required_columns: required_columns_map(&self.outputs),
+            runtime_backend: self.runtime.backend.clone(),
+            runtime_command: self.runtime.command.clone(),
+            runtime_timeout_seconds: self.runtime.timeout_seconds,
+            runtime_env_name: self.runtime.env_name.clone(),
+            runtime_env_prefix: self.runtime.env_prefix.clone(),
+            runtime_env_file: self.runtime.env_file.clone(),
+            runtime_runner: self.runtime.runner.clone(),
+            source_format: SIMPLE_YAML_SOURCE_FORMAT.to_string(),
+            source_text: self.source_text.clone(),
+        })
+        .expect("tool spec serializes to stored JSON")
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredToolSpecJson {
+    schema_version: String,
+    namespace: String,
+    name: String,
+    version: String,
+    maturity: String,
+    description: String,
+    #[serde(default)]
+    validator_profile: Option<String>,
+    #[serde(default)]
+    input_types: BTreeMap<String, String>,
+    #[serde(default)]
+    required_inputs: Vec<String>,
+    #[serde(default)]
+    input_profiles: BTreeMap<String, String>,
+    #[serde(default)]
+    param_types: BTreeMap<String, String>,
+    #[serde(default)]
+    required_params: Vec<String>,
+    #[serde(default)]
+    output_types: BTreeMap<String, String>,
+    #[serde(default)]
+    output_observers: BTreeMap<String, String>,
+    #[serde(default)]
+    input_min_rows: BTreeMap<String, String>,
+    #[serde(default)]
+    input_required_columns: BTreeMap<String, String>,
+    #[serde(default)]
+    input_sample_id_columns: BTreeMap<String, String>,
+    #[serde(default)]
+    output_min_rows: BTreeMap<String, String>,
+    #[serde(default)]
+    output_required_columns: BTreeMap<String, String>,
+    runtime_backend: String,
+    #[serde(default)]
+    runtime_command: Vec<String>,
+    #[serde(default)]
+    runtime_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    runtime_env_name: Option<String>,
+    #[serde(default)]
+    runtime_env_prefix: Option<String>,
+    #[serde(default)]
+    runtime_env_file: Option<String>,
+    #[serde(default)]
+    runtime_runner: Option<String>,
+    #[serde(default)]
+    source_format: String,
+    #[serde(default)]
+    source_text: String,
 }
 
 #[derive(Deserialize)]
@@ -670,41 +685,61 @@ pub struct ToolInspection {
 
 impl ToolInspection {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"schema_version\":\"{}\",",
-                "\"tool\":{{",
-                "\"ref\":\"{}\",",
-                "\"namespace\":\"{}\",",
-                "\"name\":\"{}\",",
-                "\"latest_version\":\"{}\",",
-                "\"maturity\":\"{}\"",
-                "}},",
-                "\"version\":{{",
-                "\"id\":\"{}\",",
-                "\"version\":\"{}\",",
-                "\"schema_version\":\"{}\",",
-                "\"spec_hash\":\"{}\",",
-                "\"created_at\":{},",
-                "\"spec\":{}",
-                "}}",
-                "}}"
-            ),
-            agentflow_schemas::TOOL_INSPECTION_JSON_SCHEMA_V0,
-            escape_json(&self.summary.tool_ref()),
-            escape_json(&self.summary.namespace),
-            escape_json(&self.summary.name),
-            escape_json(&self.summary.latest_version),
-            escape_json(&self.summary.maturity),
-            escape_json(&self.version_id),
-            escape_json(&self.version),
-            escape_json(&self.schema_version),
-            escape_json(&self.spec_hash),
-            self.created_at,
-            self.spec_json
-        )
+        serde_json::to_string(&ToolInspectionJson {
+            schema_version: agentflow_schemas::TOOL_INSPECTION_JSON_SCHEMA_V0.to_string(),
+            tool: ToolInspectionToolJson {
+                tool_ref: self.summary.tool_ref(),
+                namespace: self.summary.namespace.clone(),
+                name: self.summary.name.clone(),
+                latest_version: self.summary.latest_version.clone(),
+                maturity: self.summary.maturity.clone(),
+            },
+            version: ToolInspectionVersionJson {
+                id: self.version_id.clone(),
+                version: self.version.clone(),
+                schema_version: self.schema_version.clone(),
+                spec_hash: self.spec_hash.clone(),
+                created_at: self.created_at,
+                spec: stored_tool_spec_from_json(&self.spec_json)
+                    .expect("stored tool spec JSON is valid"),
+            },
+        })
+        .expect("tool inspection serializes to JSON")
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolInspectionJson {
+    schema_version: String,
+    tool: ToolInspectionToolJson,
+    version: ToolInspectionVersionJson,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolInspectionToolJson {
+    #[serde(rename = "ref")]
+    tool_ref: String,
+    namespace: String,
+    name: String,
+    latest_version: String,
+    maturity: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolInspectionVersionJson {
+    id: String,
+    version: String,
+    schema_version: String,
+    spec_hash: String,
+    created_at: i64,
+    spec: StoredToolSpecJson,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolRegisteredPayload {
+    tool_ref: String,
+    version: String,
+    spec_hash: String,
 }
 
 impl ProjectStore {
@@ -764,12 +799,12 @@ impl ProjectStore {
             step_id: None,
             run_id: None,
             event_type: "tool_registered".to_string(),
-            payload_json: format!(
-                "{{\"tool_ref\":\"{}\",\"version\":\"{}\",\"spec_hash\":\"{}\"}}",
-                escape_json(&spec.tool_ref()),
-                escape_json(&spec.version),
-                escape_json(&spec_hash)
-            ),
+            payload_json: serde_json::to_string(&ToolRegisteredPayload {
+                tool_ref: spec.tool_ref(),
+                version: spec.version.clone(),
+                spec_hash: spec_hash.clone(),
+            })
+            .expect("tool registered payload serializes to JSON"),
         })?;
         self.touch_project()?;
 
@@ -1241,42 +1276,34 @@ fn executable_from_stored_json(
     version: &str,
     spec_json: &str,
 ) -> Result<ExecutableToolSpec, StorageError> {
-    let input_types = extract_string_map(spec_json, "input_types")?;
-    let required_inputs = extract_string_array(spec_json, "required_inputs")?
+    let stored = stored_tool_spec_from_json(spec_json)?;
+    let required_inputs = stored
+        .required_inputs
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
-    let input_profiles = extract_optional_string_map(spec_json, "input_profiles")?;
-    let param_types = extract_string_map(spec_json, "param_types")?;
-    let required_params = extract_string_array(spec_json, "required_params")?
+    let required_params = stored
+        .required_params
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
-    let output_types = extract_string_map(spec_json, "output_types")?;
-    let output_observers = extract_optional_string_map(spec_json, "output_observers")?;
-    let input_min_rows = extract_optional_string_map(spec_json, "input_min_rows")?;
-    let input_required_columns = extract_optional_string_map(spec_json, "input_required_columns")?;
-    let input_sample_id_columns =
-        extract_optional_string_map(spec_json, "input_sample_id_columns")?;
-    let output_min_rows = extract_optional_string_map(spec_json, "output_min_rows")?;
-    let output_required_columns =
-        extract_optional_string_map(spec_json, "output_required_columns")?;
     let runtime = ToolRuntimeSpec {
-        backend: extract_string_field(spec_json, "runtime_backend")?,
-        command: extract_string_array(spec_json, "runtime_command")?,
-        timeout_seconds: extract_optional_u64_field(spec_json, "runtime_timeout_seconds")?,
-        env_name: extract_optional_string_field(spec_json, "runtime_env_name")?,
-        env_prefix: extract_optional_string_field(spec_json, "runtime_env_prefix")?,
-        env_file: extract_optional_string_field(spec_json, "runtime_env_file")?,
-        runner: extract_optional_string_field(spec_json, "runtime_runner")?,
+        backend: stored.runtime_backend,
+        command: stored.runtime_command,
+        timeout_seconds: stored.runtime_timeout_seconds,
+        env_name: stored.runtime_env_name,
+        env_prefix: stored.runtime_env_prefix,
+        env_file: stored.runtime_env_file,
+        runner: stored.runtime_runner,
     };
 
-    let inputs = input_types
+    let inputs = stored
+        .input_types
         .into_iter()
         .map(|(name, type_name)| {
             let required = required_inputs.contains(&name);
-            let min_rows = stored_min_rows(&input_min_rows, &name)?;
-            let required_columns = stored_columns(&input_required_columns, &name)?;
-            let sample_id_column = stored_sample_id_column(&input_sample_id_columns, &name)?;
-            let profile = input_profiles.get(&name).cloned();
+            let min_rows = stored_min_rows(&stored.input_min_rows, &name)?;
+            let required_columns = stored_columns(&stored.input_required_columns, &name)?;
+            let sample_id_column = stored_sample_id_column(&stored.input_sample_id_columns, &name)?;
+            let profile = stored.input_profiles.get(&name).cloned();
             Ok((
                 name,
                 ToolPortSpec {
@@ -1291,7 +1318,8 @@ fn executable_from_stored_json(
             ))
         })
         .collect::<Result<BTreeMap<_, _>, StorageError>>()?;
-    let params = param_types
+    let params = stored
+        .param_types
         .into_iter()
         .map(|(name, type_name)| {
             let required = required_params.contains(&name);
@@ -1304,12 +1332,13 @@ fn executable_from_stored_json(
             )
         })
         .collect();
-    let outputs = output_types
+    let outputs = stored
+        .output_types
         .into_iter()
         .map(|(name, type_name)| {
-            let observer = output_observers.get(&name).cloned();
-            let min_rows = stored_min_rows(&output_min_rows, &name)?;
-            let required_columns = stored_columns(&output_required_columns, &name)?;
+            let observer = stored.output_observers.get(&name).cloned();
+            let min_rows = stored_min_rows(&stored.output_min_rows, &name)?;
+            let required_columns = stored_columns(&stored.output_required_columns, &name)?;
             Ok((
                 name,
                 ToolPortSpec {
@@ -1341,6 +1370,12 @@ fn executable_from_stored_json(
     }
     .validate()?;
     Ok(executable)
+}
+
+fn stored_tool_spec_from_json(spec_json: &str) -> Result<StoredToolSpecJson, StorageError> {
+    serde_json::from_str(spec_json).map_err(|err| {
+        StorageError::InvalidInput(format!("stored tool spec JSON is invalid: {err}"))
+    })
 }
 
 fn normalize_scalar(input: &str) -> String {
@@ -1380,355 +1415,62 @@ fn tool_version_id(namespace: &str, name: &str, version: &str) -> String {
     format!("tool_version:{namespace}/{name}@{version}")
 }
 
-fn type_map_json(map: &BTreeMap<String, ToolPortSpec>) -> String {
-    let fields = map
-        .iter()
-        .map(|(name, port)| {
-            format!(
-                "\"{}\":\"{}\"",
-                escape_json(name),
-                escape_json(&port.type_name)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{fields}}}")
+fn port_type_map(map: &BTreeMap<String, ToolPortSpec>) -> BTreeMap<String, String> {
+    map.iter()
+        .map(|(name, port)| (name.clone(), port.type_name.clone()))
+        .collect()
 }
 
-fn observer_map_json(map: &BTreeMap<String, ToolPortSpec>) -> String {
-    let fields = map
-        .iter()
+fn observer_map(map: &BTreeMap<String, ToolPortSpec>) -> BTreeMap<String, String> {
+    map.iter()
         .filter_map(|(name, port)| {
             port.observer
                 .as_ref()
-                .map(|observer| format!("\"{}\":\"{}\"", escape_json(name), escape_json(observer)))
+                .map(|observer| (name.clone(), observer.clone()))
         })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{fields}}}")
+        .collect()
 }
 
-fn profile_map_json(map: &BTreeMap<String, ToolPortSpec>) -> String {
-    let fields = map
-        .iter()
+fn profile_map(map: &BTreeMap<String, ToolPortSpec>) -> BTreeMap<String, String> {
+    map.iter()
         .filter_map(|(name, port)| {
             port.profile
                 .as_ref()
-                .map(|profile| format!("\"{}\":\"{}\"", escape_json(name), escape_json(profile)))
+                .map(|profile| (name.clone(), profile.clone()))
         })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{fields}}}")
+        .collect()
 }
 
-fn min_rows_map_json(map: &BTreeMap<String, ToolPortSpec>) -> String {
-    let fields = map
-        .iter()
+fn min_rows_map(map: &BTreeMap<String, ToolPortSpec>) -> BTreeMap<String, String> {
+    map.iter()
         .filter_map(|(name, port)| {
             port.min_rows
-                .map(|min_rows| format!("\"{}\":\"{}\"", escape_json(name), min_rows))
+                .map(|min_rows| (name.clone(), min_rows.to_string()))
         })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{fields}}}")
+        .collect()
 }
 
-fn required_columns_map_json(map: &BTreeMap<String, ToolPortSpec>) -> String {
-    let fields = map
-        .iter()
+fn required_columns_map(map: &BTreeMap<String, ToolPortSpec>) -> BTreeMap<String, String> {
+    map.iter()
         .filter(|(_, port)| !port.required_columns.is_empty())
-        .map(|(name, port)| {
-            format!(
-                "\"{}\":\"{}\"",
-                escape_json(name),
-                escape_json(&port.required_columns.join(","))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{fields}}}")
+        .map(|(name, port)| (name.clone(), port.required_columns.join(",")))
+        .collect()
 }
 
-fn sample_id_column_map_json(map: &BTreeMap<String, ToolPortSpec>) -> String {
-    let fields = map
-        .iter()
+fn sample_id_column_map(map: &BTreeMap<String, ToolPortSpec>) -> BTreeMap<String, String> {
+    map.iter()
         .filter_map(|(name, port)| {
             port.sample_id_column
                 .as_ref()
-                .map(|column| format!("\"{}\":\"{}\"", escape_json(name), escape_json(column)))
+                .map(|column| (name.clone(), column.clone()))
         })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{fields}}}")
+        .collect()
 }
 
-fn param_type_map_json(map: &BTreeMap<String, ToolParamSpec>) -> String {
-    let fields = map
-        .iter()
-        .map(|(name, param)| {
-            format!(
-                "\"{}\":\"{}\"",
-                escape_json(name),
-                escape_json(&param.type_name)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{fields}}}")
-}
-
-fn string_array_json(values: &[&str]) -> String {
-    let items = values
-        .iter()
-        .map(|value| format!("\"{}\"", escape_json(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{items}]")
-}
-
-fn optional_u64_json(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_string())
-}
-
-fn optional_string_json(value: Option<&str>) -> String {
-    value
-        .map(|value| format!("\"{}\"", escape_json(value)))
-        .unwrap_or_else(|| "null".to_string())
-}
-
-fn extract_string_field(json: &str, field: &str) -> Result<String, StorageError> {
-    let marker = format!("\"{field}\":\"");
-    let start = json.find(&marker).ok_or_else(|| {
-        StorageError::InvalidInput(format!("stored tool spec is missing field {field}"))
-    })? + marker.len();
-    let rest = &json[start..];
-    let end = find_json_string_end(rest)?;
-    Ok(unescape_json_string(&rest[..end]))
-}
-
-fn extract_optional_u64_field(json: &str, field: &str) -> Result<Option<u64>, StorageError> {
-    let marker = format!("\"{field}\":");
-    let Some(start) = json.find(&marker).map(|index| index + marker.len()) else {
-        return Ok(None);
-    };
-    let rest = &json[start..];
-    let value = rest.split([',', '}']).next().unwrap_or_default().trim();
-    if value.is_empty() || value == "null" {
-        return Ok(None);
-    }
-    parse_u64_field(field, value).map(Some)
-}
-
-fn extract_optional_string_field(json: &str, field: &str) -> Result<Option<String>, StorageError> {
-    let marker = format!("\"{field}\":");
-    let Some(start) = json.find(&marker).map(|index| index + marker.len()) else {
-        return Ok(None);
-    };
-    let rest = &json[start..];
-    let rest = rest.trim_start();
-    if rest.starts_with("null") {
-        return Ok(None);
-    }
-    let Some(after_quote) = rest.strip_prefix('"') else {
-        return Err(StorageError::InvalidInput(format!(
-            "stored tool spec optional string field {field} is malformed"
-        )));
-    };
-    let end = find_json_string_end(after_quote)?;
-    Ok(Some(unescape_json_string(&after_quote[..end])))
-}
-
-fn extract_string_array(json: &str, field: &str) -> Result<Vec<String>, StorageError> {
-    let marker = format!("\"{field}\":[");
-    let start = json.find(&marker).ok_or_else(|| {
-        StorageError::InvalidInput(format!("stored tool spec is missing array {field}"))
-    })? + marker.len();
-    let rest = &json[start..];
-    let mut values = Vec::new();
-    let mut index = 0;
-    loop {
-        index = skip_json_whitespace(rest, index);
-        let Some(next) = rest[index..].chars().next() else {
-            return Err(StorageError::InvalidInput(format!(
-                "stored tool spec array {field} is malformed"
-            )));
-        };
-        if next == ']' {
-            return Ok(values);
-        }
-        if next != '"' {
-            return Err(StorageError::InvalidInput(format!(
-                "stored tool spec array {field} contains non-string item"
-            )));
-        }
-        let string_start = index + 1;
-        let string_end = string_start + find_json_string_end(&rest[string_start..])?;
-        values.push(unescape_json_string(&rest[string_start..string_end]));
-        index = string_end + 1;
-        index = skip_json_whitespace(rest, index);
-        let Some(separator) = rest[index..].chars().next() else {
-            return Err(StorageError::InvalidInput(format!(
-                "stored tool spec array {field} is malformed"
-            )));
-        };
-        match separator {
-            ',' => {
-                index += 1;
-            }
-            ']' => return Ok(values),
-            _ => {
-                return Err(StorageError::InvalidInput(format!(
-                    "stored tool spec array {field} is malformed"
-                )));
-            }
-        }
-    }
-}
-
-fn extract_string_map(json: &str, field: &str) -> Result<BTreeMap<String, String>, StorageError> {
-    let marker = format!("\"{field}\":{{");
-    let start = json.find(&marker).ok_or_else(|| {
-        StorageError::InvalidInput(format!("stored tool spec is missing map {field}"))
-    })? + marker.len();
-    extract_string_map_after_marker(json, field, start)
-}
-
-fn extract_optional_string_map(
-    json: &str,
-    field: &str,
-) -> Result<BTreeMap<String, String>, StorageError> {
-    let marker = format!("\"{field}\":{{");
-    let Some(start) = json.find(&marker).map(|index| index + marker.len()) else {
-        return Ok(BTreeMap::new());
-    };
-    extract_string_map_after_marker(json, field, start)
-}
-
-fn extract_string_map_after_marker(
-    json: &str,
-    field: &str,
-    start: usize,
-) -> Result<BTreeMap<String, String>, StorageError> {
-    let rest = &json[start..];
-    let mut map = BTreeMap::new();
-    let mut index = 0;
-    loop {
-        index = skip_json_whitespace(rest, index);
-        let Some(next) = rest[index..].chars().next() else {
-            return Err(StorageError::InvalidInput(format!(
-                "stored tool spec map {field} is malformed"
-            )));
-        };
-        if next == '}' {
-            return Ok(map);
-        }
-        if next != '"' {
-            return Err(StorageError::InvalidInput(format!(
-                "stored tool spec map {field} contains non-string key"
-            )));
-        }
-        let key_start = index + 1;
-        let key_end = key_start + find_json_string_end(&rest[key_start..])?;
-        let key = unescape_json_string(&rest[key_start..key_end]);
-        index = skip_json_whitespace(rest, key_end + 1);
-        if !rest[index..].starts_with(':') {
-            return Err(StorageError::InvalidInput(format!(
-                "stored tool spec map {field} is malformed"
-            )));
-        }
-        index += 1;
-        index = skip_json_whitespace(rest, index);
-        if !rest[index..].starts_with('"') {
-            return Err(StorageError::InvalidInput(format!(
-                "stored tool spec map {field} contains non-string value"
-            )));
-        }
-        let value_start = index + 1;
-        let value_end = value_start + find_json_string_end(&rest[value_start..])?;
-        let value = unescape_json_string(&rest[value_start..value_end]);
-        map.insert(key, value);
-        index = skip_json_whitespace(rest, value_end + 1);
-        let Some(separator) = rest[index..].chars().next() else {
-            return Err(StorageError::InvalidInput(format!(
-                "stored tool spec map {field} is malformed"
-            )));
-        };
-        match separator {
-            ',' => index += 1,
-            '}' => return Ok(map),
-            _ => {
-                return Err(StorageError::InvalidInput(format!(
-                    "stored tool spec map {field} is malformed"
-                )));
-            }
-        }
-    }
-}
-
-fn find_json_string_end(input: &str) -> Result<usize, StorageError> {
-    let mut escaped = false;
-    for (index, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Ok(index),
-            _ => {}
-        }
-    }
-    Err(StorageError::InvalidInput(
-        "stored tool spec string is malformed".to_string(),
-    ))
-}
-
-fn skip_json_whitespace(input: &str, mut index: usize) -> usize {
-    while let Some(ch) = input[index..].chars().next() {
-        if !ch.is_whitespace() {
-            break;
-        }
-        index += ch.len_utf8();
-    }
-    index
-}
-
-fn unescape_json_string(input: &str) -> String {
-    let mut output = String::new();
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('"') => output.push('"'),
-                Some('\\') => output.push('\\'),
-                Some('n') => output.push('\n'),
-                Some('r') => output.push('\r'),
-                Some('t') => output.push('\t'),
-                Some(other) => output.push(other),
-                None => {}
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-    output
-}
-
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            _ => output.push(ch),
-        }
-    }
-    output
+fn param_type_map(map: &BTreeMap<String, ToolParamSpec>) -> BTreeMap<String, String> {
+    map.iter()
+        .map(|(name, param)| (name.clone(), param.type_name.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2603,5 +2345,71 @@ runtime:
         assert_eq!(store.list_tools().unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn stored_tool_spec_hashes_stay_byte_identical_for_examples() {
+        let examples_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("examples/tools");
+        let marker_json =
+            example_tool_spec(&examples_root, "marker_survival_scan.tool.yaml").stored_json();
+        let tcga_json =
+            example_tool_spec(&examples_root, "tcga_survival_assoc.tool.yaml").stored_json();
+
+        assert_eq!(migrations::checksum(&marker_json), "2f8e22fc89c1caf9");
+        assert_eq!(migrations::checksum(&tcga_json), "83405af4395dc680");
+        let marker_payload: StoredToolSpecJson = serde_json::from_str(&marker_json).unwrap();
+        assert_eq!(marker_payload.name, "marker_survival_scan");
+    }
+
+    fn example_tool_spec(examples_root: &std::path::Path, file_name: &str) -> ToolSpec {
+        let spec_path = examples_root.join(file_name);
+        let source = std::fs::read_to_string(&spec_path).unwrap();
+        let mut spec = ToolSpec::from_simple_yaml(&source).unwrap();
+        let spec_dir = spec_path.parent().unwrap();
+        for arg in spec.runtime.command.iter_mut().skip(1) {
+            if arg.starts_with('-') || std::path::Path::new(arg).is_absolute() {
+                continue;
+            }
+            let candidate = spec_dir.join(arg.as_str());
+            if candidate.exists() {
+                *arg = std::fs::canonicalize(candidate)
+                    .unwrap()
+                    .display()
+                    .to_string();
+            }
+        }
+        spec
+    }
+
+    #[test]
+    fn tool_inspection_json_and_event_payload_are_serde_readable() {
+        let inspection = ToolInspection {
+            summary: ToolSummary {
+                id: "tool:marker/scan".to_string(),
+                namespace: "marker".to_string(),
+                name: "scan".to_string(),
+                latest_version: "0.1.0".to_string(),
+                maturity: "wrapped".to_string(),
+            },
+            version_id: "tool_version:marker/scan@0.1.0".to_string(),
+            version: "0.1.0".to_string(),
+            schema_version: agentflow_schemas::TOOL_SCHEMA_V0.to_string(),
+            spec_hash: "abc123".to_string(),
+            created_at: 7,
+            spec_json: "{\"schema_version\":\"agentflow.tool.v0\",\"namespace\":\"marker\",\"name\":\"scan\",\"version\":\"0.1.0\",\"maturity\":\"wrapped\",\"description\":\"Scan\",\"validator_profile\":null,\"input_types\":{},\"required_inputs\":[],\"input_profiles\":{},\"param_types\":{},\"required_params\":[],\"output_types\":{},\"output_observers\":{},\"input_min_rows\":{},\"input_required_columns\":{},\"input_sample_id_columns\":{},\"output_min_rows\":{},\"output_required_columns\":{},\"runtime_backend\":\"local\",\"runtime_command\":[\"/bin/echo\"],\"runtime_timeout_seconds\":null,\"runtime_env_name\":null,\"runtime_env_prefix\":null,\"runtime_env_file\":null,\"runtime_runner\":null,\"source_format\":\"agentflow.tool.v0.simple_yaml\",\"source_text\":\"source\"}".to_string(),
+        };
+
+        assert_eq!(
+            inspection.to_json(),
+            "{\"schema_version\":\"agentflow.tool_inspection.v0\",\"tool\":{\"ref\":\"marker/scan\",\"namespace\":\"marker\",\"name\":\"scan\",\"latest_version\":\"0.1.0\",\"maturity\":\"wrapped\"},\"version\":{\"id\":\"tool_version:marker/scan@0.1.0\",\"version\":\"0.1.0\",\"schema_version\":\"agentflow.tool.v0\",\"spec_hash\":\"abc123\",\"created_at\":7,\"spec\":{\"schema_version\":\"agentflow.tool.v0\",\"namespace\":\"marker\",\"name\":\"scan\",\"version\":\"0.1.0\",\"maturity\":\"wrapped\",\"description\":\"Scan\",\"validator_profile\":null,\"input_types\":{},\"required_inputs\":[],\"input_profiles\":{},\"param_types\":{},\"required_params\":[],\"output_types\":{},\"output_observers\":{},\"input_min_rows\":{},\"input_required_columns\":{},\"input_sample_id_columns\":{},\"output_min_rows\":{},\"output_required_columns\":{},\"runtime_backend\":\"local\",\"runtime_command\":[\"/bin/echo\"],\"runtime_timeout_seconds\":null,\"runtime_env_name\":null,\"runtime_env_prefix\":null,\"runtime_env_file\":null,\"runtime_runner\":null,\"source_format\":\"agentflow.tool.v0.simple_yaml\",\"source_text\":\"source\"}}}"
+        );
+
+        let payload: ToolRegisteredPayload = serde_json::from_str(
+            "{\"tool_ref\":\"marker/scan\",\"version\":\"0.1.0\",\"spec_hash\":\"abc123\"}",
+        )
+        .unwrap();
+        assert_eq!(payload.tool_ref, "marker/scan");
     }
 }

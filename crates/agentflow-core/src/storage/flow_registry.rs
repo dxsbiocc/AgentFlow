@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, OptionalExtension};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::StepStatus;
 
@@ -182,39 +182,23 @@ pub struct FlowValidationReport {
 
 impl FlowValidationReport {
     pub fn to_json(&self) -> String {
-        let issues = self
-            .issues
-            .iter()
-            .map(|issue| {
-                format!(
-                    "{{\"severity\":\"{}\",\"message\":\"{}\"}}",
-                    escape_json(&issue.severity),
-                    escape_json(&issue.message)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-
-        format!(
-            concat!(
-                "{{",
-                "\"schema_version\":\"{}\",",
-                "\"flow_id\":\"{}\",",
-                "\"name\":\"{}\",",
-                "\"valid\":{},",
-                "\"step_count\":{},",
-                "\"edge_count\":{},",
-                "\"issues\":[{}]",
-                "}}"
-            ),
-            agentflow_schemas::FLOW_VALIDATION_JSON_SCHEMA_V0,
-            escape_json(&self.flow_id),
-            escape_json(&self.name),
-            self.valid,
-            self.step_count,
-            self.edge_count,
-            issues
-        )
+        serde_json::to_string(&FlowValidationReportJson {
+            schema_version: agentflow_schemas::FLOW_VALIDATION_JSON_SCHEMA_V0.to_string(),
+            flow_id: self.flow_id.clone(),
+            name: self.name.clone(),
+            valid: self.valid,
+            step_count: self.step_count,
+            edge_count: self.edge_count,
+            issues: self
+                .issues
+                .iter()
+                .map(|issue| FlowValidationIssueJson {
+                    severity: issue.severity.clone(),
+                    message: issue.message.clone(),
+                })
+                .collect(),
+        })
+        .expect("flow validation report serializes to JSON")
     }
 
     fn error_message(&self) -> String {
@@ -224,6 +208,23 @@ impl FlowValidationReport {
             .collect::<Vec<_>>()
             .join("; ")
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FlowValidationReportJson {
+    schema_version: String,
+    flow_id: String,
+    name: String,
+    valid: bool,
+    step_count: usize,
+    edge_count: usize,
+    issues: Vec<FlowValidationIssueJson>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FlowValidationIssueJson {
+    severity: String,
+    message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,85 +250,74 @@ pub struct FlowInspection {
 
 impl FlowInspection {
     pub fn to_json(&self) -> String {
-        let steps = self
-            .steps
-            .iter()
-            .map(|step| {
-                format!(
-                    concat!(
-                        "{{",
-                        "\"id\":\"{}\",",
-                        "\"local_id\":\"{}\",",
-                        "\"tool_ref\":{},",
-                        "\"type\":\"{}\",",
-                        "\"status\":\"{}\",",
-                        "\"reason\":{},",
-                        "\"inputs\":{},",
-                        "\"params\":{},",
-                        "\"outputs\":{}",
-                        "}}"
-                    ),
-                    escape_json(&step.id),
-                    escape_json(&step.local_id),
-                    optional_json_string(step.tool_ref.as_deref()),
-                    escape_json(&step.step_type),
-                    escape_json(&step.status),
-                    optional_json_string(step.reason.as_deref()),
-                    step.inputs_json,
-                    step.params_json,
-                    step.outputs_json
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let edges = self
-            .edges
-            .iter()
-            .map(|edge| {
-                format!(
-                    "{{\"from\":\"{}\",\"to\":\"{}\",\"type\":\"{}\"}}",
-                    escape_json(&edge.from_local_id),
-                    escape_json(&edge.to_local_id),
-                    escape_json(&edge.edge_type)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-
-        format!(
-            concat!(
-                "{{",
-                "\"schema_version\":\"{}\",",
-                "\"flow\":{{",
-                "\"id\":\"{}\",",
-                "\"name\":\"{}\",",
-                "\"status\":\"{}\",",
-                "\"source_path\":{},",
-                "\"flow_schema_version\":\"{}\",",
-                "\"created_at\":{},",
-                "\"updated_at\":{},",
-                "\"steps\":[{}],",
-                "\"edges\":[{}]",
-                "}}",
-                "}}"
-            ),
-            agentflow_schemas::FLOW_INSPECTION_JSON_SCHEMA_V0,
-            escape_json(&self.id),
-            escape_json(&self.name),
-            escape_json(&self.status),
-            optional_json_string(
-                self.source_path
+        serde_json::to_string(&FlowInspectionJson {
+            schema_version: agentflow_schemas::FLOW_INSPECTION_JSON_SCHEMA_V0.to_string(),
+            flow: FlowInspectionFlowJson {
+                id: self.id.clone(),
+                name: self.name.clone(),
+                status: self.status.clone(),
+                source_path: self
+                    .source_path
                     .as_ref()
-                    .map(|path| path.display().to_string())
-                    .as_deref()
-            ),
-            escape_json(&self.schema_version),
-            self.created_at,
-            self.updated_at,
-            steps,
-            edges
-        )
+                    .map(|path| path.display().to_string()),
+                flow_schema_version: self.schema_version.clone(),
+                created_at: self.created_at,
+                updated_at: self.updated_at,
+                steps: self.steps.iter().map(flow_step_json).collect(),
+                edges: self
+                    .edges
+                    .iter()
+                    .map(|edge| FlowInspectionEdgeJson {
+                        from: edge.from_local_id.clone(),
+                        to: edge.to_local_id.clone(),
+                        edge_type: edge.edge_type.clone(),
+                    })
+                    .collect(),
+            },
+        })
+        .expect("flow inspection serializes to JSON")
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FlowInspectionJson {
+    schema_version: String,
+    flow: FlowInspectionFlowJson,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FlowInspectionFlowJson {
+    id: String,
+    name: String,
+    status: String,
+    source_path: Option<String>,
+    flow_schema_version: String,
+    created_at: i64,
+    updated_at: i64,
+    steps: Vec<FlowInspectionStepJson>,
+    edges: Vec<FlowInspectionEdgeJson>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FlowInspectionStepJson {
+    id: String,
+    local_id: String,
+    tool_ref: Option<String>,
+    #[serde(rename = "type")]
+    step_type: String,
+    status: String,
+    reason: Option<String>,
+    inputs: serde_json::Value,
+    params: serde_json::Value,
+    outputs: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FlowInspectionEdgeJson {
+    from: String,
+    to: String,
+    #[serde(rename = "type")]
+    edge_type: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -523,11 +513,10 @@ impl ProjectStore {
             step_id: None,
             run_id: None,
             event_type: "flow_approved".to_string(),
-            payload_json: format!(
-                "{{\"flow_id\":\"{}\",\"step_count\":{},\"edge_count\":{}}}",
-                escape_json(&draft.id),
+            payload_json: flow_approved_payload_json(
+                &draft.id,
                 draft.steps.len(),
-                report.edge_count
+                report.edge_count,
             ),
         })?;
         self.touch_project()?;
@@ -792,6 +781,22 @@ fn issue(message: impl Into<String>) -> FlowValidationIssue {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct FlowApprovedPayload {
+    flow_id: String,
+    step_count: usize,
+    edge_count: usize,
+}
+
+fn flow_approved_payload_json(flow_id: &str, step_count: usize, edge_count: usize) -> String {
+    serde_json::to_string(&FlowApprovedPayload {
+        flow_id: flow_id.to_string(),
+        step_count,
+        edge_count,
+    })
+    .expect("flow approved payload serializes to JSON")
+}
+
 fn validate_ref_part(label: &str, value: &str) -> Result<(), StorageError> {
     if value.trim().is_empty() {
         return Err(StorageError::InvalidInput(format!(
@@ -810,12 +815,22 @@ fn validate_ref_part(label: &str, value: &str) -> Result<(), StorageError> {
 }
 
 fn map_json(map: &BTreeMap<String, String>) -> String {
-    let fields = map
-        .iter()
-        .map(|(key, value)| format!("\"{}\":\"{}\"", escape_json(key), escape_json(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{fields}}}")
+    serde_json::to_string(map).expect("flow map serializes to JSON")
+}
+
+fn flow_step_json(step: &StoredFlowStep) -> FlowInspectionStepJson {
+    FlowInspectionStepJson {
+        id: step.id.clone(),
+        local_id: step.local_id.clone(),
+        tool_ref: step.tool_ref.clone(),
+        step_type: step.step_type.clone(),
+        status: step.status.clone(),
+        reason: step.reason.clone(),
+        inputs: serde_json::from_str(&step.inputs_json).expect("stored flow inputs JSON is valid"),
+        params: serde_json::from_str(&step.params_json).expect("stored flow params JSON is valid"),
+        outputs: serde_json::from_str(&step.outputs_json)
+            .expect("stored flow outputs JSON is valid"),
+    }
 }
 
 fn db_step_id(flow_id: &str, step_id: &str) -> String {
@@ -830,28 +845,6 @@ fn local_step_id(db_step_id: &str) -> String {
 
 fn edge_id(flow_id: &str, from_step_id: &str, to_step_id: &str) -> String {
     format!("edge:{flow_id}/{from_step_id}->{to_step_id}")
-}
-
-fn optional_json_string(value: Option<&str>) -> String {
-    value.map_or_else(
-        || "null".to_string(),
-        |inner| format!("\"{}\"", escape_json(inner)),
-    )
-}
-
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            _ => output.push(ch),
-        }
-    }
-    output
 }
 
 #[cfg(test)]
@@ -1134,5 +1127,70 @@ steps:
         assert!(report.error_message().contains("dependency cycle"));
 
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn flow_validation_json_is_exact_byte_and_serde_readable() {
+        let report = FlowValidationReport {
+            flow_id: "flow_1".to_string(),
+            name: "Flow \"A\"".to_string(),
+            valid: false,
+            step_count: 1,
+            edge_count: 0,
+            issues: vec![FlowValidationIssue {
+                severity: "error".to_string(),
+                message: "missing tool".to_string(),
+            }],
+        };
+
+        let json = report.to_json();
+        assert_eq!(
+            json,
+            "{\"schema_version\":\"agentflow.flow_validation.v0\",\"flow_id\":\"flow_1\",\"name\":\"Flow \\\"A\\\"\",\"valid\":false,\"step_count\":1,\"edge_count\":0,\"issues\":[{\"severity\":\"error\",\"message\":\"missing tool\"}]}"
+        );
+
+        let payload: FlowValidationReportJson = serde_json::from_str(&json).unwrap();
+        assert_eq!(payload.issues[0].message, "missing tool");
+    }
+
+    #[test]
+    fn flow_inspection_json_is_exact_byte_and_embeds_step_maps() {
+        let inspection = FlowInspection {
+            id: "flow_1".to_string(),
+            name: "Flow One".to_string(),
+            status: "approved".to_string(),
+            source_path: Some(PathBuf::from("/tmp/flow.yaml")),
+            schema_version: agentflow_schemas::FLOW_SCHEMA_V0.to_string(),
+            created_at: 1,
+            updated_at: 2,
+            steps: vec![StoredFlowStep {
+                id: "step:flow_1/scan".to_string(),
+                local_id: "scan".to_string(),
+                tool_ref: Some("marker/scan".to_string()),
+                step_type: "analysis".to_string(),
+                status: "draft".to_string(),
+                reason: Some("Evaluate marker".to_string()),
+                params_json: "{\"gene\":\"TP53\"}".to_string(),
+                inputs_json: "{\"table\":\"artifact_1\"}".to_string(),
+                outputs_json: "{\"report\":\"marker_report\"}".to_string(),
+            }],
+            edges: vec![StoredFlowEdge {
+                from_step_id: "step:flow_1/prep".to_string(),
+                to_step_id: "step:flow_1/scan".to_string(),
+                from_local_id: "prep".to_string(),
+                to_local_id: "scan".to_string(),
+                edge_type: "needs".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            inspection.to_json(),
+            "{\"schema_version\":\"agentflow.flow_inspection.v0\",\"flow\":{\"id\":\"flow_1\",\"name\":\"Flow One\",\"status\":\"approved\",\"source_path\":\"/tmp/flow.yaml\",\"flow_schema_version\":\"agentflow.flow.v0\",\"created_at\":1,\"updated_at\":2,\"steps\":[{\"id\":\"step:flow_1/scan\",\"local_id\":\"scan\",\"tool_ref\":\"marker/scan\",\"type\":\"analysis\",\"status\":\"draft\",\"reason\":\"Evaluate marker\",\"inputs\":{\"table\":\"artifact_1\"},\"params\":{\"gene\":\"TP53\"},\"outputs\":{\"report\":\"marker_report\"}}],\"edges\":[{\"from\":\"prep\",\"to\":\"scan\",\"type\":\"needs\"}]}}"
+        );
+
+        let payload: FlowApprovedPayload =
+            serde_json::from_str("{\"flow_id\":\"flow_1\",\"step_count\":1,\"edge_count\":0}")
+                .unwrap();
+        assert_eq!(payload.flow_id, "flow_1");
     }
 }

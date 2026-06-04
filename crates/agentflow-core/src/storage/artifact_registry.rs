@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
 use crate::domain::ArtifactKind;
 
@@ -158,12 +159,11 @@ impl ProjectStore {
             step_id: None,
             run_id: None,
             event_type: "artifact_imported".to_string(),
-            payload_json: format!(
-                "{{\"artifact_id\":\"{}\",\"type\":\"{}\",\"mode\":\"{}\",\"path\":\"{}\"}}",
-                escape_json(&id),
-                escape_json(&request.artifact_type),
+            payload_json: artifact_imported_payload_json(
+                &id,
+                &request.artifact_type,
                 request.mode,
-                escape_json(&stored_path.display().to_string())
+                &stored_path,
             ),
         })?;
         self.touch_project()?;
@@ -298,12 +298,11 @@ impl ProjectStore {
             step_id: Some(request.source_step_id),
             run_id: Some(request.source_run_id),
             event_type: "artifact_computed".to_string(),
-            payload_json: format!(
-                "{{\"artifact_id\":\"{}\",\"output_name\":\"{}\",\"type\":\"{}\",\"path\":\"{}\"}}",
-                escape_json(&id),
-                escape_json(&request.output_name),
-                escape_json(&request.artifact_type),
-                escape_json(&dest_path.display().to_string())
+            payload_json: artifact_computed_payload_json(
+                &id,
+                &request.output_name,
+                &request.artifact_type,
+                &dest_path,
             ),
         })?;
 
@@ -312,59 +311,117 @@ impl ProjectStore {
 }
 
 pub fn artifacts_list_json(artifacts: &[ArtifactSummary]) -> String {
-    let items = artifacts
-        .iter()
-        .map(artifact_summary_json)
-        .collect::<Vec<_>>()
-        .join(",");
-
-    format!(
-        "{{\"schema_version\":\"{}\",\"artifacts\":[{}]}}",
-        agentflow_schemas::ARTIFACT_LIST_JSON_SCHEMA_V0,
-        items
-    )
+    serde_json::to_string(&ArtifactsListJson {
+        schema_version: agentflow_schemas::ARTIFACT_LIST_JSON_SCHEMA_V0.to_string(),
+        artifacts: artifacts.iter().map(artifact_summary_json_value).collect(),
+    })
+    .expect("artifact list serializes to JSON")
 }
 
 fn artifact_inspection_json(inspection: &ArtifactInspection) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"schema_version\":\"{}\",",
-            "\"artifact\":{},",
-            "\"validation\":{}",
-            "}}"
-        ),
-        agentflow_schemas::ARTIFACT_INSPECTION_JSON_SCHEMA_V0,
-        artifact_summary_json(&inspection.summary),
-        inspection.validation_json
-    )
+    serde_json::to_string(&ArtifactInspectionJson {
+        schema_version: agentflow_schemas::ARTIFACT_INSPECTION_JSON_SCHEMA_V0.to_string(),
+        artifact: artifact_summary_json_value(&inspection.summary),
+        validation: serde_json::from_str(&inspection.validation_json)
+            .expect("stored artifact validation JSON is valid"),
+    })
+    .expect("artifact inspection serializes to JSON")
 }
 
-fn artifact_summary_json(artifact: &ArtifactSummary) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"id\":\"{}\",",
-            "\"kind\":\"{}\",",
-            "\"type\":\"{}\",",
-            "\"path\":\"{}\",",
-            "\"hash\":{},",
-            "\"size_bytes\":{},",
-            "\"source_step_id\":{},",
-            "\"source_run_id\":{},",
-            "\"created_at\":{}",
-            "}}"
-        ),
-        escape_json(&artifact.id),
-        escape_json(&artifact.kind),
-        escape_json(&artifact.artifact_type),
-        escape_json(&artifact.path.display().to_string()),
-        optional_json_string(artifact.hash.as_deref()),
-        optional_json_i64(artifact.size_bytes),
-        optional_json_string(artifact.source_step_id.as_deref()),
-        optional_json_string(artifact.source_run_id.as_deref()),
-        artifact.created_at
-    )
+#[derive(Debug, Serialize, Deserialize)]
+struct ArtifactsListJson {
+    schema_version: String,
+    artifacts: Vec<ArtifactSummaryJson>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ArtifactInspectionJson {
+    schema_version: String,
+    artifact: ArtifactSummaryJson,
+    validation: ArtifactValidationJson,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArtifactSummaryJson {
+    id: String,
+    kind: String,
+    #[serde(rename = "type")]
+    artifact_type: String,
+    path: String,
+    hash: Option<String>,
+    size_bytes: Option<i64>,
+    source_step_id: Option<String>,
+    source_run_id: Option<String>,
+    created_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ArtifactImportedPayload {
+    artifact_id: String,
+    #[serde(rename = "type")]
+    artifact_type: String,
+    mode: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ArtifactComputedPayload {
+    artifact_id: String,
+    output_name: String,
+    #[serde(rename = "type")]
+    artifact_type: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ArtifactValidationJson {
+    Imported(ImportValidationJson),
+    Computed(ComputedValidationJson),
+}
+
+fn artifact_summary_json_value(artifact: &ArtifactSummary) -> ArtifactSummaryJson {
+    ArtifactSummaryJson {
+        id: artifact.id.clone(),
+        kind: artifact.kind.clone(),
+        artifact_type: artifact.artifact_type.clone(),
+        path: artifact.path.display().to_string(),
+        hash: artifact.hash.clone(),
+        size_bytes: artifact.size_bytes,
+        source_step_id: artifact.source_step_id.clone(),
+        source_run_id: artifact.source_run_id.clone(),
+        created_at: artifact.created_at,
+    }
+}
+
+fn artifact_imported_payload_json(
+    artifact_id: &str,
+    artifact_type: &str,
+    mode: ArtifactImportMode,
+    path: &Path,
+) -> String {
+    serde_json::to_string(&ArtifactImportedPayload {
+        artifact_id: artifact_id.to_string(),
+        artifact_type: artifact_type.to_string(),
+        mode: mode.as_str().to_string(),
+        path: path.display().to_string(),
+    })
+    .expect("artifact imported payload serializes to JSON")
+}
+
+fn artifact_computed_payload_json(
+    artifact_id: &str,
+    output_name: &str,
+    artifact_type: &str,
+    path: &Path,
+) -> String {
+    serde_json::to_string(&ArtifactComputedPayload {
+        artifact_id: artifact_id.to_string(),
+        output_name: output_name.to_string(),
+        artifact_type: artifact_type.to_string(),
+        path: path.display().to_string(),
+    })
+    .expect("artifact computed payload serializes to JSON")
 }
 
 fn import_validation_json(
@@ -374,25 +431,17 @@ fn import_validation_json(
     hash: &str,
     size_bytes: u64,
 ) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"schema_version\":\"agentflow.artifact_validation.v0\",",
-            "\"valid\":true,",
-            "\"import_mode\":\"{}\",",
-            "\"hash_algorithm\":\"fnv64\",",
-            "\"hash\":\"{}\",",
-            "\"size_bytes\":{},",
-            "\"source_path\":\"{}\",",
-            "\"stored_path\":\"{}\"",
-            "}}"
-        ),
-        mode,
-        escape_json(hash),
+    serde_json::to_string(&ImportValidationJson {
+        schema_version: "agentflow.artifact_validation.v0".to_string(),
+        valid: true,
+        import_mode: mode.as_str().to_string(),
+        hash_algorithm: "fnv64".to_string(),
+        hash: hash.to_string(),
         size_bytes,
-        escape_json(&source_path.display().to_string()),
-        escape_json(&stored_path.display().to_string())
-    )
+        source_path: source_path.display().to_string(),
+        stored_path: stored_path.display().to_string(),
+    })
+    .expect("artifact import validation serializes to JSON")
 }
 
 fn computed_validation_json(
@@ -402,26 +451,43 @@ fn computed_validation_json(
     hash: &str,
     size_bytes: u64,
 ) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"schema_version\":\"agentflow.artifact_validation.v0\",",
-            "\"valid\":true,",
-            "\"artifact_origin\":\"computed\",",
-            "\"output_name\":\"{}\",",
-            "\"hash_algorithm\":\"fnv64\",",
-            "\"hash\":\"{}\",",
-            "\"size_bytes\":{},",
-            "\"source_path\":\"{}\",",
-            "\"stored_path\":\"{}\"",
-            "}}"
-        ),
-        escape_json(output_name),
-        escape_json(hash),
+    serde_json::to_string(&ComputedValidationJson {
+        schema_version: "agentflow.artifact_validation.v0".to_string(),
+        valid: true,
+        artifact_origin: "computed".to_string(),
+        output_name: output_name.to_string(),
+        hash_algorithm: "fnv64".to_string(),
+        hash: hash.to_string(),
         size_bytes,
-        escape_json(&source_path.display().to_string()),
-        escape_json(&stored_path.display().to_string())
-    )
+        source_path: source_path.display().to_string(),
+        stored_path: stored_path.display().to_string(),
+    })
+    .expect("artifact computed validation serializes to JSON")
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ImportValidationJson {
+    schema_version: String,
+    valid: bool,
+    import_mode: String,
+    hash_algorithm: String,
+    hash: String,
+    size_bytes: u64,
+    source_path: String,
+    stored_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ComputedValidationJson {
+    schema_version: String,
+    valid: bool,
+    artifact_origin: String,
+    output_name: String,
+    hash_algorithm: String,
+    hash: String,
+    size_bytes: u64,
+    source_path: String,
+    stored_path: String,
 }
 
 fn validate_artifact_type(value: &str) -> Result<(), StorageError> {
@@ -466,32 +532,6 @@ fn now_unix_nanos() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
-}
-
-fn optional_json_string(value: Option<&str>) -> String {
-    value.map_or_else(
-        || "null".to_string(),
-        |inner| format!("\"{}\"", escape_json(inner)),
-    )
-}
-
-fn optional_json_i64(value: Option<i64>) -> String {
-    value.map_or_else(|| "null".to_string(), |inner| inner.to_string())
-}
-
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            _ => output.push(ch),
-        }
-    }
-    output
 }
 
 #[cfg(test)]
@@ -617,5 +657,63 @@ mod tests {
         assert!(json.contains("\"type\":\"TSV\""));
 
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn artifact_json_outputs_are_exact_byte_and_serde_readable() {
+        let summary = ArtifactSummary {
+            id: "artifact_1".to_string(),
+            kind: "imported".to_string(),
+            artifact_type: "TSV".to_string(),
+            path: PathBuf::from("/tmp/expression.tsv"),
+            hash: Some("fnv64:abc123".to_string()),
+            size_bytes: Some(17),
+            source_step_id: None,
+            source_run_id: None,
+            created_at: 9,
+        };
+        let inspection = ArtifactInspection {
+            summary: summary.clone(),
+            validation_json: "{\"schema_version\":\"agentflow.artifact_validation.v0\",\"valid\":true,\"import_mode\":\"copy\",\"hash_algorithm\":\"fnv64\",\"hash\":\"fnv64:abc123\",\"size_bytes\":17,\"source_path\":\"/tmp/source.tsv\",\"stored_path\":\"/tmp/expression.tsv\"}".to_string(),
+        };
+
+        assert_eq!(
+            artifacts_list_json(&[summary]),
+            "{\"schema_version\":\"agentflow.artifact_list.v0\",\"artifacts\":[{\"id\":\"artifact_1\",\"kind\":\"imported\",\"type\":\"TSV\",\"path\":\"/tmp/expression.tsv\",\"hash\":\"fnv64:abc123\",\"size_bytes\":17,\"source_step_id\":null,\"source_run_id\":null,\"created_at\":9}]}"
+        );
+        assert_eq!(
+            inspection.to_json(),
+            "{\"schema_version\":\"agentflow.artifact_inspection.v0\",\"artifact\":{\"id\":\"artifact_1\",\"kind\":\"imported\",\"type\":\"TSV\",\"path\":\"/tmp/expression.tsv\",\"hash\":\"fnv64:abc123\",\"size_bytes\":17,\"source_step_id\":null,\"source_run_id\":null,\"created_at\":9},\"validation\":{\"schema_version\":\"agentflow.artifact_validation.v0\",\"valid\":true,\"import_mode\":\"copy\",\"hash_algorithm\":\"fnv64\",\"hash\":\"fnv64:abc123\",\"size_bytes\":17,\"source_path\":\"/tmp/source.tsv\",\"stored_path\":\"/tmp/expression.tsv\"}}"
+        );
+
+        let payload: ArtifactImportedPayload = serde_json::from_str(
+            "{\"artifact_id\":\"artifact_1\",\"type\":\"TSV\",\"mode\":\"reference\",\"path\":\"/tmp/expression.tsv\"}",
+        )
+        .unwrap();
+        assert_eq!(payload.artifact_id, "artifact_1");
+    }
+
+    #[test]
+    fn artifact_validation_json_is_exact_byte() {
+        assert_eq!(
+            import_validation_json(
+                ArtifactImportMode::Reference,
+                Path::new("/tmp/source.tsv"),
+                Path::new("/tmp/stored.tsv"),
+                "fnv64:abc123",
+                17,
+            ),
+            "{\"schema_version\":\"agentflow.artifact_validation.v0\",\"valid\":true,\"import_mode\":\"reference\",\"hash_algorithm\":\"fnv64\",\"hash\":\"fnv64:abc123\",\"size_bytes\":17,\"source_path\":\"/tmp/source.tsv\",\"stored_path\":\"/tmp/stored.tsv\"}"
+        );
+        assert_eq!(
+            computed_validation_json(
+                "report",
+                Path::new("/tmp/source.md"),
+                Path::new("/tmp/stored.md"),
+                "fnv64:def456",
+                19,
+            ),
+            "{\"schema_version\":\"agentflow.artifact_validation.v0\",\"valid\":true,\"artifact_origin\":\"computed\",\"output_name\":\"report\",\"hash_algorithm\":\"fnv64\",\"hash\":\"fnv64:def456\",\"size_bytes\":19,\"source_path\":\"/tmp/source.md\",\"stored_path\":\"/tmp/stored.md\"}"
+        );
     }
 }

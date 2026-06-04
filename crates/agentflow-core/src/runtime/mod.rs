@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
 use crate::domain::{RunAttemptStatus, StepStatus};
 use crate::storage::{
@@ -148,6 +149,32 @@ pub struct RunAttemptRecord {
 pub struct RunInspection {
     pub run: RunRecordSummary,
     pub attempts: Vec<RunAttemptRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RuntimeStatusJson {
+    schema_version: String,
+    project: RuntimeStatusProjectJson,
+    counts: RuntimeStatusCountsJson,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RuntimeStatusProjectJson {
+    id: String,
+    name: String,
+    root_path: String,
+    engine_version: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RuntimeStatusCountsJson {
+    flows: i64,
+    steps: i64,
+    runs: i64,
+    run_attempts: i64,
+    artifacts: i64,
 }
 
 impl ProjectStore {
@@ -773,40 +800,25 @@ impl ProjectStore {
                 },
             )?;
 
-        Ok(format!(
-            concat!(
-                "{{",
-                "\"schema_version\":\"{}\",",
-                "\"project\":{{",
-                "\"id\":\"{}\",",
-                "\"name\":\"{}\",",
-                "\"root_path\":\"{}\",",
-                "\"engine_version\":\"{}\",",
-                "\"created_at\":{},",
-                "\"updated_at\":{}",
-                "}},",
-                "\"counts\":{{",
-                "\"flows\":{},",
-                "\"steps\":{},",
-                "\"runs\":{},",
-                "\"run_attempts\":{},",
-                "\"artifacts\":{}",
-                "}}",
-                "}}"
-            ),
-            agentflow_schemas::STATUS_JSON_SCHEMA_V0,
-            escape_json(&summary.id),
-            escape_json(&summary.name),
-            escape_json(&summary.root_path.display().to_string()),
-            escape_json(&summary.engine_version),
-            summary.created_at,
-            summary.updated_at,
-            flow_count,
-            step_count,
-            run_count,
-            attempt_count,
-            artifact_count
-        ))
+        serde_json::to_string(&RuntimeStatusJson {
+            schema_version: agentflow_schemas::STATUS_JSON_SCHEMA_V0.to_string(),
+            project: RuntimeStatusProjectJson {
+                id: summary.id,
+                name: summary.name,
+                root_path: summary.root_path.display().to_string(),
+                engine_version: summary.engine_version,
+                created_at: summary.created_at,
+                updated_at: summary.updated_at,
+            },
+            counts: RuntimeStatusCountsJson {
+                flows: flow_count,
+                steps: step_count,
+                runs: run_count,
+                run_attempts: attempt_count,
+                artifacts: artifact_count,
+            },
+        })
+        .map_err(|err| StorageError::InvalidInput(format!("status JSON failed: {err}")))
     }
 
     fn run_step(
@@ -1336,7 +1348,7 @@ impl ProjectStore {
         })?;
         for row in rows {
             let (path, validation_json) = row?;
-            if json_string_field(&validation_json, "output_name").as_deref() == Some(output_name) {
+            if validation_output_name(&validation_json).as_deref() == Some(output_name) {
                 let artifact = self.inspect_artifact_by_path(&path)?;
                 return Ok(ResolvedStepOutput {
                     cache_identity: file_hash_fnv64(&artifact.path)?,
@@ -1449,6 +1461,18 @@ fn ensure_step_dependencies_completed(
             missing.join(", ")
         )))
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactValidationOutputName {
+    #[serde(default)]
+    output_name: Option<String>,
+}
+
+fn validation_output_name(validation_json: &str) -> Option<String> {
+    serde_json::from_str::<ArtifactValidationOutputName>(validation_json)
+        .ok()
+        .and_then(|payload| payload.output_name)
 }
 
 fn run_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecordSummary> {
@@ -1668,37 +1692,29 @@ fn runtime_config_json(runtime: &ToolRuntimeSpec) -> Result<String, StorageError
         .as_deref()
         .map(|path| file_hash_fnv64(Path::new(path)))
         .transpose()?;
-    Ok(format!(
-        concat!(
-            "{{",
-            "\"backend\":\"{}\",",
-            "\"command\":{},",
-            "\"timeout_seconds\":{},",
-            "\"env_name\":{},",
-            "\"env_prefix\":{},",
-            "\"env_file\":{},",
-            "\"env_file_hash\":{},",
-            "\"runner\":{}",
-            "}}"
-        ),
-        escape_json(&runtime.backend),
-        string_array_json(&runtime.command),
-        runtime
-            .timeout_seconds
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "null".to_string()),
-        optional_json_string(runtime.env_name.as_deref()),
-        optional_json_string(runtime.env_prefix.as_deref()),
-        optional_json_string(runtime.env_file.as_deref()),
-        optional_json_string(env_file_hash.as_deref()),
-        optional_json_string(runtime.runner.as_deref())
-    ))
+    serde_json::to_string(&RuntimeConfigJson {
+        backend: runtime.backend.clone(),
+        command: runtime.command.clone(),
+        timeout_seconds: runtime.timeout_seconds,
+        env_name: runtime.env_name.clone(),
+        env_prefix: runtime.env_prefix.clone(),
+        env_file: runtime.env_file.clone(),
+        env_file_hash,
+        runner: runtime.runner.clone(),
+    })
+    .map_err(|err| StorageError::InvalidInput(format!("runtime config JSON failed: {err}")))
 }
 
-fn optional_json_string(value: Option<&str>) -> String {
-    value
-        .map(|value| format!("\"{}\"", escape_json(value)))
-        .unwrap_or_else(|| "null".to_string())
+#[derive(Debug, Serialize, Deserialize)]
+struct RuntimeConfigJson {
+    backend: String,
+    command: Vec<String>,
+    timeout_seconds: Option<u64>,
+    env_name: Option<String>,
+    env_prefix: Option<String>,
+    env_file: Option<String>,
+    env_file_hash: Option<String>,
+    runner: Option<String>,
 }
 
 fn stable_hash(input: &str) -> String {
@@ -2573,121 +2589,25 @@ fn env_vars(
 }
 
 fn parse_json_map(input: &str) -> Result<BTreeMap<String, String>, StorageError> {
-    let mut map = BTreeMap::new();
-    let mut index = 0;
-    skip_json_whitespace(input, &mut index);
-    expect_json_char(input, &mut index, '{')?;
-    skip_json_whitespace(input, &mut index);
-    if consume_json_char(input, &mut index, '}') {
-        return Ok(map);
-    }
-
-    loop {
-        let key = parse_json_string(input, &mut index)?;
-        skip_json_whitespace(input, &mut index);
-        expect_json_char(input, &mut index, ':')?;
-        skip_json_whitespace(input, &mut index);
-        let value = parse_json_string(input, &mut index)?;
-        map.insert(key, value);
-        skip_json_whitespace(input, &mut index);
-        if consume_json_char(input, &mut index, ',') {
-            skip_json_whitespace(input, &mut index);
-            continue;
-        }
-        if consume_json_char(input, &mut index, '}') {
-            break;
-        }
-        return Err(StorageError::InvalidInput(format!(
-            "cannot parse map: {input}"
-        )));
-    }
-
-    skip_json_whitespace(input, &mut index);
-    if index != input.len() {
-        return Err(StorageError::InvalidInput(format!(
-            "cannot parse map: {input}"
-        )));
-    }
-    Ok(map)
-}
-
-fn parse_json_string(input: &str, index: &mut usize) -> Result<String, StorageError> {
-    expect_json_char(input, index, '"')?;
-    let rest = input.get(*index..).ok_or_else(|| {
-        StorageError::InvalidInput(format!("cannot parse json string in map: {input}"))
-    })?;
-    let end = find_json_string_end(rest)
-        .ok_or_else(|| StorageError::InvalidInput(format!("cannot parse map: {input}")))?;
-    let value = unescape_json_string(&rest[..end]);
-    *index += end + 1;
-    Ok(value)
-}
-
-fn expect_json_char(input: &str, index: &mut usize, expected: char) -> Result<(), StorageError> {
-    if consume_json_char(input, index, expected) {
-        Ok(())
-    } else {
-        Err(StorageError::InvalidInput(format!(
-            "expected '{expected}' while parsing map: {input}"
-        )))
-    }
-}
-
-fn consume_json_char(input: &str, index: &mut usize, expected: char) -> bool {
-    if input
-        .get(*index..)
-        .and_then(|rest| rest.chars().next())
-        .is_some_and(|actual| actual == expected)
-    {
-        *index += expected.len_utf8();
-        true
-    } else {
-        false
-    }
-}
-
-fn skip_json_whitespace(input: &str, index: &mut usize) {
-    while input
-        .get(*index..)
-        .and_then(|rest| rest.chars().next())
-        .is_some_and(char::is_whitespace)
-    {
-        let ch = input[*index..].chars().next().expect("checked above");
-        *index += ch.len_utf8();
-    }
+    serde_json::from_str(input)
+        .map_err(|err| StorageError::InvalidInput(format!("cannot parse map: {input}: {err}")))
 }
 
 fn path_map_json(map: &BTreeMap<String, PathBuf>) -> String {
-    let fields = map
+    let path_map = map
         .iter()
-        .map(|(key, value)| {
-            format!(
-                "\"{}\":\"{}\"",
-                escape_json(key),
-                escape_json(&value.display().to_string())
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{fields}}}")
+        .map(|(key, value)| (key.clone(), value.display().to_string()))
+        .collect::<BTreeMap<_, _>>();
+    serde_json::to_string(&path_map).expect("path map serializes to JSON")
 }
 
 fn string_map_json(map: &BTreeMap<String, String>) -> String {
-    let fields = map
-        .iter()
-        .map(|(key, value)| format!("\"{}\":\"{}\"", escape_json(key), escape_json(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{fields}}}")
+    serde_json::to_string(map).expect("string map serializes to JSON")
 }
 
+#[cfg(test)]
 fn string_array_json(values: &[String]) -> String {
-    let items = values
-        .iter()
-        .map(|value| format!("\"{}\"", escape_json(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{items}]")
+    serde_json::to_string(values).expect("string array serializes to JSON")
 }
 
 fn shell_display(command: &[String]) -> String {
@@ -2705,51 +2625,6 @@ fn shell_display(command: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn json_string_field(json: &str, field: &str) -> Option<String> {
-    let marker = format!("\"{field}\":\"");
-    let start = json.find(&marker)? + marker.len();
-    let rest = &json[start..];
-    let end = find_json_string_end(rest)?;
-    Some(unescape_json_string(&rest[..end]))
-}
-
-fn find_json_string_end(input: &str) -> Option<usize> {
-    let mut escaped = false;
-    for (index, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(index),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn unescape_json_string(input: &str) -> String {
-    let mut output = String::new();
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('"') => output.push('"'),
-                Some('\\') => output.push('\\'),
-                Some('n') => output.push('\n'),
-                Some('r') => output.push('\r'),
-                Some('t') => output.push('\t'),
-                Some(other) => output.push(other),
-                None => {}
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-    output
 }
 
 fn sanitize_path_part(value: &str) -> String {
@@ -2788,21 +2663,6 @@ fn now_unix_nanos() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
-}
-
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            _ => output.push(ch),
-        }
-    }
-    output
 }
 
 #[cfg(test)]
@@ -2914,6 +2774,62 @@ exec "$@"
             parse_json_map(r#"{"gene":"TP53,EGFR:ALK","label":"quoted \"value\""}"#).unwrap();
         assert_eq!(parsed["gene"], "TP53,EGFR:ALK");
         assert_eq!(parsed["label"], "quoted \"value\"");
+    }
+
+    #[test]
+    fn runtime_json_helpers_are_exact_byte_and_serde_readable() {
+        let mut map = BTreeMap::new();
+        map.insert("gene".to_string(), "TP53".to_string());
+        map.insert("label".to_string(), "quoted \"value\"".to_string());
+        assert_eq!(
+            string_map_json(&map),
+            "{\"gene\":\"TP53\",\"label\":\"quoted \\\"value\\\"\"}"
+        );
+        assert_eq!(parse_json_map(&string_map_json(&map)).unwrap(), map);
+
+        let mut paths = BTreeMap::new();
+        paths.insert("report".to_string(), PathBuf::from("/tmp/report.md"));
+        assert_eq!(path_map_json(&paths), "{\"report\":\"/tmp/report.md\"}");
+        assert_eq!(
+            string_array_json(&["/bin/echo".to_string(), "hello world".to_string()]),
+            "[\"/bin/echo\",\"hello world\"]"
+        );
+
+        let runtime = ToolRuntimeSpec {
+            backend: "local".to_string(),
+            command: vec!["/bin/echo".to_string(), "hello world".to_string()],
+            timeout_seconds: Some(5),
+            env_name: None,
+            env_prefix: None,
+            env_file: None,
+            runner: None,
+        };
+        let json = runtime_config_json(&runtime).unwrap();
+        assert_eq!(
+            json,
+            "{\"backend\":\"local\",\"command\":[\"/bin/echo\",\"hello world\"],\"timeout_seconds\":5,\"env_name\":null,\"env_prefix\":null,\"env_file\":null,\"env_file_hash\":null,\"runner\":null}"
+        );
+        let payload: RuntimeConfigJson = serde_json::from_str(&json).unwrap();
+        assert_eq!(payload.command, ["/bin/echo", "hello world"]);
+    }
+
+    #[test]
+    fn status_json_is_exact_byte() {
+        let path = temp_project_path("status-json");
+        let store = ProjectStore::init(&path, Some("Runtime Demo")).unwrap();
+        let summary = store.summary().unwrap();
+        let expected = format!(
+            "{{\"schema_version\":\"agentflow.status.v0\",\"project\":{{\"id\":\"{}\",\"name\":\"Runtime Demo\",\"root_path\":\"{}\",\"engine_version\":\"{}\",\"created_at\":{},\"updated_at\":{}}},\"counts\":{{\"flows\":0,\"steps\":0,\"runs\":0,\"run_attempts\":0,\"artifacts\":0}}}}",
+            summary.id,
+            summary.root_path.display(),
+            summary.engine_version,
+            summary.created_at,
+            summary.updated_at
+        );
+
+        assert_eq!(store.status_json().unwrap(), expected);
+
+        let _ = fs::remove_dir_all(path);
     }
 
     #[test]

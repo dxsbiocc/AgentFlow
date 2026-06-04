@@ -12,7 +12,8 @@ use crate::handoff::{
 };
 use crate::hypothesis::HypothesisStatus;
 use crate::storage::{
-    validate_param_value, ArtifactSummary, EventRecord, ProjectStore, StorageError, ToolParamSpec,
+    validate_param_value, ArtifactSummary, EventRecord, FlowDraft, FlowStepDraft, ProjectStore,
+    StorageError, ToolParamSpec,
 };
 use crate::tool_select::{CapabilityQuery, Fit};
 
@@ -100,6 +101,9 @@ pub enum AppliedAction {
         patch_id: String,
         step_id: String,
     },
+    FlowAutoCreated {
+        flow_id: String,
+    },
     StepRun {
         step_id: String,
         observation_id: Option<String>,
@@ -122,6 +126,22 @@ impl ApplyFailure {
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("apply failure serializes to JSON")
     }
+}
+
+struct AppliedStepFinalization<'a> {
+    action: AppliedAction,
+    hypothesis_id: &'a str,
+    flow_id: &'a str,
+    step_id: &'a str,
+    step: &'a ProposedStep,
+    inferred_param_names: &'a [String],
+    auto_run: bool,
+}
+
+struct ApplyCycleOutputs<'a> {
+    applied: &'a mut Vec<AppliedAction>,
+    apply_failures: &'a mut Vec<ApplyFailure>,
+    raised_decisions: &'a mut Vec<DecisionPoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -297,9 +317,10 @@ impl ProjectStore {
                         }
                     }
                     if config.apply {
-                        if let (Some(flow_id), Some(step)) =
-                            (config.flow.as_deref(), proposal.drafted_step.as_ref())
-                        {
+                        if let Some(step) = proposal.drafted_step.as_ref() {
+                            let flow_id = config.flow.clone().unwrap_or_else(|| {
+                                auto_flow_id(&proposal.decision.candidate.hypothesis_id)
+                            });
                             let ctx = StepContext {
                                 cost: Cost::Moderate,
                                 reversible: true,
@@ -315,56 +336,64 @@ impl ProjectStore {
                             if let Some(kind) = policy.assess(&ctx) {
                                 let point = self.raise_decision_point(
                                     kind,
-                                    &graph_patch_apply_digest(&proposal.decision, flow_id),
+                                    &graph_patch_apply_digest(&proposal.decision, &flow_id),
                                     graph_patch_apply_options(
                                         &proposal.decision.candidate.hypothesis_id,
-                                        flow_id,
+                                        &flow_id,
                                     ),
                                     0,
                                 )?;
                                 raised_decisions.push(point);
                             } else {
-                                match self.apply_branch_patch_for_proposal(
-                                    flow_id,
-                                    &proposal.decision,
-                                    step,
-                                ) {
+                                let apply_result = if config.flow.is_some() {
+                                    self.apply_branch_patch_for_proposal(
+                                        &flow_id,
+                                        &proposal.decision,
+                                        step,
+                                    )
+                                } else {
+                                    self.apply_auto_flow_for_proposal(
+                                        &flow_id,
+                                        &proposal.decision,
+                                        step,
+                                    )
+                                };
+                                match apply_result {
                                     Ok(actions) => {
                                         for action in actions {
-                                            if let AppliedAction::GraphPatchApplied {
-                                                flow_id,
-                                                step_id,
-                                                ..
-                                            } = &action
-                                            {
-                                                self.emit_inferred_params_for_step(
-                                                    flow_id,
-                                                    step_id,
-                                                    &proposal.decision.candidate.hypothesis_id,
-                                                    step,
-                                                    &inferred_param_names,
-                                                )?;
-                                            }
-                                            let auto_run_target = match &action {
+                                            let applied_step = match &action {
                                                 AppliedAction::GraphPatchApplied {
                                                     flow_id,
                                                     step_id,
                                                     ..
-                                                } if config.auto_run => {
-                                                    Some((flow_id.clone(), step_id.clone()))
+                                                } => Some((flow_id.clone(), step_id.clone())),
+                                                AppliedAction::FlowAutoCreated { flow_id } => {
+                                                    Some((flow_id.clone(), step.id.clone()))
                                                 }
                                                 _ => None,
                                             };
-                                            applied.push(action);
-                                            if let Some((flow_id, step_id)) = auto_run_target {
-                                                self.auto_run_applied_step(
-                                                    &proposal.decision.candidate.hypothesis_id,
-                                                    &flow_id,
-                                                    &step_id,
-                                                    &mut applied,
-                                                    &mut apply_failures,
-                                                    &mut raised_decisions,
+                                            if let Some((flow_id, step_id)) = applied_step {
+                                                self.record_applied_step_action(
+                                                    AppliedStepFinalization {
+                                                        action,
+                                                        hypothesis_id: &proposal
+                                                            .decision
+                                                            .candidate
+                                                            .hypothesis_id,
+                                                        flow_id: &flow_id,
+                                                        step_id: &step_id,
+                                                        step,
+                                                        inferred_param_names: &inferred_param_names,
+                                                        auto_run: config.auto_run,
+                                                    },
+                                                    ApplyCycleOutputs {
+                                                        applied: &mut applied,
+                                                        apply_failures: &mut apply_failures,
+                                                        raised_decisions: &mut raised_decisions,
+                                                    },
                                                 )?;
+                                            } else {
+                                                applied.push(action);
                                             }
                                         }
                                     }
@@ -528,6 +557,59 @@ impl ProjectStore {
                 step_id,
             })
             .collect())
+    }
+
+    fn apply_auto_flow_for_proposal(
+        &self,
+        flow_id: &str,
+        decision: &BranchDecision,
+        step: &ProposedStep,
+    ) -> Result<Vec<AppliedAction>, StorageError> {
+        match self.inspect_flow(flow_id) {
+            Ok(_) => self.apply_branch_patch_for_proposal(flow_id, decision, step),
+            Err(StorageError::NotFound(_)) => {
+                self.approve_flow(
+                    FlowDraft {
+                        schema_version: agentflow_schemas::FLOW_SCHEMA_V0.to_string(),
+                        id: flow_id.to_string(),
+                        name: format!("Auto flow for {}", decision.candidate.hypothesis_id),
+                        steps: vec![flow_step_draft_from_proposed(step)],
+                        source_text: auto_flow_source_text(flow_id, decision),
+                    },
+                    None,
+                )?;
+                Ok(vec![AppliedAction::FlowAutoCreated {
+                    flow_id: flow_id.to_string(),
+                }])
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn record_applied_step_action(
+        &self,
+        finalization: AppliedStepFinalization<'_>,
+        outputs: ApplyCycleOutputs<'_>,
+    ) -> Result<(), StorageError> {
+        self.emit_inferred_params_for_step(
+            finalization.flow_id,
+            finalization.step_id,
+            finalization.hypothesis_id,
+            finalization.step,
+            finalization.inferred_param_names,
+        )?;
+        outputs.applied.push(finalization.action);
+        if finalization.auto_run {
+            self.auto_run_applied_step(
+                finalization.hypothesis_id,
+                finalization.flow_id,
+                finalization.step_id,
+                outputs.applied,
+                outputs.apply_failures,
+                outputs.raised_decisions,
+            )?;
+        }
+        Ok(())
     }
 
     fn emit_inferred_params_for_step(
@@ -835,10 +917,35 @@ fn applied_budget_count(applied: &[AppliedAction]) -> usize {
         .filter(|action| {
             matches!(
                 action,
-                AppliedAction::LifecycleTransition { .. } | AppliedAction::GraphPatchApplied { .. }
+                AppliedAction::LifecycleTransition { .. }
+                    | AppliedAction::GraphPatchApplied { .. }
+                    | AppliedAction::FlowAutoCreated { .. }
             )
         })
         .count()
+}
+
+fn auto_flow_id(hypothesis_id: &str) -> String {
+    format!("auto_{hypothesis_id}")
+}
+
+fn flow_step_draft_from_proposed(step: &ProposedStep) -> FlowStepDraft {
+    FlowStepDraft {
+        id: step.id.clone(),
+        tool_ref: step.tool.clone(),
+        needs: step.needs.clone(),
+        reason: None,
+        inputs: step.inputs.iter().cloned().collect(),
+        params: step.params.iter().cloned().collect(),
+        outputs: step.outputs.iter().cloned().collect(),
+    }
+}
+
+fn auto_flow_source_text(flow_id: &str, decision: &BranchDecision) -> String {
+    format!(
+        "auto-generated flow {flow_id} for hypothesis {}",
+        decision.candidate.hypothesis_id
+    )
 }
 
 fn auto_run_failure_reason(step_id: &str, reason: &str) -> String {
@@ -1288,6 +1395,13 @@ mod tests {
             "{\"type\":\"graph_patch_applied\",\"flow_id\":\"flow_1\",\"patch_id\":\"patch_1\",\"step_id\":\"step_1\"}"
         );
         assert_eq!(
+            (AppliedAction::FlowAutoCreated {
+                flow_id: "auto_hypothesis_1".to_string(),
+            })
+            .to_json(),
+            "{\"type\":\"flow_auto_created\",\"flow_id\":\"auto_hypothesis_1\"}"
+        );
+        assert_eq!(
             (AppliedAction::StepRun {
                 step_id: "step_1".to_string(),
                 observation_id: Some("observation_1".to_string()),
@@ -1536,6 +1650,16 @@ printf '# Marker report\nGene: THRSP\nscore: 0.61\n' > "$AGENTFLOW_OUTPUT_MARKER
         script_path
     }
 
+    fn write_no_input_auto_run_marker_script(root: &std::path::Path) -> PathBuf {
+        let script_path = root.join("auto_run_marker_no_input.sh");
+        std::fs::write(
+            &script_path,
+            "printf '# Marker report\nGene: THRSP\nscore: 0.61\n' > \"$AGENTFLOW_OUTPUT_MARKER_REPORT\"\n",
+        )
+        .unwrap();
+        script_path
+    }
+
     fn register_exploratory_marker_tool(store: &ProjectStore, script_path: &std::path::Path) {
         let command = script_path.display();
         let spec = ToolSpec::from_simple_yaml(&format!(
@@ -1550,6 +1674,39 @@ inputs:
   expression_table:
     type: ExpressionTable
     required: true
+outputs:
+  marker_report:
+    type: Markdown
+    observer: marker_report
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {command}
+"#
+        ))
+        .unwrap();
+        store.register_tool(spec).unwrap();
+    }
+
+    fn register_no_input_constrained_marker_tool(
+        store: &ProjectStore,
+        script_path: &std::path::Path,
+    ) {
+        let command = script_path.display();
+        let spec = ToolSpec::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: marker_deepen
+version: 0.1.0
+maturity: exploratory
+description: Marker gene deepening report for pathway validation
+params:
+  gene:
+    type: string
+    required: true
+    pattern: "^[A-Z0-9-]+$"
 outputs:
   marker_report:
     type: Markdown
@@ -1968,6 +2125,228 @@ steps:
         assert!(report.to_json().contains("\"type\":\"step_run\""));
         assert!(report.to_json().contains("\"observation_id\":\""));
         assert!(report.to_json().contains("\"kind\":\"stance_assessment\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn apply_without_flow_auto_creates_flow_runs_step_and_raises_stance_assessment() {
+        let (path, store) = init_project("auto-flow-runs-stance-assessment");
+        let script = write_no_input_auto_run_marker_script(&path);
+        register_no_input_constrained_marker_tool(&store, &script);
+        let statement = "Marker THRSP evidence requires deeper pathway validation";
+        let hypothesis_id = record_hypothesis(&store, statement);
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+        let auto_flow_id = format!("auto_{hypothesis_id}");
+
+        let report = store
+            .run_cycle_with(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: true,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &StubParamInferer,
+            )
+            .unwrap();
+
+        assert_eq!(report.outcome, CycleOutcome::HandedOff);
+        assert!(report.applied.iter().any(|action| matches!(
+            action,
+            AppliedAction::FlowAutoCreated { flow_id } if flow_id == &auto_flow_id
+        )));
+        let flow = store.inspect_flow(&auto_flow_id).unwrap();
+        assert_eq!(flow.steps.len(), 1);
+        assert_eq!(flow.steps[0].local_id, "step_marker_deepen");
+        assert!(flow.steps[0].inputs_json.contains("{}"));
+
+        let (step_id, observation_id) = report
+            .applied
+            .iter()
+            .find_map(|action| match action {
+                AppliedAction::StepRun {
+                    step_id,
+                    observation_id: Some(observation_id),
+                } => Some((step_id, observation_id)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(step_id, "step_marker_deepen");
+        let observation = store.inspect_observation(observation_id).unwrap();
+        assert_eq!(
+            observation.step_id.as_deref(),
+            Some(format!("step:{auto_flow_id}/step_marker_deepen").as_str())
+        );
+        assert_eq!(observation.kind, "marker_report");
+        assert_eq!(
+            store
+                .inferred_params_for_step(&auto_flow_id, "step_marker_deepen")
+                .unwrap(),
+            vec![("gene".to_string(), "THRSP".to_string())]
+        );
+
+        let point = report
+            .raised_decisions
+            .iter()
+            .find(|point| point.kind == DecisionKind::StanceAssessment)
+            .unwrap();
+        assert!(point.digest.contains(observation_id));
+        assert!(point.digest.contains(statement));
+        assert!(point.digest.contains(
+            "⚠ 该结果依赖 LLM 推断的未确认参数：gene=THRSP（请人工确认参数正确再据此判定立场）"
+        ));
+        assert!(report.to_json().contains("\"type\":\"flow_auto_created\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn apply_with_existing_flow_does_not_auto_create_flow() {
+        let (path, store) = init_project("flow-some-no-auto-create");
+        register_marker_tool(&store);
+        let artifact_id = import_expression_artifact(&store, &path);
+        approve_marker_flow(&store, &artifact_id);
+        let hypothesis_id = record_hypothesis(&store, "Marker evidence needs deeper validation");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: true,
+                auto_run: false,
+                flow: Some("auto_flow".to_string()),
+                max_apply: 5,
+                propose_synth: false,
+            })
+            .unwrap();
+
+        assert!(!report
+            .applied
+            .iter()
+            .any(|action| matches!(action, AppliedAction::FlowAutoCreated { .. })));
+        assert_eq!(event_count(&store, "flow_approved"), 1);
+        assert!(store
+            .inspect_flow(&format!("auto_{hypothesis_id}"))
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn apply_without_flow_budget_brake_raises_decision_instead_of_creating_flow() {
+        let (path, store) = init_project("auto-flow-budget-brake");
+        let script = write_no_input_auto_run_marker_script(&path);
+        register_no_input_constrained_marker_tool(&store, &script);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+
+        let report = store
+            .run_cycle_with(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: true,
+                    flow: None,
+                    max_apply: 1,
+                    propose_synth: false,
+                },
+                &StubParamInferer,
+            )
+            .unwrap();
+
+        assert_eq!(report.outcome, CycleOutcome::HandedOff);
+        assert!(report.applied.iter().any(|action| matches!(
+            action,
+            AppliedAction::LifecycleTransition { hypothesis_id: id, .. } if id == &hypothesis_id
+        )));
+        assert!(!report
+            .applied
+            .iter()
+            .any(|action| matches!(action, AppliedAction::FlowAutoCreated { .. })));
+        assert!(!report
+            .applied
+            .iter()
+            .any(|action| matches!(action, AppliedAction::StepRun { .. })));
+        assert!(report
+            .raised_decisions
+            .iter()
+            .any(|point| point.kind == DecisionKind::BudgetThreshold));
+        assert_eq!(event_count(&store, "flow_approved"), 0);
+        assert!(store
+            .inspect_flow(&format!("auto_{hypothesis_id}"))
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn apply_without_flow_reuses_existing_auto_flow_on_same_hypothesis() {
+        let (path, store) = init_project("auto-flow-idempotent");
+        let script = write_no_input_auto_run_marker_script(&path);
+        register_no_input_constrained_marker_tool(&store, &script);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+        let auto_flow_id = format!("auto_{hypothesis_id}");
+        let config = ApplyConfig {
+            apply: true,
+            auto_run: false,
+            flow: None,
+            max_apply: 5,
+            propose_synth: false,
+        };
+
+        let first = store
+            .run_cycle_with(config.clone(), &StubParamInferer)
+            .unwrap();
+        let second = store.run_cycle_with(config, &StubParamInferer).unwrap();
+
+        assert!(first.applied.iter().any(|action| matches!(
+            action,
+            AppliedAction::FlowAutoCreated { flow_id } if flow_id == &auto_flow_id
+        )));
+        assert!(!second
+            .applied
+            .iter()
+            .any(|action| matches!(action, AppliedAction::FlowAutoCreated { .. })));
+        assert_eq!(event_count(&store, "flow_approved"), 1);
+        let flow = store.inspect_flow(&auto_flow_id).unwrap();
+        assert_eq!(
+            flow.steps
+                .iter()
+                .filter(|step| step.local_id == "step_marker_deepen")
+                .count(),
+            1
+        );
 
         let _ = std::fs::remove_dir_all(path);
     }

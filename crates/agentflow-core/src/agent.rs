@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
@@ -10,7 +10,9 @@ use crate::handoff::{
     StepContext,
 };
 use crate::hypothesis::HypothesisStatus;
-use crate::storage::{ArtifactSummary, EventRecord, ProjectStore, StorageError};
+use crate::storage::{
+    validate_param_value, ArtifactSummary, EventRecord, ProjectStore, StorageError, ToolParamSpec,
+};
 use crate::tool_select::{CapabilityQuery, Fit};
 
 const AGENT_CYCLE_COMPLETED_EVENT: &str = "agent.cycle_completed";
@@ -445,8 +447,14 @@ impl ProjectStore {
             });
         };
 
+        let executable = self.executable_tool(&candidate.tool_ref)?;
         let mut drafted_step = self.draft_step_for(&candidate.tool_ref, available)?;
-        infer_replace_params(&mut drafted_step, &decision.candidate.statement, inferer);
+        infer_replace_params(
+            &mut drafted_step,
+            &decision.candidate.statement,
+            inferer,
+            &executable.params,
+        );
         let needs = self.infer_step_needs(&drafted_step)?;
         let drafted_step = ProposedStep {
             needs,
@@ -625,6 +633,7 @@ fn infer_replace_params(
     step: &mut ProposedStep,
     hypothesis_statement: &str,
     inferer: &dyn ParamInferer,
+    param_specs: &BTreeMap<String, ToolParamSpec>,
 ) {
     for (param_name, param_value) in &mut step.params {
         let placeholder = format!("REPLACE_{param_name}");
@@ -637,6 +646,11 @@ fn infer_replace_params(
         };
         let trimmed = inferred.trim();
         if !trimmed.is_empty() {
+            if let Some(spec) = param_specs.get(param_name) {
+                if validate_param_value(spec, trimmed).is_err() {
+                    continue;
+                }
+            }
             *param_value = trimmed.to_string();
         }
     }
@@ -1332,6 +1346,43 @@ runtime:
         store.register_tool(spec).unwrap();
     }
 
+    fn register_constrained_exploratory_marker_tool(
+        store: &ProjectStore,
+        script_path: &std::path::Path,
+    ) {
+        let command = script_path.display();
+        let spec = ToolSpec::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: marker_deepen
+version: 0.1.0
+maturity: exploratory
+description: Marker gene deepening report for pathway validation
+inputs:
+  expression_table:
+    type: ExpressionTable
+    required: true
+params:
+  gene:
+    type: string
+    required: true
+    pattern: "^[A-Z0-9-]+$"
+outputs:
+  marker_report:
+    type: Markdown
+    observer: marker_report
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {command}
+"#
+        ))
+        .unwrap();
+        store.register_tool(spec).unwrap();
+    }
+
     struct StubParamInferer;
 
     impl ParamInferer for StubParamInferer {
@@ -1339,6 +1390,16 @@ runtime:
             assert!(hypothesis_statement.contains("THRSP"));
             assert_eq!(param_name, "gene");
             Some("THRSP".to_string())
+        }
+    }
+
+    struct InvalidParamInferer;
+
+    impl ParamInferer for InvalidParamInferer {
+        fn infer(&self, hypothesis_statement: &str, param_name: &str) -> Option<String> {
+            assert!(hypothesis_statement.contains("THRSP"));
+            assert_eq!(param_name, "gene");
+            Some("THRSP!".to_string())
         }
     }
 
@@ -1416,6 +1477,33 @@ steps:
     needs: []
     inputs:
       expression_table: {artifact_id}
+    outputs:
+      marker_report: seed_marker_report
+"#
+                ))
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+    }
+
+    fn approve_constrained_auto_run_marker_flow(store: &ProjectStore, artifact_id: &str) {
+        store
+            .approve_flow(
+                FlowDraft::from_simple_yaml(&format!(
+                    r#"
+schema_version: agentflow.flow.v0
+id: auto_flow
+name: Auto run flow
+steps:
+  - id: seed
+    tool: analysis/marker_deepen
+    reason: Existing seed analysis
+    needs: []
+    inputs:
+      expression_table: {artifact_id}
+    params:
+      gene: TP53
     outputs:
       marker_report: seed_marker_report
 "#
@@ -2296,6 +2384,57 @@ steps:
             step.params,
             vec![("gene".to_string(), "REPLACE_gene".to_string())]
         );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn invalid_inferred_replace_param_stays_placeholder_and_does_not_auto_run() {
+        let (path, store) = init_project("invalid-inferred-param");
+        let script = write_auto_run_marker_script(&path, false);
+        register_constrained_exploratory_marker_tool(&store, &script);
+        let artifact_id = import_expression_artifact(&store, &path);
+        approve_constrained_auto_run_marker_flow(&store, &artifact_id);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is below the decision margin.",
+        );
+
+        let report = store
+            .run_cycle_with(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: true,
+                    flow: Some("auto_flow".to_string()),
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &InvalidParamInferer,
+            )
+            .unwrap();
+
+        let step = report.branch_proposals[0].drafted_step.as_ref().unwrap();
+        assert_eq!(
+            step.params,
+            vec![("gene".to_string(), "REPLACE_gene".to_string())]
+        );
+        assert!(!report
+            .applied
+            .iter()
+            .any(|action| matches!(action, AppliedAction::StepRun { .. })));
+        assert_eq!(report.apply_failures.len(), 1);
+        assert_eq!(report.apply_failures[0].hypothesis_id, hypothesis_id);
+        assert!(report.apply_failures[0]
+            .reason
+            .contains("missing required param gene"));
+        assert!(store.list_observations().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(path);
     }

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use regex::Regex;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +45,8 @@ pub struct ToolPortSpec {
 pub struct ToolParamSpec {
     pub type_name: String,
     pub required: bool,
+    pub enum_values: Option<Vec<String>>,
+    pub pattern: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +182,8 @@ impl ToolSpec {
             input_profiles: profile_map(&self.inputs),
             param_types: param_type_map(&self.params),
             required_params,
+            param_enum_values: param_enum_values_map(&self.params),
+            param_patterns: param_patterns_map(&self.params),
             output_types: port_type_map(&self.outputs),
             output_observers: observer_map(&self.outputs),
             input_min_rows: min_rows_map(&self.inputs),
@@ -220,6 +225,10 @@ struct StoredToolSpecJson {
     param_types: BTreeMap<String, String>,
     #[serde(default)]
     required_params: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    param_enum_values: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    param_patterns: BTreeMap<String, String>,
     #[serde(default)]
     output_types: BTreeMap<String, String>,
     #[serde(default)]
@@ -467,6 +476,14 @@ struct RawToolParamSpec {
     type_name: Option<String>,
     #[serde(default, deserialize_with = "yaml::deserialize_bool_like")]
     required: bool,
+    #[serde(
+        rename = "enum",
+        default,
+        deserialize_with = "yaml::deserialize_string_vec"
+    )]
+    enum_values: Vec<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
+    pattern: Option<String>,
 }
 
 impl RawToolParamSpec {
@@ -474,6 +491,8 @@ impl RawToolParamSpec {
         ToolParamSpec {
             type_name: self.type_name.unwrap_or_default(),
             required: self.required,
+            enum_values: (!self.enum_values.is_empty()).then_some(self.enum_values),
+            pattern: self.pattern,
         }
     }
 }
@@ -625,6 +644,11 @@ impl ParsedExecutableSections {
                 return Err(StorageError::InvalidInput(format!(
                     "param {name} must declare type"
                 )));
+            }
+            if let Some(pattern) = &param.pattern {
+                Regex::new(pattern).map_err(|error| {
+                    StorageError::InvalidInput(format!("param {name} pattern is invalid: {error}"))
+                })?;
             }
         }
         Ok(())
@@ -1323,11 +1347,15 @@ fn executable_from_stored_json(
         .into_iter()
         .map(|(name, type_name)| {
             let required = required_params.contains(&name);
+            let enum_values = stored.param_enum_values.get(&name).cloned();
+            let pattern = stored.param_patterns.get(&name).cloned();
             (
                 name,
                 ToolParamSpec {
                     type_name,
                     required,
+                    enum_values,
+                    pattern,
                 },
             )
         })
@@ -1376,6 +1404,47 @@ fn stored_tool_spec_from_json(spec_json: &str) -> Result<StoredToolSpecJson, Sto
     serde_json::from_str(spec_json).map_err(|err| {
         StorageError::InvalidInput(format!("stored tool spec JSON is invalid: {err}"))
     })
+}
+
+pub(crate) fn validate_param_value(spec: &ToolParamSpec, value: &str) -> Result<(), String> {
+    match spec.type_name.trim() {
+        "int" => {
+            value
+                .parse::<i64>()
+                .map_err(|_| format!("value {value:?} must be an int"))?;
+        }
+        "float" => {
+            value
+                .parse::<f64>()
+                .map_err(|_| format!("value {value:?} must be a float"))?;
+        }
+        "bool" => {
+            value
+                .parse::<bool>()
+                .map_err(|_| format!("value {value:?} must be a bool"))?;
+        }
+        "string" => {}
+        _ => {}
+    }
+
+    if let Some(enum_values) = &spec.enum_values {
+        if !enum_values.iter().any(|allowed| allowed == value) {
+            return Err(format!(
+                "value {value:?} must be one of: {}",
+                enum_values.join(", ")
+            ));
+        }
+    }
+
+    if let Some(pattern) = &spec.pattern {
+        let regex =
+            Regex::new(pattern).map_err(|error| format!("param pattern is invalid: {error}"))?;
+        if !regex.is_match(value) {
+            return Err(format!("value {value:?} must match pattern {pattern:?}"));
+        }
+    }
+
+    Ok(())
 }
 
 fn normalize_scalar(input: &str) -> String {
@@ -1470,6 +1539,28 @@ fn sample_id_column_map(map: &BTreeMap<String, ToolPortSpec>) -> BTreeMap<String
 fn param_type_map(map: &BTreeMap<String, ToolParamSpec>) -> BTreeMap<String, String> {
     map.iter()
         .map(|(name, param)| (name.clone(), param.type_name.clone()))
+        .collect()
+}
+
+fn param_enum_values_map(map: &BTreeMap<String, ToolParamSpec>) -> BTreeMap<String, Vec<String>> {
+    map.iter()
+        .filter_map(|(name, param)| {
+            param
+                .enum_values
+                .as_ref()
+                .map(|values| (name.clone(), values.clone()))
+        })
+        .collect()
+}
+
+fn param_patterns_map(map: &BTreeMap<String, ToolParamSpec>) -> BTreeMap<String, String> {
+    map.iter()
+        .filter_map(|(name, param)| {
+            param
+                .pattern
+                .as_ref()
+                .map(|pattern| (name.clone(), pattern.clone()))
+        })
         .collect()
 }
 
@@ -2358,9 +2449,111 @@ runtime:
             example_tool_spec(&examples_root, "tcga_survival_assoc.tool.yaml").stored_json();
 
         assert_eq!(migrations::checksum(&marker_json), "2f8e22fc89c1caf9");
-        assert_eq!(migrations::checksum(&tcga_json), "83405af4395dc680");
+        assert_eq!(migrations::checksum(&tcga_json), "a3e9aca548cab542");
         let marker_payload: StoredToolSpecJson = serde_json::from_str(&marker_json).unwrap();
         assert_eq!(marker_payload.name, "marker_survival_scan");
+    }
+
+    #[test]
+    fn parses_param_value_constraints_and_executable_tool_preserves_them() {
+        let spec = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: constrained_scan
+version: 0.1.0
+maturity: wrapped
+description: Scan with constrained params
+params:
+  mode:
+    type: string
+    required: true
+    enum: [fast, careful]
+  gene:
+    type: string
+    required: true
+    pattern: "^[A-Z0-9-]+$"
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.params
+                .get("mode")
+                .unwrap()
+                .enum_values
+                .as_ref()
+                .unwrap(),
+            &vec!["fast".to_string(), "careful".to_string()]
+        );
+        assert_eq!(
+            spec.params.get("gene").unwrap().pattern.as_deref(),
+            Some("^[A-Z0-9-]+$")
+        );
+
+        let path = temp_project_path("param-constraints");
+        let store = ProjectStore::init(&path, Some("Tools")).unwrap();
+        store.register_tool(spec).unwrap();
+        let executable = store.executable_tool("marker/constrained_scan").unwrap();
+        assert_eq!(
+            executable
+                .params
+                .get("mode")
+                .unwrap()
+                .enum_values
+                .as_ref()
+                .unwrap(),
+            &vec!["fast".to_string(), "careful".to_string()]
+        );
+        assert_eq!(
+            executable.params.get("gene").unwrap().pattern.as_deref(),
+            Some("^[A-Z0-9-]+$")
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn validate_param_value_checks_type_enum_and_pattern() {
+        let int_param = ToolParamSpec {
+            type_name: "int".to_string(),
+            required: true,
+            enum_values: None,
+            pattern: None,
+        };
+        assert!(validate_param_value(&int_param, "42").is_ok());
+        assert!(validate_param_value(&int_param, "4.2")
+            .unwrap_err()
+            .contains("must be an int"));
+
+        let enum_param = ToolParamSpec {
+            type_name: "string".to_string(),
+            required: true,
+            enum_values: Some(vec!["fast".to_string(), "careful".to_string()]),
+            pattern: None,
+        };
+        assert!(validate_param_value(&enum_param, "fast").is_ok());
+        assert!(validate_param_value(&enum_param, "slow")
+            .unwrap_err()
+            .contains("must be one of"));
+
+        let pattern_param = ToolParamSpec {
+            type_name: "string".to_string(),
+            required: true,
+            enum_values: None,
+            pattern: Some("^[A-Z0-9-]+$".to_string()),
+        };
+        assert!(validate_param_value(&pattern_param, "TP53").is_ok());
+        assert!(validate_param_value(&pattern_param, "TP53!")
+            .unwrap_err()
+            .contains("must match pattern"));
     }
 
     fn example_tool_spec(examples_root: &std::path::Path, file_name: &str) -> ToolSpec {

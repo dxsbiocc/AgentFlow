@@ -605,6 +605,12 @@ impl ProjectStore {
         let Some(observation_id) = request.observation_id.as_deref() else {
             return Ok(request.grade);
         };
+        if !self
+            .source_inferred_params_for_observation(observation_id)?
+            .is_empty()
+        {
+            return Ok(EvidenceGrade::Inferred);
+        }
         if self.source_tool_maturity_for_observation(observation_id)?
             == Some(ToolMaturity::Exploratory)
         {
@@ -612,6 +618,27 @@ impl ProjectStore {
         }
 
         Ok(request.grade)
+    }
+
+    fn source_inferred_params_for_observation(
+        &self,
+        observation_id: &str,
+    ) -> Result<Vec<(String, String)>, StorageError> {
+        let observation_id = observation_id.trim();
+        if observation_id.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let observation = match self.inspect_observation(observation_id) {
+            Ok(observation) => observation,
+            Err(StorageError::NotFound(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let (Some(flow_id), Some(step_id)) = (observation.flow_id, observation.step_id) else {
+            return Ok(Vec::new());
+        };
+
+        self.inferred_params_for_step(&flow_id, &step_id)
     }
 
     fn source_tool_maturity_for_observation(
@@ -1604,6 +1631,96 @@ steps:
         assert_eq!(
             store.evidence_for(&non_observed_id).unwrap()[0].grade,
             EvidenceGrade::LiteratureSupported
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn observed_grade_is_capped_for_non_exploratory_observation_with_inferred_params() {
+        let path = temp_project_path("grade-cap-inferred-param");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Argument Demo")).unwrap();
+        let observation_id = tool_observation(
+            &store,
+            &path,
+            "verified_param_flow",
+            "verified_param_tool",
+            "verified",
+        );
+        let hypothesis_id = record_hypothesis(&store);
+        store
+            .append_event(crate::storage::EventRecord {
+                flow_id: Some("verified_param_flow".to_string()),
+                step_id: Some("produce".to_string()),
+                run_id: None,
+                event_type: "agent.params_inferred".to_string(),
+                payload_json: r#"{"flow_id":"verified_param_flow","step_id":"produce","hypothesis_id":"hypothesis_1","params":[{"name":"gene","value":"THRSP"}]}"#
+                    .to_string(),
+            })
+            .unwrap();
+
+        let evidence = store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis_id.clone(),
+                observation_id: Some(observation_id),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: "Verified source with inferred parameter".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            store
+                .inferred_params_for_step("verified_param_flow", "step:verified_param_flow/produce")
+                .unwrap(),
+            vec![("gene".to_string(), "THRSP".to_string())]
+        );
+        assert_eq!(evidence.grade, EvidenceGrade::Inferred);
+        assert_eq!(
+            store.evidence_for(&hypothesis_id).unwrap()[0].grade,
+            EvidenceGrade::Inferred
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn observed_grade_is_not_capped_for_non_exploratory_observation_without_inferred_params() {
+        let path = temp_project_path("grade-no-cap-no-inferred-param");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Argument Demo")).unwrap();
+        let observation_id = tool_observation(
+            &store,
+            &path,
+            "verified_clean_flow",
+            "verified_clean",
+            "verified",
+        );
+        let hypothesis_id = record_hypothesis(&store);
+
+        let evidence = store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis_id.clone(),
+                observation_id: Some(observation_id),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: "Verified source without inferred parameter".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            store
+                .inferred_params_for_step("verified_clean_flow", "produce")
+                .unwrap(),
+            Vec::<(String, String)>::new()
+        );
+        assert_eq!(evidence.grade, EvidenceGrade::Observed);
+        assert_eq!(
+            store.evidence_for(&hypothesis_id).unwrap()[0].grade,
+            EvidenceGrade::Observed
         );
 
         let _ = fs::remove_dir_all(path);

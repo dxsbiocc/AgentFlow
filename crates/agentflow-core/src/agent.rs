@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use rusqlite::params;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 
@@ -16,6 +17,7 @@ use crate::storage::{
 use crate::tool_select::{CapabilityQuery, Fit};
 
 const AGENT_CYCLE_COMPLETED_EVENT: &str = "agent.cycle_completed";
+const PARAMS_INFERRED_EVENT: &str = "agent.params_inferred";
 const TOOL_GAP_HYPOTHESIS_MARKER: &str = "hypothesis_id = ";
 const STANCE_ASSESSMENT_OBSERVATION_MARKER: &str = "observation_id = ";
 
@@ -276,7 +278,7 @@ impl ProjectStore {
                     raised_decisions.push(point);
                 }
                 BranchAction::Deepen { .. } | BranchAction::Spawn { .. } => {
-                    let proposal = self.enrich_branch_proposal(
+                    let (proposal, inferred_param_names) = self.enrich_branch_proposal(
                         decision,
                         &available_input_types,
                         &available,
@@ -329,6 +331,20 @@ impl ProjectStore {
                                 ) {
                                     Ok(actions) => {
                                         for action in actions {
+                                            if let AppliedAction::GraphPatchApplied {
+                                                flow_id,
+                                                step_id,
+                                                ..
+                                            } = &action
+                                            {
+                                                self.emit_inferred_params_for_step(
+                                                    flow_id,
+                                                    step_id,
+                                                    &proposal.decision.candidate.hypothesis_id,
+                                                    step,
+                                                    &inferred_param_names,
+                                                )?;
+                                            }
                                             let auto_run_target = match &action {
                                                 AppliedAction::GraphPatchApplied {
                                                     flow_id,
@@ -429,7 +445,7 @@ impl ProjectStore {
         available_input_types: &[String],
         available: &[(String, String)],
         inferer: &dyn ParamInferer,
-    ) -> Result<EnrichedProposal, StorageError> {
+    ) -> Result<(EnrichedProposal, Vec<String>), StorageError> {
         let query = CapabilityQuery {
             desired_output_type: None,
             available_input_types: available_input_types.to_vec(),
@@ -438,18 +454,21 @@ impl ProjectStore {
         let top = self.match_tools(&query)?.into_iter().next();
 
         let Some(candidate) = top else {
-            return Ok(EnrichedProposal {
-                decision,
-                matched_tool: None,
-                matched_fit: None,
-                match_reason: None,
-                drafted_step: None,
-            });
+            return Ok((
+                EnrichedProposal {
+                    decision,
+                    matched_tool: None,
+                    matched_fit: None,
+                    match_reason: None,
+                    drafted_step: None,
+                },
+                Vec::new(),
+            ));
         };
 
         let executable = self.executable_tool(&candidate.tool_ref)?;
         let mut drafted_step = self.draft_step_for(&candidate.tool_ref, available)?;
-        infer_replace_params(
+        let inferred_param_names = infer_replace_params(
             &mut drafted_step,
             &decision.candidate.statement,
             inferer,
@@ -460,13 +479,16 @@ impl ProjectStore {
             needs,
             ..drafted_step
         };
-        Ok(EnrichedProposal {
-            decision,
-            matched_tool: Some(candidate.tool_ref),
-            matched_fit: Some(candidate.fit.as_str().to_string()),
-            match_reason: Some(candidate.reason),
-            drafted_step: Some(drafted_step),
-        })
+        Ok((
+            EnrichedProposal {
+                decision,
+                matched_tool: Some(candidate.tool_ref),
+                matched_fit: Some(candidate.fit.as_str().to_string()),
+                match_reason: Some(candidate.reason),
+                drafted_step: Some(drafted_step),
+            },
+            inferred_param_names,
+        ))
     }
 
     fn has_equivalent_tool_branches(
@@ -506,6 +528,30 @@ impl ProjectStore {
                 step_id,
             })
             .collect())
+    }
+
+    fn emit_inferred_params_for_step(
+        &self,
+        flow_id: &str,
+        step_id: &str,
+        hypothesis_id: &str,
+        step: &ProposedStep,
+        inferred_param_names: &[String],
+    ) -> Result<(), StorageError> {
+        let params = inferred_param_payloads(step, inferred_param_names);
+        if params.is_empty() {
+            return Ok(());
+        }
+
+        self.append_event(EventRecord {
+            flow_id: Some(flow_id.to_string()),
+            step_id: Some(step_id.to_string()),
+            run_id: None,
+            event_type: PARAMS_INFERRED_EVENT.to_string(),
+            payload_json: params_inferred_payload_json(flow_id, step_id, hypothesis_id, params),
+        })?;
+        self.touch_project()?;
+        Ok(())
     }
 
     fn auto_run_applied_step(
@@ -584,15 +630,25 @@ impl ProjectStore {
 
         let observation = self.inspect_observation(observation_id)?;
         let hypothesis = self.inspect_hypothesis(hypothesis_id)?;
+        let inferred_params = inferred_params_for_observation(
+            self,
+            observation.flow_id.as_deref(),
+            observation.step_id.as_deref(),
+        )?;
+        let mut digest = stance_assessment_digest(
+            step_id,
+            observation_id,
+            &observation.summary,
+            hypothesis_id,
+            &hypothesis.statement,
+        );
+        if !inferred_params.is_empty() {
+            digest.push('\n');
+            digest.push_str(&inferred_param_warning(&inferred_params));
+        }
         let point = self.raise_decision_point(
             DecisionKind::StanceAssessment,
-            &stance_assessment_digest(
-                step_id,
-                observation_id,
-                &observation.summary,
-                hypothesis_id,
-                &hypothesis.statement,
-            ),
+            &digest,
             stance_assessment_options(hypothesis_id, observation_id),
             2,
         )?;
@@ -610,6 +666,166 @@ impl ProjectStore {
             .rev()
             .find(|observation| observation.step_id.as_deref() == Some(source_step_id))
             .map(|observation| observation.id))
+    }
+
+    pub fn inferred_params_for_step(
+        &self,
+        flow_id: &str,
+        step_id: &str,
+    ) -> Result<Vec<(String, String)>, StorageError> {
+        let flow_id = flow_id.trim();
+        let step_id = step_id.trim();
+        if flow_id.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "flow id must not be empty".to_string(),
+            ));
+        }
+        if step_id.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "step id must not be empty".to_string(),
+            ));
+        }
+
+        let mut stmt = self.connection().prepare(
+            "SELECT id, flow_id, step_id, payload_json
+             FROM events
+             WHERE event_type = ?1
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![PARAMS_INFERRED_EVENT], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        let mut params = Vec::new();
+        for row in rows {
+            let (event_id, event_flow_id, event_step_id, payload_json) = row?;
+            let payload = params_inferred_payload_from_json(&event_id, &payload_json)?;
+            let candidate_flow_id = event_flow_id.unwrap_or(payload.flow_id);
+            let candidate_step_id = event_step_id.unwrap_or(payload.step_id);
+            if candidate_flow_id == flow_id && step_ids_match(flow_id, step_id, &candidate_step_id)
+            {
+                for param in payload.params {
+                    let name = param.name.trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    params.push((name.to_string(), param.value.trim().to_string()));
+                }
+            }
+        }
+
+        Ok(params)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ParamsInferredPayload {
+    flow_id: String,
+    step_id: String,
+    hypothesis_id: String,
+    params: Vec<InferredParamPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct InferredParamPayload {
+    name: String,
+    value: String,
+}
+
+fn inferred_param_payloads(
+    step: &ProposedStep,
+    inferred_param_names: &[String],
+) -> Vec<InferredParamPayload> {
+    inferred_param_names
+        .iter()
+        .filter_map(|name| {
+            step.params
+                .iter()
+                .find(|(param_name, _)| param_name == name)
+                .map(|(_, value)| InferredParamPayload {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+        })
+        .collect()
+}
+
+fn params_inferred_payload_json(
+    flow_id: &str,
+    step_id: &str,
+    hypothesis_id: &str,
+    params: Vec<InferredParamPayload>,
+) -> String {
+    serde_json::to_string(&ParamsInferredPayload {
+        flow_id: flow_id.to_string(),
+        step_id: step_id.to_string(),
+        hypothesis_id: hypothesis_id.to_string(),
+        params,
+    })
+    .expect("params inferred payload serializes to JSON")
+}
+
+fn params_inferred_payload_from_json(
+    event_id: &str,
+    payload_json: &str,
+) -> Result<ParamsInferredPayload, StorageError> {
+    serde_json::from_str(payload_json).map_err(|err| {
+        StorageError::InvalidInput(format!(
+            "params inferred event {event_id} has invalid payload: {err}"
+        ))
+    })
+}
+
+fn inferred_params_for_observation(
+    store: &ProjectStore,
+    flow_id: Option<&str>,
+    step_id: Option<&str>,
+) -> Result<Vec<(String, String)>, StorageError> {
+    let (Some(flow_id), Some(step_id)) = (flow_id, step_id) else {
+        return Ok(Vec::new());
+    };
+    store.inferred_params_for_step(flow_id, step_id)
+}
+
+fn inferred_param_warning(params: &[(String, String)]) -> String {
+    let params = params
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("⚠ 该结果依赖 LLM 推断的未确认参数：{params}（请人工确认参数正确再据此判定立场）")
+}
+
+fn step_ids_match(flow_id: &str, requested: &str, candidate: &str) -> bool {
+    step_id_variants(flow_id, requested)
+        .intersection(&step_id_variants(flow_id, candidate))
+        .next()
+        .is_some()
+}
+
+fn step_id_variants(flow_id: &str, step_id: &str) -> BTreeSet<String> {
+    let step_id = step_id.trim();
+    let mut variants = BTreeSet::from([step_id.to_string()]);
+    if let Some(local_id) = canonical_step_local_id(flow_id, step_id) {
+        variants.insert(local_id.to_string());
+    } else {
+        variants.insert(format!("step:{flow_id}/{step_id}"));
+    }
+    variants
+}
+
+fn canonical_step_local_id<'a>(flow_id: &str, step_id: &'a str) -> Option<&'a str> {
+    let rest = step_id.strip_prefix("step:")?;
+    let (step_flow_id, local_id) = rest.split_once('/')?;
+    if step_flow_id == flow_id && !local_id.trim().is_empty() {
+        Some(local_id)
+    } else {
+        None
     }
 }
 
@@ -634,7 +850,8 @@ fn infer_replace_params(
     hypothesis_statement: &str,
     inferer: &dyn ParamInferer,
     param_specs: &BTreeMap<String, ToolParamSpec>,
-) {
+) -> Vec<String> {
+    let mut inferred_param_names = Vec::new();
     for (param_name, param_value) in &mut step.params {
         let placeholder = format!("REPLACE_{param_name}");
         if param_value != &placeholder {
@@ -652,8 +869,10 @@ fn infer_replace_params(
                 }
             }
             *param_value = trimmed.to_string();
+            inferred_param_names.push(param_name.clone());
         }
     }
+    inferred_param_names
 }
 
 fn proposal_keywords(statement: &str) -> Vec<String> {
@@ -2354,6 +2573,156 @@ steps:
 
         let step = report.branch_proposals[0].drafted_step.as_ref().unwrap();
         assert_eq!(step.params, vec![("gene".to_string(), "THRSP".to_string())]);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn inferred_params_are_emitted_after_graph_patch_apply_and_projected() {
+        let (path, store) = init_project("inferred-param-provenance");
+        let script = write_auto_run_marker_script(&path, false);
+        register_constrained_exploratory_marker_tool(&store, &script);
+        let artifact_id = import_expression_artifact(&store, &path);
+        approve_constrained_auto_run_marker_flow(&store, &artifact_id);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is below the decision margin.",
+        );
+
+        let report = store
+            .run_cycle_with(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: false,
+                    flow: Some("auto_flow".to_string()),
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &StubParamInferer,
+            )
+            .unwrap();
+
+        assert!(report.applied.iter().any(|action| {
+            matches!(
+                action,
+                AppliedAction::GraphPatchApplied {
+                    flow_id,
+                    step_id,
+                    ..
+                } if flow_id == "auto_flow" && step_id == "step_marker_deepen"
+            )
+        }));
+        assert_eq!(event_count(&store, "agent.params_inferred"), 1);
+        assert_eq!(
+            store
+                .inferred_params_for_step("auto_flow", "step_marker_deepen")
+                .unwrap(),
+            vec![("gene".to_string(), "THRSP".to_string())]
+        );
+        assert_eq!(
+            store
+                .inferred_params_for_step("auto_flow", "step:auto_flow/step_marker_deepen")
+                .unwrap(),
+            vec![("gene".to_string(), "THRSP".to_string())]
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn stance_assessment_digest_warns_for_inferred_params() {
+        let (path, store) = init_project("stance-digest-inferred-param-warning");
+        let script = write_auto_run_marker_script(&path, false);
+        register_constrained_exploratory_marker_tool(&store, &script);
+        let artifact_id = import_expression_artifact(&store, &path);
+        approve_constrained_auto_run_marker_flow(&store, &artifact_id);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is below the decision margin.",
+        );
+
+        let report = store
+            .run_cycle_with(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: true,
+                    flow: Some("auto_flow".to_string()),
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &StubParamInferer,
+            )
+            .unwrap();
+
+        let point = report
+            .raised_decisions
+            .iter()
+            .find(|point| point.kind == DecisionKind::StanceAssessment)
+            .unwrap();
+        assert!(point.digest.contains(
+            "⚠ 该结果依赖 LLM 推断的未确认参数：gene=THRSP（请人工确认参数正确再据此判定立场）"
+        ));
+        assert_eq!(point.options.len(), 3);
+        assert_eq!(point.recommendation, 2);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn stance_assessment_digest_has_no_warning_without_inferred_params() {
+        let (path, store) = init_project("stance-digest-no-inferred-param-warning");
+        let script = write_auto_run_marker_script(&path, false);
+        register_exploratory_marker_tool(&store, &script);
+        let artifact_id = import_expression_artifact(&store, &path);
+        approve_auto_run_marker_flow(&store, &artifact_id);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: true,
+                auto_run: true,
+                flow: Some("auto_flow".to_string()),
+                max_apply: 5,
+                propose_synth: false,
+            })
+            .unwrap();
+
+        let point = report
+            .raised_decisions
+            .iter()
+            .find(|point| point.kind == DecisionKind::StanceAssessment)
+            .unwrap();
+        assert!(!point.digest.contains("LLM 推断的未确认参数"));
+        assert_eq!(
+            store
+                .inferred_params_for_step("auto_flow", "step_marker_deepen")
+                .unwrap(),
+            Vec::<(String, String)>::new()
+        );
 
         let _ = std::fs::remove_dir_all(path);
     }

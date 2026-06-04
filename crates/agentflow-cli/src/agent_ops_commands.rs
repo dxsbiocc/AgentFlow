@@ -1026,6 +1026,9 @@ fn format_applied_actions(actions: &[AppliedAction]) -> String {
                 "  graph patch {} applied to {} step {}",
                 patch_id, flow_id, step_id
             ),
+            AppliedAction::FlowAutoCreated { flow_id } => {
+                format!("  flow {} auto-created", flow_id)
+            }
             AppliedAction::StepRun {
                 step_id,
                 observation_id,

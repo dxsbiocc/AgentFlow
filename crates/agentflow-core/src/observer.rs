@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::Path;
 
 use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
 use crate::storage::{now_unix_seconds, EventRecord, ProjectStore, StorageError};
 
@@ -148,11 +149,10 @@ impl ProjectStore {
             step_id: artifact.summary.source_step_id.clone(),
             run_id: artifact.summary.source_run_id.clone(),
             event_type: "observation_recorded".to_string(),
-            payload_json: format!(
-                "{{\"observation_id\":\"{}\",\"artifact_id\":\"{}\",\"kind\":\"{}\"}}",
-                escape_json(observation_id),
-                escape_json(&artifact.summary.id),
-                escape_json(kind)
+            payload_json: observation_recorded_payload_json(
+                observation_id,
+                &artifact.summary.id,
+                kind,
             ),
         })?;
         self.touch_project()?;
@@ -407,68 +407,111 @@ fn observation_summary(
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ObservationRecordedPayload {
+    observation_id: String,
+    artifact_id: String,
+    kind: String,
+}
+
+fn observation_recorded_payload_json(
+    observation_id: &str,
+    artifact_id: &str,
+    kind: &str,
+) -> String {
+    serde_json::to_string(&ObservationRecordedPayload {
+        observation_id: observation_id.to_string(),
+        artifact_id: artifact_id.to_string(),
+        kind: kind.to_string(),
+    })
+    .expect("observation recorded payload serializes to JSON")
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ObservationPayload {
+    schema_version: String,
+    artifact: ObservationArtifactPayload,
+    text: Option<ObservationTextPayload>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MarkerReportPayload {
+    schema_version: String,
+    adapter: String,
+    artifact: ObservationArtifactPayload,
+    domain: Option<MarkerReportDomainPayload>,
+    text: Option<ObservationTextPayload>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ObservationArtifactPayload {
+    id: String,
+    path: String,
+    kind: String,
+    #[serde(rename = "type")]
+    artifact_type: String,
+    size_bytes: i64,
+    hash: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MarkerReportDomainPayload {
+    gene: Option<String>,
+    score: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ObservationTextPayload {
+    line_count: i64,
+    preview: String,
+    metrics: Vec<ObservationMetricPayload>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ObservationMetricPayload {
+    name: String,
+    value: serde_json::Value,
+    raw: String,
+}
+
 fn observation_payload_json(
     artifact: &crate::storage::ArtifactInspection,
     observed: &ObservedFile,
 ) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"schema_version\":\"{}\",",
-            "\"artifact\":{},",
-            "\"text\":{}",
-            "}}"
-        ),
-        OBSERVATION_SCHEMA_VERSION,
-        observation_artifact_json(artifact, observed),
-        observation_text_json(observed.text.as_ref())
-    )
+    serde_json::to_string(&ObservationPayload {
+        schema_version: OBSERVATION_SCHEMA_VERSION.to_string(),
+        artifact: observation_artifact_payload(artifact, observed),
+        text: observation_text_payload(observed.text.as_ref()),
+    })
+    .expect("observation payload serializes to JSON")
 }
 
 fn marker_report_payload_json(
     artifact: &crate::storage::ArtifactInspection,
     observed: &ObservedFile,
 ) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"schema_version\":\"{}\",",
-            "\"adapter\":\"{}\",",
-            "\"artifact\":{},",
-            "\"domain\":{},",
-            "\"text\":{}",
-            "}}"
-        ),
-        OBSERVATION_SCHEMA_VERSION,
-        MARKER_REPORT_OBSERVATION_KIND,
-        observation_artifact_json(artifact, observed),
-        marker_report_domain_json(observed.text.as_ref()),
-        observation_text_json(observed.text.as_ref())
-    )
+    serde_json::to_string(&MarkerReportPayload {
+        schema_version: OBSERVATION_SCHEMA_VERSION.to_string(),
+        adapter: MARKER_REPORT_OBSERVATION_KIND.to_string(),
+        artifact: observation_artifact_payload(artifact, observed),
+        domain: marker_report_domain_payload(observed.text.as_ref()),
+        text: observation_text_payload(observed.text.as_ref()),
+    })
+    .expect("marker report payload serializes to JSON")
 }
 
-fn observation_artifact_json(
+fn observation_artifact_payload(
     artifact: &crate::storage::ArtifactInspection,
     observed: &ObservedFile,
-) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"id\":\"{}\",",
-            "\"path\":\"{}\",",
-            "\"kind\":\"{}\",",
-            "\"type\":\"{}\",",
-            "\"size_bytes\":{},",
-            "\"hash\":\"{}\"",
-            "}}"
-        ),
-        escape_json(&artifact.summary.id),
-        escape_json(&artifact.summary.path.display().to_string()),
-        escape_json(&artifact.summary.kind),
-        escape_json(&artifact.summary.artifact_type),
-        observed.size_bytes,
-        escape_json(&observed.hash)
-    )
+) -> ObservationArtifactPayload {
+    ObservationArtifactPayload {
+        id: artifact.summary.id.clone(),
+        path: artifact.summary.path.display().to_string(),
+        kind: artifact.summary.kind.clone(),
+        artifact_type: artifact.summary.artifact_type.clone(),
+        size_bytes: observed.size_bytes,
+        hash: observed.hash.clone(),
+    }
 }
 
 fn marker_report_summary(path: &Path, observed: &ObservedFile) -> String {
@@ -506,44 +549,36 @@ fn marker_report_summary(path: &Path, observed: &ObservedFile) -> String {
     }
 }
 
-fn marker_report_domain_json(text: Option<&TextObservation>) -> String {
-    let Some(text) = text else {
-        return "null".to_string();
-    };
+fn marker_report_domain_payload(
+    text: Option<&TextObservation>,
+) -> Option<MarkerReportDomainPayload> {
+    let text = text?;
     let gene = extract_named_text_field(&text.sample_text, "gene")
         .or_else(|| extract_named_text_field(&text.sample_text, "marker"));
-    format!(
-        "{{\"gene\":{},\"score\":{}}}",
-        optional_json_string(gene.as_deref()),
-        text_metric_value(text, "score").unwrap_or("null")
-    )
+    Some(MarkerReportDomainPayload {
+        gene,
+        score: text_metric_value(text, "score").map(json_number_value),
+    })
 }
 
-fn observation_text_json(text: Option<&TextObservation>) -> String {
-    text.map_or_else(
-        || "null".to_string(),
-        |text| {
-            let metrics = text
-                .metrics
-                .iter()
-                .map(|metric| {
-                    format!(
-                        "{{\"name\":\"{}\",\"value\":{},\"raw\":\"{}\"}}",
-                        escape_json(&metric.name),
-                        metric.value,
-                        escape_json(&metric.raw)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!(
-                "{{\"line_count\":{},\"preview\":\"{}\",\"metrics\":[{}]}}",
-                text.line_count,
-                escape_json(&text.preview),
-                metrics
-            )
-        },
-    )
+fn observation_text_payload(text: Option<&TextObservation>) -> Option<ObservationTextPayload> {
+    text.map(|text| ObservationTextPayload {
+        line_count: text.line_count,
+        preview: text.preview.clone(),
+        metrics: text
+            .metrics
+            .iter()
+            .map(|metric| ObservationMetricPayload {
+                name: metric.name.clone(),
+                value: json_number_value(&metric.value),
+                raw: metric.raw.clone(),
+            })
+            .collect(),
+    })
+}
+
+fn json_number_value(value: &str) -> serde_json::Value {
+    serde_json::from_str(value).expect("observed metric value is formatted as a JSON number")
 }
 
 fn extract_named_text_field(text: &str, field: &str) -> Option<String> {
@@ -575,13 +610,6 @@ fn text_metric_value<'a>(text: &'a TextObservation, metric_name: &str) -> Option
         .map(|metric| metric.value.as_str())
 }
 
-fn optional_json_string(value: Option<&str>) -> String {
-    value.map_or_else(
-        || "null".to_string(),
-        |inner| format!("\"{}\"", escape_json(inner)),
-    )
-}
-
 pub fn normalize_metric_name(input: &str) -> String {
     let mut output = String::new();
     let mut last_was_separator = false;
@@ -605,12 +633,31 @@ pub fn metric_value_from_payload(payload_json: &str, metric_name: &str) -> Optio
     if normalized.is_empty() {
         return None;
     }
-    let marker = format!("\"name\":\"{}\"", escape_json(&normalized));
-    let metric_start = payload_json.find(&marker)?;
-    let rest = &payload_json[metric_start + marker.len()..];
-    let value_marker = "\"value\":";
-    let value_start = rest.find(value_marker)? + value_marker.len();
-    parse_json_number_prefix(&rest[value_start..])
+    let payload: MetricLookupPayload = serde_json::from_str(payload_json).ok()?;
+    payload
+        .text?
+        .metrics
+        .into_iter()
+        .find(|metric| metric.name == normalized)
+        .map(|metric| metric.value)
+}
+
+#[derive(Debug, Deserialize)]
+struct MetricLookupPayload {
+    #[serde(default)]
+    text: Option<MetricLookupTextPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetricLookupTextPayload {
+    #[serde(default)]
+    metrics: Vec<MetricLookupMetricPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetricLookupMetricPayload {
+    name: String,
+    value: f64,
 }
 
 fn extract_text_metrics(text: &str) -> Vec<ObservedMetric> {
@@ -694,25 +741,6 @@ fn parse_first_number(input: &str) -> Option<f64> {
     input[start..end].parse::<f64>().ok()
 }
 
-fn parse_json_number_prefix(input: &str) -> Option<f64> {
-    let trimmed = input.trim_start();
-    let mut end = 0;
-    for (index, ch) in trimmed.char_indices() {
-        if index == 0 && matches!(ch, '-' | '+') {
-            end = ch.len_utf8();
-            continue;
-        }
-        if ch.is_ascii_digit() || matches!(ch, '.' | 'e' | 'E' | '-' | '+') {
-            end = index + ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-    (end > 0)
-        .then(|| trimmed[..end].parse::<f64>().ok())
-        .flatten()
-}
-
 fn format_metric_value(value: f64) -> String {
     if value.fract() == 0.0 {
         format!("{value:.0}")
@@ -725,26 +753,12 @@ fn format_metric_value(value: f64) -> String {
     }
 }
 
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => output.push(ch),
-        }
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{ArtifactImportMode, ArtifactImportRequest};
+    use crate::storage::{
+        ArtifactImportMode, ArtifactImportRequest, ArtifactInspection, ArtifactSummary,
+    };
     use std::path::PathBuf;
 
     fn temp_project_path(test_name: &str) -> PathBuf {
@@ -765,6 +779,151 @@ mod tests {
             .unwrap()
             .summary
             .id
+    }
+
+    fn artifact_inspection(path: PathBuf) -> ArtifactInspection {
+        ArtifactInspection {
+            summary: ArtifactSummary {
+                id: "artifact_1".to_string(),
+                kind: "computed".to_string(),
+                artifact_type: "Markdown".to_string(),
+                path,
+                hash: None,
+                size_bytes: None,
+                source_step_id: Some("step:flow/scan".to_string()),
+                source_run_id: Some("run_1".to_string()),
+                created_at: 7,
+            },
+            validation_json: "{}".to_string(),
+        }
+    }
+
+    fn text_observation() -> TextObservation {
+        TextObservation {
+            line_count: 2,
+            preview: "Gene: EGFR\nscore: 0.75".to_string(),
+            sample_text: "Gene: EGFR\nscore: 0.75\np value: 0.031\n".to_string(),
+            metrics: vec![
+                ObservedMetric {
+                    name: "score".to_string(),
+                    value: "0.75".to_string(),
+                    raw: "score: 0.75".to_string(),
+                },
+                ObservedMetric {
+                    name: "p_value".to_string(),
+                    value: "0.031".to_string(),
+                    raw: "p value: 0.031".to_string(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn payload_json_outputs_match_legacy_bytes() {
+        let artifact = artifact_inspection(PathBuf::from("/tmp/report.md"));
+        let observed = ObservedFile {
+            size_bytes: 27,
+            hash: "fnv64:abc123".to_string(),
+            text: Some(text_observation()),
+        };
+
+        assert_eq!(
+            observation_payload_json(&artifact, &observed),
+            concat!(
+                "{\"schema_version\":\"agentflow.observation.v0\",",
+                "\"artifact\":{\"id\":\"artifact_1\",\"path\":\"/tmp/report.md\",\"kind\":\"computed\",\"type\":\"Markdown\",\"size_bytes\":27,\"hash\":\"fnv64:abc123\"},",
+                "\"text\":{\"line_count\":2,\"preview\":\"Gene: EGFR\\nscore: 0.75\",",
+                "\"metrics\":[{\"name\":\"score\",\"value\":0.75,\"raw\":\"score: 0.75\"},",
+                "{\"name\":\"p_value\",\"value\":0.031,\"raw\":\"p value: 0.031\"}]}}"
+            )
+        );
+        assert_eq!(
+            marker_report_payload_json(&artifact, &observed),
+            concat!(
+                "{\"schema_version\":\"agentflow.observation.v0\",",
+                "\"adapter\":\"marker_report\",",
+                "\"artifact\":{\"id\":\"artifact_1\",\"path\":\"/tmp/report.md\",\"kind\":\"computed\",\"type\":\"Markdown\",\"size_bytes\":27,\"hash\":\"fnv64:abc123\"},",
+                "\"domain\":{\"gene\":\"EGFR\",\"score\":0.75},",
+                "\"text\":{\"line_count\":2,\"preview\":\"Gene: EGFR\\nscore: 0.75\",",
+                "\"metrics\":[{\"name\":\"score\",\"value\":0.75,\"raw\":\"score: 0.75\"},",
+                "{\"name\":\"p_value\",\"value\":0.031,\"raw\":\"p value: 0.031\"}]}}"
+            )
+        );
+        assert_eq!(
+            observation_recorded_payload_json("observation_1", "artifact_1", "marker_report"),
+            "{\"observation_id\":\"observation_1\",\"artifact_id\":\"artifact_1\",\"kind\":\"marker_report\"}"
+        );
+    }
+
+    #[test]
+    fn legacy_handwritten_payloads_deserialize_and_metrics_parse() {
+        let payload: ObservationPayload = serde_json::from_str(
+            r#"{
+                "schema_version": "agentflow.observation.v0",
+                "text": {
+                    "metrics": [
+                        {"raw": "score: 0.75", "value": 0.75, "name": "score"}
+                    ],
+                    "preview": "legacy",
+                    "line_count": 1
+                },
+                "artifact": {
+                    "hash": "fnv64:abc123",
+                    "size_bytes": 27,
+                    "type": "Markdown",
+                    "kind": "computed",
+                    "path": "/tmp/report.md",
+                    "id": "artifact_1"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(payload.schema_version, OBSERVATION_SCHEMA_VERSION);
+        assert_eq!(payload.artifact.id, "artifact_1");
+
+        let marker_payload: MarkerReportPayload = serde_json::from_str(
+            r#"{
+                "schema_version": "agentflow.observation.v0",
+                "adapter": "marker_report",
+                "artifact": {
+                    "id": "artifact_1",
+                    "path": "/tmp/report.md",
+                    "kind": "computed",
+                    "type": "Markdown",
+                    "size_bytes": 27,
+                    "hash": "fnv64:abc123"
+                },
+                "domain": {"score": 0.75, "gene": "EGFR"},
+                "text": {
+                    "line_count": 2,
+                    "preview": "legacy",
+                    "metrics": [{"name": "score", "value": 0.75, "raw": "score: 0.75"}]
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(marker_payload.adapter, MARKER_REPORT_OBSERVATION_KIND);
+        assert_eq!(
+            marker_payload
+                .domain
+                .as_ref()
+                .and_then(|domain| domain.gene.as_deref()),
+            Some("EGFR")
+        );
+
+        assert_eq!(
+            metric_value_from_payload(
+                r#"{
+                    "text": {
+                        "metrics": [
+                            {"name": "score", "value": 0.75, "raw": "score: 0.75"}
+                        ]
+                    }
+                }"#,
+                "Score"
+            ),
+            Some(0.75)
+        );
     }
 
     #[test]

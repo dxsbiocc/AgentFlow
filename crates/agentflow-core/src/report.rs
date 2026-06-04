@@ -4,7 +4,10 @@ use std::path::PathBuf;
 
 use rusqlite::params;
 
-use crate::argument::{EvidenceLink, Stance, VerdictSummary, VerdictTag};
+use crate::argument::{
+    cross_modal_corroboration, CrossModalAssessment, CrossModalStatus, EvidenceLink, Stance,
+    VerdictSummary, VerdictTag,
+};
 use crate::handoff::DecisionStatus;
 use crate::storage::{
     now_unix_seconds, ArtifactSummary, ProjectStore, StorageError, StoredFlowStep,
@@ -94,6 +97,12 @@ impl ProjectStore {
                     &mut markdown,
                     "- verdict: {}",
                     format_research_verdict(verdict.as_ref())
+                )
+                .unwrap();
+                writeln!(
+                    &mut markdown,
+                    "- 跨模态印证：{}",
+                    format_cross_modal_assessment(&cross_modal_corroboration(&evidence))
                 )
                 .unwrap();
                 write_research_evidence_group(
@@ -671,6 +680,40 @@ fn research_evidence_source(link: &EvidenceLink) -> &str {
         .unwrap_or("-")
 }
 
+fn format_cross_modal_assessment(assessment: &CrossModalAssessment) -> String {
+    match assessment.status {
+        CrossModalStatus::Conflicting => {
+            let mut details = Vec::new();
+            if assessment.literature_supporting > 0 && assessment.empirical_contradicting > 0 {
+                details.push("文献支持 / 数据反驳");
+            }
+            if assessment.literature_contradicting > 0 && assessment.empirical_supporting > 0 {
+                details.push("文献反驳 / 数据支持");
+            }
+            format!("⚠ 冲突（{}）", details.join("；"))
+        }
+        CrossModalStatus::Corroborated => {
+            let mut details = Vec::new();
+            if assessment.literature_supporting > 0 && assessment.empirical_supporting > 0 {
+                details.push("文献 + 数据一致支持");
+            }
+            if assessment.literature_contradicting > 0 && assessment.empirical_contradicting > 0 {
+                details.push("文献 + 数据一致反驳");
+            }
+            format!("印证（{}）", details.join("；"))
+        }
+        CrossModalStatus::EmpiricalOnly => format!(
+            "仅数据（支持 {} / 反驳 {}）",
+            assessment.empirical_supporting, assessment.empirical_contradicting
+        ),
+        CrossModalStatus::LiteratureOnly => format!(
+            "仅文献（支持 {} / 反驳 {}）",
+            assessment.literature_supporting, assessment.literature_contradicting
+        ),
+        CrossModalStatus::None => "无（未发现文献或数据证据）".to_string(),
+    }
+}
+
 fn format_research_verdict(verdict: Option<&VerdictSummary>) -> String {
     verdict.map_or_else(
         || "(no verdict)".to_string(),
@@ -1071,6 +1114,7 @@ fi
         assert!(report.contains("### Marker A changes pathway B"));
         assert!(report.contains("- lifecycle: `proposed`"));
         assert!(report.contains("- verdict: `inconclusive(provisional)` (confidence: `medium`)"));
+        assert!(report.contains("- 跨模态印证：仅数据（支持 0 / 反驳 1）"));
         assert!(report.contains("- supporting evidence (1):"));
         assert!(report.contains("[observed] Observed marker increase in run 1 - source: lab_run_1"));
         assert!(report.contains("- contradicting evidence (1):"));
@@ -1081,6 +1125,104 @@ fi
         assert!(report.contains("[hypothesis] Mechanism remains speculative - source: -"));
         assert!(report
             .contains("- uncertainty: evidence below decision margin / needs stronger evidence"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn generate_research_report_markdown_renders_cross_modal_conflict() {
+        let path = temp_project_path("cross-modal-conflict");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Cross Modal Conflict")).unwrap();
+        let hypothesis = store
+            .record_hypothesis(HypothesisRequest {
+                statement: "Literature and data disagree on marker A".to_string(),
+                origin: "agent".to_string(),
+                related_goal_id: "goal_cross_modal".to_string(),
+            })
+            .unwrap();
+
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis.id.clone(),
+                observation_id: None,
+                source: Some("PMID:123".to_string()),
+                grade: EvidenceGrade::LiteratureSupported,
+                stance: Stance::Supports,
+                note: "Paper reports marker A increases".to_string(),
+            })
+            .unwrap();
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis.id.clone(),
+                observation_id: Some("observation_contra".to_string()),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Contradicts,
+                note: "Run shows marker A decreases".to_string(),
+            })
+            .unwrap();
+
+        let report = store.generate_research_report_markdown().unwrap();
+
+        assert!(report.contains("- 跨模态印证：⚠ 冲突（文献支持 / 数据反驳）"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn generate_research_report_markdown_renders_single_modality_and_empty_cross_modal_labels() {
+        let path = temp_project_path("cross-modal-labels");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Cross Modal Labels")).unwrap();
+        let empirical = store
+            .record_hypothesis(HypothesisRequest {
+                statement: "Data alone supports marker A".to_string(),
+                origin: "agent".to_string(),
+                related_goal_id: "goal_cross_modal".to_string(),
+            })
+            .unwrap();
+        let literature = store
+            .record_hypothesis(HypothesisRequest {
+                statement: "Literature alone contradicts marker B".to_string(),
+                origin: "agent".to_string(),
+                related_goal_id: "goal_cross_modal".to_string(),
+            })
+            .unwrap();
+        store
+            .record_hypothesis(HypothesisRequest {
+                statement: "No modal evidence is linked".to_string(),
+                origin: "agent".to_string(),
+                related_goal_id: "goal_cross_modal".to_string(),
+            })
+            .unwrap();
+
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: empirical.id,
+                observation_id: Some("observation_support".to_string()),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: "Observed marker A increase".to_string(),
+            })
+            .unwrap();
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: literature.id,
+                observation_id: None,
+                source: Some("PMID:456".to_string()),
+                grade: EvidenceGrade::LiteratureSupported,
+                stance: Stance::Contradicts,
+                note: "Paper reports marker B does not change".to_string(),
+            })
+            .unwrap();
+
+        let report = store.generate_research_report_markdown().unwrap();
+
+        assert!(report.contains("- 跨模态印证：仅数据（支持 1 / 反驳 0）"));
+        assert!(report.contains("- 跨模态印证：仅文献（支持 0 / 反驳 1）"));
+        assert!(report.contains("- 跨模态印证：无（未发现文献或数据证据）"));
 
         let _ = fs::remove_dir_all(path);
     }

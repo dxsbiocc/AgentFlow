@@ -123,6 +123,81 @@ impl EvidenceLink {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CrossModalStatus {
+    Conflicting,
+    Corroborated,
+    EmpiricalOnly,
+    LiteratureOnly,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossModalAssessment {
+    pub status: CrossModalStatus,
+    pub literature_supporting: usize,
+    pub literature_contradicting: usize,
+    pub empirical_supporting: usize,
+    pub empirical_contradicting: usize,
+}
+
+pub fn cross_modal_corroboration(evidence: &[EvidenceLink]) -> CrossModalAssessment {
+    let mut assessment = CrossModalAssessment {
+        status: CrossModalStatus::None,
+        literature_supporting: 0,
+        literature_contradicting: 0,
+        empirical_supporting: 0,
+        empirical_contradicting: 0,
+    };
+
+    for link in evidence {
+        if link.grade == EvidenceGrade::LiteratureSupported {
+            match link.stance {
+                Stance::Supports => assessment.literature_supporting += 1,
+                Stance::Contradicts => assessment.literature_contradicting += 1,
+                Stance::Neutral => {}
+            }
+        }
+
+        if matches!(
+            link.grade,
+            EvidenceGrade::Observed | EvidenceGrade::Inferred
+        ) && link.observation_id.is_some()
+        {
+            match link.stance {
+                Stance::Supports => assessment.empirical_supporting += 1,
+                Stance::Contradicts => assessment.empirical_contradicting += 1,
+                Stance::Neutral => {}
+            }
+        }
+    }
+
+    let has_literature_support = assessment.literature_supporting > 0;
+    let has_literature_contra = assessment.literature_contradicting > 0;
+    let has_empirical_support = assessment.empirical_supporting > 0;
+    let has_empirical_contra = assessment.empirical_contradicting > 0;
+    let has_literature = has_literature_support || has_literature_contra;
+    let has_empirical = has_empirical_support || has_empirical_contra;
+
+    assessment.status = if (has_literature_support && has_empirical_contra)
+        || (has_literature_contra && has_empirical_support)
+    {
+        CrossModalStatus::Conflicting
+    } else if (has_literature_support && has_empirical_support)
+        || (has_literature_contra && has_empirical_contra)
+    {
+        CrossModalStatus::Corroborated
+    } else if has_empirical {
+        CrossModalStatus::EmpiricalOnly
+    } else if has_literature {
+        CrossModalStatus::LiteratureOnly
+    } else {
+        CrossModalStatus::None
+    };
+
+    assessment
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimBasis {
@@ -1076,9 +1151,9 @@ mod tests {
     use crate::storage::{now_unix_seconds, FlowDraft, ProjectStore, StorageError, ToolSpec};
 
     use super::{
-        ArgumentEngine, ClaimBasis, EvidenceGrade, EvidenceLink, EvidenceLinkRequest,
-        InconclusiveKind, RuleBasedEngine, SelfDeceptionGate, Stance, Verdict, VerdictReport,
-        VerdictTag,
+        cross_modal_corroboration, ArgumentEngine, ClaimBasis, CrossModalStatus, EvidenceGrade,
+        EvidenceLink, EvidenceLinkRequest, InconclusiveKind, RuleBasedEngine, SelfDeceptionGate,
+        Stance, Verdict, VerdictReport, VerdictTag,
     };
 
     fn temp_project_path(test_name: &str) -> PathBuf {
@@ -1110,6 +1185,13 @@ mod tests {
             stance,
             note: format!("{stance} via {grade}"),
             created_at: 1,
+        }
+    }
+
+    fn observed_evidence_link(id: &str, grade: EvidenceGrade, stance: Stance) -> EvidenceLink {
+        EvidenceLink {
+            observation_id: Some(format!("observation_{id}")),
+            ..evidence_link(id, grade, stance)
         }
     }
 
@@ -1817,6 +1899,90 @@ steps:
         assert_eq!(report.contradicting.len(), 0);
         assert!(report.rationale.contains("rule 2"));
         assert!(report.rationale.contains("support=6"));
+    }
+
+    #[test]
+    fn cross_modal_corroboration_classifies_none_without_modal_stance_evidence() {
+        let evidence = vec![
+            evidence_link("e1", EvidenceGrade::Hypothesis, Stance::Supports),
+            observed_evidence_link("e2", EvidenceGrade::Unsupported, Stance::Contradicts),
+            evidence_link("e3", EvidenceGrade::Observed, Stance::Supports),
+        ];
+
+        let assessment = cross_modal_corroboration(&evidence);
+
+        assert_eq!(assessment.status, CrossModalStatus::None);
+        assert_eq!(assessment.literature_supporting, 0);
+        assert_eq!(assessment.literature_contradicting, 0);
+        assert_eq!(assessment.empirical_supporting, 0);
+        assert_eq!(assessment.empirical_contradicting, 0);
+    }
+
+    #[test]
+    fn cross_modal_corroboration_classifies_literature_only() {
+        let evidence = vec![evidence_link(
+            "e1",
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+        )];
+
+        let assessment = cross_modal_corroboration(&evidence);
+
+        assert_eq!(assessment.status, CrossModalStatus::LiteratureOnly);
+        assert_eq!(assessment.literature_supporting, 1);
+        assert_eq!(assessment.literature_contradicting, 0);
+        assert_eq!(assessment.empirical_supporting, 0);
+        assert_eq!(assessment.empirical_contradicting, 0);
+    }
+
+    #[test]
+    fn cross_modal_corroboration_classifies_empirical_only() {
+        let evidence = vec![observed_evidence_link(
+            "e1",
+            EvidenceGrade::Inferred,
+            Stance::Contradicts,
+        )];
+
+        let assessment = cross_modal_corroboration(&evidence);
+
+        assert_eq!(assessment.status, CrossModalStatus::EmpiricalOnly);
+        assert_eq!(assessment.literature_supporting, 0);
+        assert_eq!(assessment.literature_contradicting, 0);
+        assert_eq!(assessment.empirical_supporting, 0);
+        assert_eq!(assessment.empirical_contradicting, 1);
+    }
+
+    #[test]
+    fn cross_modal_corroboration_classifies_same_stance_corroborated() {
+        let evidence = vec![
+            evidence_link("e1", EvidenceGrade::LiteratureSupported, Stance::Supports),
+            observed_evidence_link("e2", EvidenceGrade::Observed, Stance::Supports),
+        ];
+
+        let assessment = cross_modal_corroboration(&evidence);
+
+        assert_eq!(assessment.status, CrossModalStatus::Corroborated);
+        assert_eq!(assessment.literature_supporting, 1);
+        assert_eq!(assessment.literature_contradicting, 0);
+        assert_eq!(assessment.empirical_supporting, 1);
+        assert_eq!(assessment.empirical_contradicting, 0);
+    }
+
+    #[test]
+    fn cross_modal_corroboration_prioritizes_conflicting_cross_stance_evidence() {
+        let evidence = vec![
+            evidence_link("e1", EvidenceGrade::LiteratureSupported, Stance::Supports),
+            observed_evidence_link("e2", EvidenceGrade::Observed, Stance::Supports),
+            observed_evidence_link("e3", EvidenceGrade::Observed, Stance::Contradicts),
+        ];
+
+        let assessment = cross_modal_corroboration(&evidence);
+
+        assert_eq!(assessment.status, CrossModalStatus::Conflicting);
+        assert_eq!(assessment.literature_supporting, 1);
+        assert_eq!(assessment.literature_contradicting, 0);
+        assert_eq!(assessment.empirical_supporting, 1);
+        assert_eq!(assessment.empirical_contradicting, 1);
     }
 
     #[test]

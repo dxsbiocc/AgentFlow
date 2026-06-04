@@ -1,5 +1,8 @@
 use std::collections::BTreeSet;
 
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Serialize, Serializer};
+
 use crate::argument::{ArgumentEngine, InconclusiveKind, RuleBasedEngine, Verdict, VerdictReport};
 use crate::branch::{BranchAction, BranchDecision, BranchPolicy, ProposedStep, RuleBasedSelector};
 use crate::handoff::{
@@ -14,7 +17,8 @@ const AGENT_CYCLE_COMPLETED_EVENT: &str = "agent.cycle_completed";
 const TOOL_GAP_HYPOTHESIS_MARKER: &str = "hypothesis_id = ";
 const STANCE_ASSESSMENT_OBSERVATION_MARKER: &str = "observation_id = ";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CycleOutcome {
     HandedOff,
     Advanced,
@@ -31,7 +35,7 @@ impl CycleOutcome {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrichedProposal {
     pub decision: BranchDecision,
     pub matched_tool: Option<String>,
@@ -42,25 +46,7 @@ pub struct EnrichedProposal {
 
 impl EnrichedProposal {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"decision\":{},",
-                "\"matched_tool\":{},",
-                "\"matched_fit\":{},",
-                "\"match_reason\":{},",
-                "\"drafted_step\":{}",
-                "}}"
-            ),
-            self.decision.to_json(),
-            optional_string_json(self.matched_tool.as_deref()),
-            optional_string_json(self.matched_fit.as_deref()),
-            optional_string_json(self.match_reason.as_deref()),
-            self.drafted_step
-                .as_ref()
-                .map(proposed_step_json)
-                .unwrap_or_else(|| "null".to_string())
-        )
+        serde_json::to_string(self).expect("enriched proposal serializes to JSON")
     }
 }
 
@@ -98,7 +84,8 @@ impl ParamInferer for NoopParamInferer {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppliedAction {
     LifecycleTransition {
         hypothesis_id: String,
@@ -117,54 +104,11 @@ pub enum AppliedAction {
 
 impl AppliedAction {
     pub fn to_json(&self) -> String {
-        match self {
-            Self::LifecycleTransition { hypothesis_id, to } => format!(
-                concat!(
-                    "{{",
-                    "\"type\":\"lifecycle_transition\",",
-                    "\"hypothesis_id\":\"{}\",",
-                    "\"to\":\"{}\"",
-                    "}}"
-                ),
-                escape_json(hypothesis_id),
-                escape_json(to)
-            ),
-            Self::GraphPatchApplied {
-                flow_id,
-                patch_id,
-                step_id,
-            } => format!(
-                concat!(
-                    "{{",
-                    "\"type\":\"graph_patch_applied\",",
-                    "\"flow_id\":\"{}\",",
-                    "\"patch_id\":\"{}\",",
-                    "\"step_id\":\"{}\"",
-                    "}}"
-                ),
-                escape_json(flow_id),
-                escape_json(patch_id),
-                escape_json(step_id)
-            ),
-            Self::StepRun {
-                step_id,
-                observation_id,
-            } => format!(
-                concat!(
-                    "{{",
-                    "\"type\":\"step_run\",",
-                    "\"step_id\":\"{}\",",
-                    "\"observation_id\":{}",
-                    "}}"
-                ),
-                escape_json(step_id),
-                optional_string_json(observation_id.as_deref())
-            ),
-        }
+        serde_json::to_string(self).expect("applied action serializes to JSON")
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyFailure {
     pub hypothesis_id: String,
     pub reason: String,
@@ -172,86 +116,53 @@ pub struct ApplyFailure {
 
 impl ApplyFailure {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!("{{", "\"hypothesis_id\":\"{}\",", "\"reason\":\"{}\"", "}}"),
-            escape_json(&self.hypothesis_id),
-            escape_json(&self.reason)
-        )
+        serde_json::to_string(self).expect("apply failure serializes to JSON")
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CycleReport {
     pub checkpoint_id: String,
     pub provisional_verdicts: Vec<String>,
     pub strong_candidates: Vec<String>,
     pub raised_decisions: Vec<DecisionPoint>,
     pub branch_proposals: Vec<EnrichedProposal>,
+    #[serde(default)]
     pub applied: Vec<AppliedAction>,
+    #[serde(default)]
     pub apply_failures: Vec<ApplyFailure>,
     pub outcome: CycleOutcome,
 }
 
 impl CycleReport {
     pub fn to_json(&self) -> String {
-        let decisions = self
-            .raised_decisions
-            .iter()
-            .map(DecisionPoint::to_json)
-            .collect::<Vec<_>>()
-            .join(",");
-        let branch_proposals = self
-            .branch_proposals
-            .iter()
-            .map(EnrichedProposal::to_json)
-            .collect::<Vec<_>>()
-            .join(",");
-        let applied = self
-            .applied
-            .iter()
-            .map(AppliedAction::to_json)
-            .collect::<Vec<_>>()
-            .join(",");
-        let apply_failures = self
-            .apply_failures
-            .iter()
-            .map(ApplyFailure::to_json)
-            .collect::<Vec<_>>()
-            .join(",");
-        let applied_field = if self.applied.is_empty() {
-            String::new()
-        } else {
-            format!("\"applied\":[{applied}],")
-        };
-        let apply_failures_field = if self.apply_failures.is_empty() {
-            String::new()
-        } else {
-            format!("\"apply_failures\":[{apply_failures}],")
-        };
+        serde_json::to_string(self).expect("cycle report serializes to JSON")
+    }
+}
 
-        format!(
-            concat!(
-                "{{",
-                "\"schema_version\":\"agentflow.agent_cycle.v0\",",
-                "\"checkpoint_id\":\"{}\",",
-                "\"provisional_verdicts\":{},",
-                "\"strong_candidates\":{},",
-                "\"raised_decisions\":[{}],",
-                "\"branch_proposals\":[{}],",
-                "{}",
-                "{}",
-                "\"outcome\":\"{}\"",
-                "}}"
-            ),
-            escape_json(&self.checkpoint_id),
-            json_string_array(&self.provisional_verdicts),
-            json_string_array(&self.strong_candidates),
-            decisions,
-            branch_proposals,
-            applied_field,
-            apply_failures_field,
-            self.outcome.as_str()
-        )
+impl Serialize for CycleReport {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count = 7
+            + usize::from(!self.applied.is_empty())
+            + usize::from(!self.apply_failures.is_empty());
+        let mut state = serializer.serialize_struct("CycleReport", field_count)?;
+        state.serialize_field("schema_version", "agentflow.agent_cycle.v0")?;
+        state.serialize_field("checkpoint_id", &self.checkpoint_id)?;
+        state.serialize_field("provisional_verdicts", &self.provisional_verdicts)?;
+        state.serialize_field("strong_candidates", &self.strong_candidates)?;
+        state.serialize_field("raised_decisions", &self.raised_decisions)?;
+        state.serialize_field("branch_proposals", &self.branch_proposals)?;
+        if !self.applied.is_empty() {
+            state.serialize_field("applied", &self.applied)?;
+        }
+        if !self.apply_failures.is_empty() {
+            state.serialize_field("apply_failures", &self.apply_failures)?;
+        }
+        state.serialize_field("outcome", &self.outcome)?;
+        state.end()
     }
 }
 
@@ -1026,85 +937,25 @@ fn evidence_ids(evidence: &[crate::argument::EvidenceLink]) -> String {
 }
 
 fn cycle_completed_payload_json(report: &CycleReport) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"checkpoint_id\":\"{}\",",
-            "\"provisional_verdict_count\":{},",
-            "\"strong_candidate_count\":{},",
-            "\"raised_decision_count\":{},",
-            "\"branch_proposal_count\":{},",
-            "\"outcome\":\"{}\"",
-            "}}"
-        ),
-        escape_json(&report.checkpoint_id),
-        report.provisional_verdicts.len(),
-        report.strong_candidates.len(),
-        report.raised_decisions.len(),
-        report.branch_proposals.len(),
-        report.outcome.as_str()
-    )
+    serde_json::to_string(&CycleCompletedPayload {
+        checkpoint_id: report.checkpoint_id.clone(),
+        provisional_verdict_count: report.provisional_verdicts.len(),
+        strong_candidate_count: report.strong_candidates.len(),
+        raised_decision_count: report.raised_decisions.len(),
+        branch_proposal_count: report.branch_proposals.len(),
+        outcome: report.outcome,
+    })
+    .expect("cycle completed payload serializes to JSON")
 }
 
-fn json_string_array(values: &[String]) -> String {
-    let items = values
-        .iter()
-        .map(|value| format!("\"{}\"", escape_json(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{items}]")
-}
-
-fn optional_string_json(value: Option<&str>) -> String {
-    value
-        .map(|inner| format!("\"{}\"", escape_json(inner)))
-        .unwrap_or_else(|| "null".to_string())
-}
-
-fn proposed_step_json(step: &ProposedStep) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"id\":\"{}\",",
-            "\"tool\":\"{}\",",
-            "\"needs\":{},",
-            "\"inputs\":{},",
-            "\"params\":{},",
-            "\"outputs\":{}",
-            "}}"
-        ),
-        escape_json(&step.id),
-        escape_json(&step.tool),
-        json_string_array(&step.needs),
-        json_pair_object(&step.inputs),
-        json_pair_object(&step.params),
-        json_pair_object(&step.outputs)
-    )
-}
-
-fn json_pair_object(pairs: &[(String, String)]) -> String {
-    let fields = pairs
-        .iter()
-        .map(|(key, value)| format!("\"{}\":\"{}\"", escape_json(key), escape_json(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{fields}}}")
-}
-
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => output.push(ch),
-        }
-    }
-    output
+#[derive(Debug, Serialize, Deserialize)]
+struct CycleCompletedPayload {
+    checkpoint_id: String,
+    provisional_verdict_count: usize,
+    strong_candidate_count: usize,
+    raised_decision_count: usize,
+    branch_proposal_count: usize,
+    outcome: CycleOutcome,
 }
 
 #[cfg(test)]
@@ -1113,8 +964,10 @@ mod tests {
 
     use rusqlite::params;
 
-    use crate::argument::{EvidenceGrade, EvidenceLinkRequest, Stance};
-    use crate::branch::BranchAction;
+    use crate::argument::{EvidenceGrade, EvidenceLinkRequest, Stance, VerdictTag};
+    use crate::branch::{
+        BranchAction, BranchCandidate, BranchDecision, CandidateKind, ProposedStep, SelectionMode,
+    };
     use crate::handoff::DecisionKind;
     use crate::hypothesis::{Confidence, HypothesisRequest, HypothesisStatus};
     use crate::storage::{
@@ -1139,6 +992,207 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let store = ProjectStore::init(&path, Some("Agent Demo")).unwrap();
         (path, store)
+    }
+
+    fn sample_decision() -> BranchDecision {
+        BranchDecision {
+            candidate: BranchCandidate {
+                hypothesis_id: "hypothesis_1".to_string(),
+                statement: "Marker evidence needs deeper validation".to_string(),
+                verdict: Some(VerdictTag::InconclusiveProvisional),
+                confidence: Some(Confidence::Medium),
+                kind: CandidateKind::Deepen,
+                evidence_count: 2,
+                score: 33,
+            },
+            action: BranchAction::Deepen {
+                reason: "Need \"more\"\n".to_string(),
+            },
+            selected_by: SelectionMode::Explore,
+        }
+    }
+
+    fn sample_proposal() -> super::EnrichedProposal {
+        super::EnrichedProposal {
+            decision: sample_decision(),
+            matched_tool: Some("analysis/marker".to_string()),
+            matched_fit: Some("medium".to_string()),
+            match_reason: Some("input \"ok\"\n".to_string()),
+            drafted_step: Some(ProposedStep {
+                id: "step_marker".to_string(),
+                tool: "analysis/marker".to_string(),
+                needs: vec!["producer".to_string()],
+                inputs: vec![("expression_table".to_string(), "artifact_1".to_string())],
+                params: vec![("gene".to_string(), "TP53".to_string())],
+                outputs: vec![("report".to_string(), "marker_report".to_string())],
+            }),
+        }
+    }
+
+    #[test]
+    fn json_outputs_match_legacy_bytes() {
+        let proposal = sample_proposal();
+        assert_eq!(
+            proposal.to_json(),
+            "{\"decision\":{\"candidate\":{\"hypothesis_id\":\"hypothesis_1\",\"statement\":\"Marker evidence needs deeper validation\",\"verdict\":\"inconclusive_provisional\",\"confidence\":\"medium\",\"kind\":\"deepen\",\"evidence_count\":2,\"score\":33},\"action\":{\"kind\":\"deepen\",\"reason\":\"Need \\\"more\\\"\\n\"},\"selected_by\":\"explore\"},\"matched_tool\":\"analysis/marker\",\"matched_fit\":\"medium\",\"match_reason\":\"input \\\"ok\\\"\\n\",\"drafted_step\":{\"id\":\"step_marker\",\"tool\":\"analysis/marker\",\"needs\":[\"producer\"],\"inputs\":{\"expression_table\":\"artifact_1\"},\"params\":{\"gene\":\"TP53\"},\"outputs\":{\"report\":\"marker_report\"}}}"
+        );
+
+        assert_eq!(
+            (AppliedAction::LifecycleTransition {
+                hypothesis_id: "hypothesis_1".to_string(),
+                to: "under_test".to_string(),
+            })
+            .to_json(),
+            "{\"type\":\"lifecycle_transition\",\"hypothesis_id\":\"hypothesis_1\",\"to\":\"under_test\"}"
+        );
+        assert_eq!(
+            (AppliedAction::GraphPatchApplied {
+                flow_id: "flow_1".to_string(),
+                patch_id: "patch_1".to_string(),
+                step_id: "step_1".to_string(),
+            })
+            .to_json(),
+            "{\"type\":\"graph_patch_applied\",\"flow_id\":\"flow_1\",\"patch_id\":\"patch_1\",\"step_id\":\"step_1\"}"
+        );
+        assert_eq!(
+            (AppliedAction::StepRun {
+                step_id: "step_1".to_string(),
+                observation_id: Some("observation_1".to_string()),
+            })
+            .to_json(),
+            "{\"type\":\"step_run\",\"step_id\":\"step_1\",\"observation_id\":\"observation_1\"}"
+        );
+        let step_run_without_observation = AppliedAction::StepRun {
+            step_id: "step_1".to_string(),
+            observation_id: None,
+        };
+        assert_eq!(
+            step_run_without_observation.to_json(),
+            "{\"type\":\"step_run\",\"step_id\":\"step_1\",\"observation_id\":null}"
+        );
+
+        let failure = super::ApplyFailure {
+            hypothesis_id: "hypothesis_1".to_string(),
+            reason: "Quote \" and newline\n".to_string(),
+        };
+        assert_eq!(
+            failure.to_json(),
+            "{\"hypothesis_id\":\"hypothesis_1\",\"reason\":\"Quote \\\" and newline\\n\"}"
+        );
+
+        let report = super::CycleReport {
+            checkpoint_id: "checkpoint_1".to_string(),
+            provisional_verdicts: vec!["hypothesis_1".to_string()],
+            strong_candidates: vec!["hypothesis_2".to_string()],
+            raised_decisions: Vec::new(),
+            branch_proposals: vec![proposal.clone()],
+            applied: vec![step_run_without_observation.clone()],
+            apply_failures: vec![failure.clone()],
+            outcome: CycleOutcome::Advanced,
+        };
+        assert_eq!(
+            report.to_json(),
+            format!(
+                "{{\"schema_version\":\"agentflow.agent_cycle.v0\",\"checkpoint_id\":\"checkpoint_1\",\"provisional_verdicts\":[\"hypothesis_1\"],\"strong_candidates\":[\"hypothesis_2\"],\"raised_decisions\":[],\"branch_proposals\":[{}],\"applied\":[{}],\"apply_failures\":[{}],\"outcome\":\"advanced\"}}",
+                proposal.to_json(),
+                step_run_without_observation.to_json(),
+                failure.to_json()
+            )
+        );
+
+        let empty_report = super::CycleReport {
+            checkpoint_id: "checkpoint_empty".to_string(),
+            provisional_verdicts: Vec::new(),
+            strong_candidates: Vec::new(),
+            raised_decisions: Vec::new(),
+            branch_proposals: Vec::new(),
+            applied: Vec::new(),
+            apply_failures: Vec::new(),
+            outcome: CycleOutcome::Idle,
+        };
+        assert_eq!(
+            empty_report.to_json(),
+            "{\"schema_version\":\"agentflow.agent_cycle.v0\",\"checkpoint_id\":\"checkpoint_empty\",\"provisional_verdicts\":[],\"strong_candidates\":[],\"raised_decisions\":[],\"branch_proposals\":[],\"outcome\":\"idle\"}"
+        );
+        assert_eq!(
+            super::cycle_completed_payload_json(&report),
+            "{\"checkpoint_id\":\"checkpoint_1\",\"provisional_verdict_count\":1,\"strong_candidate_count\":1,\"raised_decision_count\":0,\"branch_proposal_count\":1,\"outcome\":\"advanced\"}"
+        );
+    }
+
+    #[test]
+    fn legacy_handwritten_payloads_parse_with_json_whitespace_and_ordering() {
+        let report: super::CycleReport = serde_json::from_str(
+            r#"{
+                "outcome": "handed_off",
+                "branch_proposals": [
+                    {
+                        "drafted_step": {
+                            "outputs": {"report": "marker_report"},
+                            "params": {"gene": "TP53"},
+                            "inputs": {"expression_table": "artifact_1"},
+                            "needs": ["producer"],
+                            "tool": "analysis/marker",
+                            "id": "step_marker"
+                        },
+                        "match_reason": "legacy match",
+                        "matched_fit": "medium",
+                        "matched_tool": "analysis/marker",
+                        "decision": {
+                            "selected_by": "explore",
+                            "action": {
+                                "reason": "legacy deepen",
+                                "kind": "deepen"
+                            },
+                            "candidate": {
+                                "score": 33,
+                                "evidence_count": 2,
+                                "kind": "deepen",
+                                "confidence": "medium",
+                                "verdict": "inconclusive_provisional",
+                                "statement": "Legacy candidate",
+                                "hypothesis_id": "hypothesis_legacy"
+                            }
+                        }
+                    }
+                ],
+                "raised_decisions": [],
+                "strong_candidates": ["hypothesis_strong"],
+                "provisional_verdicts": ["hypothesis_legacy"],
+                "checkpoint_id": "checkpoint_legacy",
+                "schema_version": "agentflow.agent_cycle.v0"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(report.checkpoint_id, "checkpoint_legacy");
+        assert_eq!(report.provisional_verdicts, vec!["hypothesis_legacy"]);
+        assert_eq!(report.strong_candidates, vec!["hypothesis_strong"]);
+        assert_eq!(report.branch_proposals.len(), 1);
+        assert!(report.applied.is_empty());
+        assert!(report.apply_failures.is_empty());
+        assert_eq!(report.outcome, CycleOutcome::HandedOff);
+        let step = report.branch_proposals[0].drafted_step.as_ref().unwrap();
+        assert_eq!(
+            step.inputs,
+            vec![("expression_table".to_string(), "artifact_1".to_string())]
+        );
+
+        let action: AppliedAction = serde_json::from_str(
+            r#"{
+                "observation_id": null,
+                "step_id": "step_legacy",
+                "type": "step_run"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            action,
+            AppliedAction::StepRun {
+                step_id: "step_legacy".to_string(),
+                observation_id: None,
+            }
+        );
     }
 
     fn record_hypothesis(store: &ProjectStore, statement: &str) -> String {

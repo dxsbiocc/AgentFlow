@@ -8,6 +8,7 @@ params:
   gene:
     type: string
     required: true
+    pattern: "^[A-Za-z0-9-]+$"
   study:
     type: string
     required: false

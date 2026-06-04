@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::StepStatus;
 
 use super::project_store::{now_unix_seconds, EventRecord, ProjectStore, StorageError};
-use super::tool_registry::ExecutableToolSpec;
+use super::tool_registry::{validate_param_value, ExecutableToolSpec};
 use super::yaml;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -684,18 +684,33 @@ fn validate_step_against_tool(
     }
 
     for (param_name, param) in &tool.params {
-        if param.required && !step.params.contains_key(param_name) {
+        if param.required
+            && step
+                .params
+                .get(param_name)
+                .is_none_or(|value| is_replace_param_placeholder(param_name, value))
+        {
             issues.push(issue(format!(
                 "step {} is missing required param {} for tool {}",
                 step.id, param_name, tool.tool_ref
             )));
         }
     }
-    for param_name in step.params.keys() {
-        if !tool.params.contains_key(param_name) {
+    for (param_name, param_value) in &step.params {
+        let Some(param) = tool.params.get(param_name) else {
             issues.push(issue(format!(
                 "step {} provides unknown param {} for tool {}",
                 step.id, param_name, tool.tool_ref
+            )));
+            continue;
+        };
+        if is_replace_param_placeholder(param_name, param_value) {
+            continue;
+        }
+        if let Err(error) = validate_param_value(param, param_value) {
+            issues.push(issue(format!(
+                "step {} param {} invalid for tool {}: {}",
+                step.id, param_name, tool.tool_ref, error
             )));
         }
     }
@@ -716,6 +731,10 @@ fn validate_step_against_tool(
             )));
         }
     }
+}
+
+fn is_replace_param_placeholder(param_name: &str, value: &str) -> bool {
+    value == format!("REPLACE_{param_name}")
 }
 
 fn artifact_ref(input: &str) -> Option<&str> {
@@ -890,6 +909,43 @@ runtime:
 "#
     }
 
+    fn constrained_tool() -> &'static str {
+        r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: constrained_survival_scan
+version: 0.1.0
+maturity: wrapped
+description: Scan a candidate marker with constrained params
+inputs:
+  expression_table:
+    type: TSV
+    required: true
+  survival_table:
+    type: TSV
+    required: true
+params:
+  mode:
+    type: string
+    required: true
+    enum: [fast, careful]
+  gene:
+    type: string
+    required: true
+    pattern: "^[A-Z0-9-]+$"
+  retries:
+    type: int
+    required: true
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#
+    }
+
     fn setup_store(test_name: &str) -> (ProjectStore, PathBuf, String, String) {
         let path = temp_project_path(test_name);
         let store = ProjectStore::init(&path, Some("Flows")).unwrap();
@@ -919,6 +975,36 @@ runtime:
             path,
             expression_artifact.summary.id,
             survival_artifact.summary.id,
+        )
+    }
+
+    fn constrained_flow(
+        expression_artifact_id: &str,
+        survival_artifact_id: &str,
+        mode: &str,
+        gene: &str,
+        retries: &str,
+    ) -> String {
+        format!(
+            r#"
+schema_version: agentflow.flow.v0
+id: constrained_demo
+name: Constrained demo
+steps:
+  - id: scan
+    tool: marker/constrained_survival_scan
+    reason: Evaluate constrained marker signal
+    needs: []
+    inputs:
+      expression_table: {expression_artifact_id}
+      survival_table: {survival_artifact_id}
+    params:
+      mode: {mode}
+      gene: {gene}
+      retries: {retries}
+    outputs:
+      report: marker_report
+"#
         )
     }
 
@@ -1049,6 +1135,79 @@ steps: []
         assert!(inspection
             .to_json()
             .contains("agentflow.flow_inspection.v0"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn validation_accepts_param_values_that_satisfy_constraints() {
+        let (store, path, expression_id, survival_id) = setup_store("valid-param-constraints");
+        store
+            .register_tool(ToolSpec::from_simple_yaml(constrained_tool()).unwrap())
+            .unwrap();
+        let draft = FlowDraft::from_simple_yaml(&constrained_flow(
+            &expression_id,
+            &survival_id,
+            "fast",
+            "TP53-1",
+            "3",
+        ))
+        .unwrap();
+
+        let report = store.validate_flow(&draft);
+        assert!(report.valid, "unexpected issues: {:?}", report.issues);
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn validation_rejects_invalid_param_type_enum_and_pattern_values() {
+        let (store, path, expression_id, survival_id) = setup_store("invalid-param-constraints");
+        store
+            .register_tool(ToolSpec::from_simple_yaml(constrained_tool()).unwrap())
+            .unwrap();
+        let draft = FlowDraft::from_simple_yaml(&constrained_flow(
+            &expression_id,
+            &survival_id,
+            "slow",
+            "TP53!",
+            "many",
+        ))
+        .unwrap();
+
+        let report = store.validate_flow(&draft);
+        assert!(!report.valid);
+        let message = report.error_message();
+        assert!(message.contains("param mode"), "{message}");
+        assert!(message.contains("must be one of"), "{message}");
+        assert!(message.contains("param gene"), "{message}");
+        assert!(message.contains("must match pattern"), "{message}");
+        assert!(message.contains("param retries"), "{message}");
+        assert!(message.contains("must be an int"), "{message}");
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn validation_treats_replace_param_placeholder_as_unfilled_without_pattern_error() {
+        let (store, path, expression_id, survival_id) = setup_store("replace-param-unfilled");
+        store
+            .register_tool(ToolSpec::from_simple_yaml(constrained_tool()).unwrap())
+            .unwrap();
+        let draft = FlowDraft::from_simple_yaml(&constrained_flow(
+            &expression_id,
+            &survival_id,
+            "fast",
+            "REPLACE_gene",
+            "3",
+        ))
+        .unwrap();
+
+        let report = store.validate_flow(&draft);
+        assert!(!report.valid);
+        let message = report.error_message();
+        assert!(message.contains("missing required param gene"), "{message}");
+        assert!(!message.contains("must match pattern"), "{message}");
 
         let _ = fs::remove_dir_all(path);
     }

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 
 use super::migrations;
 
@@ -63,29 +64,35 @@ pub struct ProjectSummary {
 
 impl ProjectSummary {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"schema_version\":\"{}\",",
-                "\"project\":{{",
-                "\"id\":\"{}\",",
-                "\"name\":\"{}\",",
-                "\"root_path\":\"{}\",",
-                "\"engine_version\":\"{}\",",
-                "\"created_at\":{},",
-                "\"updated_at\":{}",
-                "}}",
-                "}}"
-            ),
-            agentflow_schemas::STATUS_JSON_SCHEMA_V0,
-            escape_json(&self.id),
-            escape_json(&self.name),
-            escape_json(&self.root_path.display().to_string()),
-            escape_json(&self.engine_version),
-            self.created_at,
-            self.updated_at
-        )
+        serde_json::to_string(&ProjectSummaryJson {
+            schema_version: agentflow_schemas::STATUS_JSON_SCHEMA_V0.to_string(),
+            project: ProjectSummaryProjectJson {
+                id: self.id.clone(),
+                name: self.name.clone(),
+                root_path: self.root_path.display().to_string(),
+                engine_version: self.engine_version.clone(),
+                created_at: self.created_at,
+                updated_at: self.updated_at,
+            },
+        })
+        .expect("project summary serializes to JSON")
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProjectSummaryJson {
+    schema_version: String,
+    project: ProjectSummaryProjectJson,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProjectSummaryProjectJson {
+    id: String,
+    name: String,
+    root_path: String,
+    engine_version: String,
+    created_at: i64,
+    updated_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,22 +295,6 @@ fn write_project_toml(root_path: &Path, name: &str) -> Result<(), StorageError> 
     Ok(())
 }
 
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => output.push(ch),
-        }
-    }
-    output
-}
-
 fn escape_toml(input: &str) -> String {
     input.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -422,5 +413,26 @@ mod tests {
         let json = summary.to_json();
         assert!(json.contains("\"schema_version\":\"agentflow.status.v0\""));
         assert!(json.contains("\"name\":\"Demo\""));
+    }
+
+    #[test]
+    fn summary_json_is_exact_byte_and_serde_readable() {
+        let summary = ProjectSummary {
+            id: "project_1".to_string(),
+            name: "Demo \"A\"".to_string(),
+            root_path: PathBuf::from("/tmp/demo path"),
+            engine_version: "0.1.0".to_string(),
+            created_at: 1,
+            updated_at: 2,
+        };
+
+        let json = summary.to_json();
+        assert_eq!(
+            json,
+            "{\"schema_version\":\"agentflow.status.v0\",\"project\":{\"id\":\"project_1\",\"name\":\"Demo \\\"A\\\"\",\"root_path\":\"/tmp/demo path\",\"engine_version\":\"0.1.0\",\"created_at\":1,\"updated_at\":2}}"
+        );
+
+        let payload: ProjectSummaryJson = serde_json::from_str(&json).unwrap();
+        assert_eq!(payload.project.name, "Demo \"A\"");
     }
 }

@@ -1,4 +1,5 @@
 use rusqlite::params;
+use serde::{Deserialize, Serialize};
 
 use crate::storage::{EventRecord, ProjectStore, StorageError};
 
@@ -24,26 +25,20 @@ pub struct ResearchNote {
 
 impl ResearchNote {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"id\":\"{}\",",
-                "\"problem\":\"{}\",",
-                "\"question\":\"{}\",",
-                "\"finding\":\"{}\",",
-                "\"confidence\":\"{}\",",
-                "\"source\":{},",
-                "\"created_at\":{}",
-                "}}"
-            ),
-            escape_json(&self.id),
-            escape_json(&self.problem),
-            escape_json(&self.question),
-            escape_json(&self.finding),
-            escape_json(&self.confidence),
-            optional_json_string(self.source.as_deref()),
-            self.created_at
-        )
+        serde_json::to_string(&ResearchNoteJson {
+            id: self.id.clone(),
+            problem: self.problem.clone(),
+            question: self.question.clone(),
+            finding: self.finding.clone(),
+            confidence: self.confidence.clone(),
+            source: self
+                .source
+                .as_ref()
+                .filter(|source| !source.trim().is_empty())
+                .cloned(),
+            created_at: self.created_at,
+        })
+        .expect("research note serializes to JSON")
     }
 }
 
@@ -136,23 +131,40 @@ fn validate_non_empty(label: &str, value: &str) -> Result<(), StorageError> {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ResearchNoteJson {
+    id: String,
+    problem: String,
+    question: String,
+    finding: String,
+    confidence: String,
+    source: Option<String>,
+    created_at: i64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ResearchNotePayload {
+    #[serde(default)]
+    problem: String,
+    #[serde(default)]
+    question: String,
+    #[serde(default)]
+    finding: String,
+    #[serde(default)]
+    confidence: String,
+    #[serde(default)]
+    source: Option<String>,
+}
+
 fn research_note_payload_json(request: &ResearchNoteRequest) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"problem\":\"{}\",",
-            "\"question\":\"{}\",",
-            "\"finding\":\"{}\",",
-            "\"confidence\":\"{}\",",
-            "\"source\":{}",
-            "}}"
-        ),
-        escape_json(request.problem.trim()),
-        escape_json(request.question.trim()),
-        escape_json(request.finding.trim()),
-        escape_json(request.confidence.trim()),
-        optional_json_string(request.source.as_deref().map(str::trim))
-    )
+    serde_json::to_string(&ResearchNotePayload {
+        problem: request.problem.trim().to_string(),
+        question: request.question.trim().to_string(),
+        finding: request.finding.trim().to_string(),
+        confidence: request.confidence.trim().to_string(),
+        source: trimmed_non_empty(request.source.as_deref()),
+    })
+    .expect("research note payload serializes to JSON")
 }
 
 fn note_from_event(
@@ -160,87 +172,25 @@ fn note_from_event(
     payload_json: &str,
     created_at: i64,
 ) -> Result<ResearchNote, rusqlite::Error> {
+    let payload: ResearchNotePayload = serde_json::from_str(payload_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(err))
+    })?;
     Ok(ResearchNote {
         id,
-        problem: json_string_field(payload_json, "problem").unwrap_or_default(),
-        question: json_string_field(payload_json, "question").unwrap_or_default(),
-        finding: json_string_field(payload_json, "finding").unwrap_or_default(),
-        confidence: json_string_field(payload_json, "confidence").unwrap_or_default(),
-        source: json_nullable_string_field(payload_json, "source"),
+        problem: payload.problem,
+        question: payload.question,
+        finding: payload.finding,
+        confidence: payload.confidence,
+        source: payload.source,
         created_at,
     })
 }
 
-fn optional_json_string(value: Option<&str>) -> String {
-    value.filter(|inner| !inner.trim().is_empty()).map_or_else(
-        || "null".to_string(),
-        |inner| format!("\"{}\"", escape_json(inner)),
-    )
-}
-
-fn json_string_field(json: &str, field: &str) -> Option<String> {
-    let marker = format!("\"{field}\":\"");
-    let start = json.find(&marker)? + marker.len();
-    let rest = &json[start..];
-    let end = find_json_string_end(rest)?;
-    Some(unescape_json_string(&rest[..end]))
-}
-
-fn json_nullable_string_field(json: &str, field: &str) -> Option<String> {
-    json_string_field(json, field)
-}
-
-fn find_json_string_end(input: &str) -> Option<usize> {
-    let mut escaped = false;
-    for (index, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(index),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn unescape_json_string(input: &str) -> String {
-    let mut output = String::new();
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('"') => output.push('"'),
-                Some('\\') => output.push('\\'),
-                Some('n') => output.push('\n'),
-                Some('r') => output.push('\r'),
-                Some('t') => output.push('\t'),
-                Some(other) => output.push(other),
-                None => {}
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-    output
-}
-
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => output.push(ch),
-        }
-    }
-    output
+fn trimmed_non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|inner| !inner.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -249,7 +199,7 @@ mod tests {
 
     use crate::storage::ProjectStore;
 
-    use super::ResearchNoteRequest;
+    use super::{ResearchNote, ResearchNoteJson, ResearchNotePayload, ResearchNoteRequest};
 
     fn temp_project_path(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -308,5 +258,40 @@ mod tests {
         assert!(error.to_string().contains("confidence must be"));
 
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn research_note_json_is_exact_byte() {
+        let note = ResearchNote {
+            id: "event_1".to_string(),
+            problem: "Marker \"A\"".to_string(),
+            question: "Does TP53\\EGFR validate?".to_string(),
+            finding: "Line one\nLine two".to_string(),
+            confidence: "high".to_string(),
+            source: Some("lab\tbook".to_string()),
+            created_at: 42,
+        };
+
+        assert_eq!(
+            note.to_json(),
+            "{\"id\":\"event_1\",\"problem\":\"Marker \\\"A\\\"\",\"question\":\"Does TP53\\\\EGFR validate?\",\"finding\":\"Line one\\nLine two\",\"confidence\":\"high\",\"source\":\"lab\\tbook\",\"created_at\":42}"
+        );
+
+        let payload: ResearchNoteJson = serde_json::from_str(&note.to_json()).unwrap();
+        assert_eq!(payload.id, "event_1");
+    }
+
+    #[test]
+    fn research_note_payload_reads_old_handwritten_json() {
+        let payload: ResearchNotePayload = serde_json::from_str(
+            "{\"problem\":\"P\\\"1\",\"question\":\"Q\\\\2\",\"finding\":\"F\\n3\",\"confidence\":\"medium\",\"source\":null}",
+        )
+        .unwrap();
+
+        assert_eq!(payload.problem, "P\"1");
+        assert_eq!(payload.question, "Q\\2");
+        assert_eq!(payload.finding, "F\n3");
+        assert_eq!(payload.confidence, "medium");
+        assert_eq!(payload.source, None);
     }
 }

@@ -3,7 +3,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentflow_core::agent::{
-    AppliedAction, ApplyConfig, CycleReport, EnrichedProposal, ParamInferer,
+    AppliedAction, ApplyConfig, CycleReport, EnrichedProposal, NoopParamInferer, ParamInferer,
+    RelevanceScorer,
 };
 use agentflow_core::argument::{EvidenceLink, Stance, VerdictSummary, VerdictTag};
 use agentflow_core::branch::{
@@ -36,6 +37,7 @@ struct AgentRunOptions {
     max_apply: u32,
     propose_synth: bool,
     infer_params: bool,
+    semantic_match: bool,
     synthesizer: Option<String>,
     auto_forage: bool,
     forage_max: u32,
@@ -60,6 +62,7 @@ impl Default for AgentRunOptions {
             max_apply: 5,
             propose_synth: false,
             infer_params: false,
+            semantic_match: false,
             synthesizer: None,
             auto_forage: false,
             forage_max: DEFAULT_AUTO_FORAGE_MAX,
@@ -200,15 +203,32 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
         max_apply: options.max_apply,
         propose_synth: options.propose_synth,
     };
-    let report = if options.infer_params {
-        let synthesizer = options
-            .synthesizer
-            .as_deref()
-            .unwrap_or(synth_commands::DEFAULT_SYNTHESIZER);
-        let inferer = LlmParamInferer { synthesizer };
-        store.run_cycle_with(config, &inferer)?
-    } else {
-        store.run_cycle_with_apply_config(config)?
+    let synthesizer = options
+        .synthesizer
+        .unwrap_or_else(|| synth_commands::DEFAULT_SYNTHESIZER.to_string());
+    let report = match (options.infer_params, options.semantic_match) {
+        (true, true) => {
+            let inferer = LlmParamInferer {
+                synthesizer: &synthesizer,
+            };
+            let scorer = LlmRelevanceScorer {
+                synthesizer: &synthesizer,
+            };
+            store.run_cycle_with_scorer(config, &inferer, &scorer)?
+        }
+        (true, false) => {
+            let inferer = LlmParamInferer {
+                synthesizer: &synthesizer,
+            };
+            store.run_cycle_with(config, &inferer)?
+        }
+        (false, true) => {
+            let scorer = LlmRelevanceScorer {
+                synthesizer: &synthesizer,
+            };
+            store.run_cycle_with_scorer(config, &NoopParamInferer, &scorer)?
+        }
+        (false, false) => store.run_cycle_with_apply_config(config)?,
     };
 
     if options.project.json {
@@ -519,14 +539,48 @@ impl ParamInferer for LlmParamInferer<'_> {
     }
 }
 
+struct LlmRelevanceScorer<'a> {
+    synthesizer: &'a str,
+}
+
+impl RelevanceScorer for LlmRelevanceScorer<'_> {
+    fn is_relevant(
+        &self,
+        hypothesis_statement: &str,
+        tool_ref: &str,
+        tool_description: &str,
+    ) -> Option<bool> {
+        let prompt = relevance_prompt(hypothesis_statement, tool_ref, tool_description);
+        let candidate = synth_commands::run_synthesizer(self.synthesizer, &prompt).ok()?;
+        let stripped = synth_commands::strip_markdown_fence(&candidate);
+        parse_yes_no(&stripped)
+    }
+}
+
 fn param_inference_prompt(statement: &str, param_name: &str) -> String {
     format!(
         "Research hypothesis: \"{statement}\". A bioinformatics analysis tool needs a value for the parameter \"{param_name}\". Reply with ONLY the value (e.g. a gene symbol like THRSP), no explanation, no quotes."
     )
 }
 
+fn relevance_prompt(statement: &str, tool_ref: &str, tool_description: &str) -> String {
+    format!("假设「{statement}」与工具 <{tool_ref}>（描述：{tool_description}）是否研究相关？只答 yes/no。")
+}
+
 fn first_non_empty_line(value: &str) -> Option<&str> {
     value.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn parse_yes_no(value: &str) -> Option<bool> {
+    let answer = first_non_empty_line(value)?;
+    let normalized = answer
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '.' | '。'))
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
 }
 
 fn should_auto_forage(verdict: Option<&VerdictSummary>) -> bool {
@@ -681,6 +735,7 @@ impl TryFrom<AgentRunArgs> for AgentRunOptions {
             max_apply: 5,
             propose_synth: args.propose_synth,
             infer_params: args.infer_params,
+            semantic_match: args.semantic_match,
             synthesizer: last_value(args.synthesizer),
             auto_forage: args.auto_forage,
             forage_max: DEFAULT_AUTO_FORAGE_MAX,
@@ -1562,6 +1617,72 @@ runtime:
         store.register_tool(spec).unwrap();
     }
 
+    fn register_semantic_tool(
+        store: &ProjectStore,
+        name: &str,
+        maturity: &str,
+        description: &str,
+        inputs: &[(&str, &str)],
+    ) {
+        let input_yaml = if inputs.is_empty() {
+            String::new()
+        } else {
+            let entries = inputs
+                .iter()
+                .map(|(name, type_name)| {
+                    format!("  {name}:\n    type: {type_name}\n    required: true\n")
+                })
+                .collect::<String>();
+            format!("inputs:\n{entries}")
+        };
+        let spec = ToolSpec::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: {name}
+version: 0.1.0
+maturity: {maturity}
+description: {description}
+{input_yaml}outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#
+        ))
+        .unwrap();
+        store.register_tool(spec).unwrap();
+    }
+
+    fn register_semantic_rerank_tools(store: &ProjectStore) {
+        register_semantic_tool(
+            store,
+            "score_low_current",
+            "verified",
+            "validation helper for unrelated prioritization",
+            &[
+                ("expression_table", "ExpressionTable"),
+                ("cohort_table", "CohortTable"),
+            ],
+        );
+        register_semantic_tool(
+            store,
+            "latent_assoc",
+            "verified",
+            "mechanism analysis for latent association",
+            &[],
+        );
+        register_semantic_tool(
+            store,
+            "io_medium",
+            "exploratory",
+            "generic assay runner",
+            &[("expression_table", "ExpressionTable")],
+        );
+    }
+
     fn import_expression_artifact(store: &ProjectStore, root: &Path) -> String {
         let source_path = root.join("expression.tsv");
         std::fs::write(&source_path, "gene\tvalue\nTHRSP\t3\n").unwrap();
@@ -1655,6 +1776,16 @@ steps:
         format!("/bin/sh {}", stub_path.display())
     }
 
+    fn write_semantic_synthesizer_stub(path: &Path) -> String {
+        let stub_path = path.join("agent-run-semantic-synth.sh");
+        std::fs::write(
+            &stub_path,
+            "#!/bin/sh\ncase \"$*\" in\n  *analysis/latent_assoc*) printf 'yes\\n' ;;\n  *) printf 'no\\n' ;;\nesac\n",
+        )
+        .unwrap();
+        format!("/bin/sh {}", stub_path.display())
+    }
+
     fn shell_single_quoted(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
@@ -1712,6 +1843,50 @@ steps:
         assert!(json.contains("\"outcome\":\"advanced\""));
         assert!(json.contains("\"matched_tool\":null"));
         assert!(json.contains(&hypothesis_id));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn agent_run_semantic_match_promotes_relevant_low_tool_from_stub_backend() {
+        let path = temp_project_path("agent-run-semantic-match");
+        let store = init_project(&path);
+        register_semantic_rerank_tools(&store);
+        import_expression_artifact(&store, &path);
+        let hypothesis_id =
+            record_hypothesis_with_statement(&store, "THRSP survival mechanism needs validation");
+        link_weak_evidence(&store, &hypothesis_id);
+
+        let without_semantic = run(args(&[
+            "agentflow",
+            "agent",
+            "run",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(without_semantic.contains("\"matched_tool\":\"analysis/score_low_current\""));
+        assert!(without_semantic.contains("\"matched_fit\":\"low\""));
+        assert!(!without_semantic.contains("relevance:semantic"));
+
+        let synthesizer = write_semantic_synthesizer_stub(&path);
+        let with_semantic = run(args(&[
+            "agentflow",
+            "agent",
+            "run",
+            "--semantic-match",
+            "--synthesizer",
+            &synthesizer,
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(with_semantic.contains("\"matched_tool\":\"analysis/latent_assoc\""));
+        assert!(with_semantic.contains("\"matched_fit\":\"medium\""));
+        assert!(with_semantic.contains("relevance:semantic"));
 
         let _ = std::fs::remove_dir_all(path);
     }

@@ -93,7 +93,7 @@ pub fn usage() -> String {
         "  agentflow evidence list --hypothesis <id> [--json] [--path <path>]",
         "  agentflow verdict render --hypothesis <id> [--json] [--path <path>] [--gate-supports <text> --gate-against <text> --gate-alternatives <text> --gate-data-risks <text> --gate-assumptions <text> --gate-falsifier <text> --gate-claim-basis observed|inferred|speculative --gate-not-yet <text>]",
         "  agentflow verdict show --hypothesis <id> [--json] [--path <path>]",
-        "  agentflow agent run [--apply] [--auto-run] [--flow <flow-id>] [--max-apply <n>] [--propose-synth] [--infer-params] [--synthesizer <cmd>] [--auto-forage] [--forage-max <n>] [--forage-script <path>] [--python <bin>] [--json] [--path <path>]",
+        "  agentflow agent run [--apply] [--auto-run] [--flow <flow-id>] [--max-apply <n>] [--propose-synth] [--infer-params] [--semantic-match] [--synthesizer <cmd>] [--auto-forage] [--forage-max <n>] [--forage-script <path>] [--python <bin>] [--json] [--path <path>]",
         "  agentflow branch candidates [--json] [--path <path>]",
         "  agentflow branch select [--explore] [--json] [--path <path>]",
         "  agentflow decision list [--json] [--path <path>]",

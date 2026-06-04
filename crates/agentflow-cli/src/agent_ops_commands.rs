@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,7 +15,11 @@ use agentflow_core::handoff::{DecisionPoint, DecisionStatus};
 use agentflow_core::storage::ProjectStore;
 use agentflow_core::trace_guard::{Checkpoint, DriftReport, RevertRecord};
 
-use crate::{next_arg, require_value, synth_commands, CliError};
+use crate::cli_args::*;
+use crate::{
+    last_value, parse_u32_value, parse_usize_value, project_path_from_json, synth_commands,
+    CliError,
+};
 
 #[derive(Debug, Default)]
 struct PathJsonOptions {
@@ -70,12 +73,6 @@ impl Default for AgentRunOptions {
 struct BranchSelectOptions {
     project: PathJsonOptions,
     explore: bool,
-}
-
-#[derive(Debug, Default)]
-struct SingleIdOptions {
-    project: PathJsonOptions,
-    id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -134,103 +131,50 @@ const DEFAULT_AUTO_FORAGE_MAX: u32 = 5;
 const DEFAULT_PYTHON: &str = "python3";
 const AUTO_FORAGE_NOTE: &str = "auto-forage";
 
-pub(crate) fn agent_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "run" => agent_run_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown agent command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "agent requires a command: run".to_string(),
-        )),
+pub(crate) fn agent_command(args: AgentArgs) -> Result<String, CliError> {
+    match args.command {
+        AgentCommand::Run(args) => agent_run_command(args),
     }
 }
 
-pub(crate) fn branch_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "candidates" => branch_candidates_command(args),
-        Some(command) if command == "select" => branch_select_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown branch command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "branch requires a command: candidates or select".to_string(),
-        )),
+pub(crate) fn branch_command(args: BranchArgs) -> Result<String, CliError> {
+    match args.command {
+        BranchCommand::Candidates(args) => branch_candidates_command(args),
+        BranchCommand::Select(args) => branch_select_command(args),
     }
 }
 
-pub(crate) fn decision_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "list" => decision_list_command(args),
-        Some(command) if command == "pending" => decision_pending_command(args),
-        Some(command) if command == "show" => decision_show_command(args),
-        Some(command) if command == "resolve" => decision_resolve_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown decision command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "decision requires a command: list, pending, show, or resolve".to_string(),
-        )),
+pub(crate) fn decision_command(args: DecisionArgs) -> Result<String, CliError> {
+    match args.command {
+        DecisionCommand::List(args) => decision_list_command(args),
+        DecisionCommand::Pending(args) => decision_pending_command(args),
+        DecisionCommand::Show(args) => decision_show_command(args),
+        DecisionCommand::Resolve(args) => decision_resolve_command(args),
     }
 }
 
-pub(crate) fn forage_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "observe" => forage_observe_command(args),
-        Some(command) if command == "ingest" => forage_ingest_command(args),
-        Some(command) if command == "fetch" => forage_fetch_command(args),
-        Some(command) if command == "list" => forage_list_command(args),
-        Some(command) if command == "show" => forage_show_command(args),
-        Some(command) if command == "link" => forage_link_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown forage command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "forage requires a command: observe, list, show, or link".to_string(),
-        )),
+pub(crate) fn forage_command(args: ForageArgs) -> Result<String, CliError> {
+    match args.command {
+        ForageCommand::Observe(args) => forage_observe_command(args),
+        ForageCommand::Ingest(args) => forage_ingest_command(args),
+        ForageCommand::Fetch(args) => forage_fetch_command(args),
+        ForageCommand::List(args) => forage_list_command(args),
+        ForageCommand::Show(args) => forage_show_command(args),
+        ForageCommand::Link(args) => forage_link_command(args),
     }
 }
 
-pub(crate) fn trace_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match next_arg(&mut args)? {
-        Some(command) if command == "checkpoint" => trace_checkpoint_command(args),
-        Some(command) if command == "list" => trace_list_command(args),
-        Some(command) if command == "drift" => trace_drift_command(args),
-        Some(command) if command == "revert" => trace_revert_command(args),
-        Some(command) => Err(CliError::InvalidArgument(format!(
-            "unknown trace command: {command}"
-        ))),
-        None => Err(CliError::InvalidArgument(
-            "trace requires a command: checkpoint, list, drift, or revert".to_string(),
-        )),
+pub(crate) fn trace_command(args: TraceArgs) -> Result<String, CliError> {
+    match args.command {
+        TraceCommand::Checkpoint(args) => trace_checkpoint_command(args),
+        TraceCommand::List(args) => trace_list_command(args),
+        TraceCommand::Drift(args) => trace_drift_command(args),
+        TraceCommand::Revert(args) => trace_revert_command(args),
     }
 }
 
-fn agent_run_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_agent_run_options(args)?;
+fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
+    let options = AgentRunOptions::try_from(args)?;
     let path = options.project.path.unwrap_or(std::env::current_dir()?);
     let store = ProjectStore::open(&path)?;
     let auto_forage = if options.auto_forage {
@@ -274,11 +218,8 @@ where
     }
 }
 
-fn branch_candidates_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_path_json_options(args, "branch candidates")?;
+fn branch_candidates_command(args: PathJsonArgs) -> Result<String, CliError> {
+    let options = PathJsonOptions::from(args);
     let path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let candidates = store.branch_candidates()?;
@@ -296,11 +237,8 @@ where
     }
 }
 
-fn branch_select_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_branch_select_options(args)?;
+fn branch_select_command(args: BranchSelectArgs) -> Result<String, CliError> {
+    let options = BranchSelectOptions::from(args);
     let path = options.project.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let selector = RuleBasedSelector;
@@ -324,11 +262,8 @@ where
     }
 }
 
-fn decision_list_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_path_json_options(args, "decision list")?;
+fn decision_list_command(args: PathJsonArgs) -> Result<String, CliError> {
+    let options = PathJsonOptions::from(args);
     let path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let points = store.list_decision_points()?;
@@ -349,11 +284,8 @@ where
     }
 }
 
-fn decision_pending_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_path_json_options(args, "decision pending")?;
+fn decision_pending_command(args: PathJsonArgs) -> Result<String, CliError> {
+    let options = PathJsonOptions::from(args);
     let path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let points = store.pending_decision_points()?;
@@ -374,33 +306,23 @@ where
     }
 }
 
-fn decision_show_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_id_options(args, "decision id")?;
-    let decision_id = options.id.ok_or_else(|| {
-        CliError::InvalidArgument("decision show requires <decision-id>".to_string())
-    })?;
-    let path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn decision_show_command(args: DecisionShowArgs) -> Result<String, CliError> {
+    let decision_id = args.decision_id;
+    let json = args.project.json;
+    let path = project_path_from_json(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let point = store.inspect_decision_point(&decision_id)?;
 
-    if options.project.json {
+    if json {
         Ok(point.to_json())
     } else {
         Ok(format_decision_point("Decision point", &point))
     }
 }
 
-fn decision_resolve_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_decision_resolve_options(args)?;
-    let decision_id = options.decision_id.ok_or_else(|| {
-        CliError::InvalidArgument("decision resolve requires <decision-id>".to_string())
-    })?;
+fn decision_resolve_command(args: DecisionResolveArgs) -> Result<String, CliError> {
+    let options = DecisionResolveOptions::try_from(args)?;
+    let decision_id = options.decision_id.expect("clap requires decision id");
     let chosen_index = options.choose.ok_or_else(|| {
         CliError::InvalidArgument("decision resolve requires --choose".to_string())
     })?;
@@ -418,11 +340,8 @@ where
     }
 }
 
-fn forage_observe_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_forage_observe_options(args)?;
+fn forage_observe_command(args: ForageObserveArgs) -> Result<String, CliError> {
+    let options = ForageObserveOptions::try_from(args)?;
     let source = options
         .source
         .ok_or_else(|| CliError::InvalidArgument("forage observe requires --source".to_string()))?;
@@ -449,14 +368,9 @@ where
     }
 }
 
-fn forage_ingest_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_forage_ingest_options(args)?;
-    let hits_file = options.hits_file.ok_or_else(|| {
-        CliError::InvalidArgument("forage ingest requires <hits-file>".to_string())
-    })?;
+fn forage_ingest_command(args: ForageIngestArgs) -> Result<String, CliError> {
+    let options = ForageIngestOptions::from(args);
+    let hits_file = options.hits_file.expect("clap requires hits file");
     let source = options
         .source
         .unwrap_or_else(|| DEFAULT_FORAGE_SOURCE.to_string());
@@ -471,11 +385,8 @@ where
     }
 }
 
-fn forage_fetch_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_forage_fetch_options(args)?;
+fn forage_fetch_command(args: ForageFetchArgs) -> Result<String, CliError> {
+    let options = ForageFetchOptions::try_from(args)?;
     let query = options
         .query
         .ok_or_else(|| CliError::InvalidArgument("forage fetch requires --query".to_string()))?;
@@ -625,11 +536,8 @@ fn should_auto_forage(verdict: Option<&VerdictSummary>) -> bool {
     )
 }
 
-fn forage_list_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_path_json_options(args, "forage list")?;
+fn forage_list_command(args: PathJsonArgs) -> Result<String, CliError> {
+    let options = PathJsonOptions::from(args);
     let path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let observations = store.list_forage_observations()?;
@@ -647,19 +555,14 @@ where
     }
 }
 
-fn forage_show_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_id_options(args, "forage observation id")?;
-    let observation_id = options.id.ok_or_else(|| {
-        CliError::InvalidArgument("forage show requires <forage-obs-id>".to_string())
-    })?;
-    let path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn forage_show_command(args: ForageShowArgs) -> Result<String, CliError> {
+    let observation_id = args.forage_obs_id;
+    let json = args.project.json;
+    let path = project_path_from_json(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let observation = store.inspect_forage_observation(&observation_id)?;
 
-    if options.project.json {
+    if json {
         Ok(observation.to_json())
     } else {
         Ok(format_forage_observation(
@@ -669,11 +572,8 @@ where
     }
 }
 
-fn forage_link_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_forage_link_options(args)?;
+fn forage_link_command(args: ForageLinkArgs) -> Result<String, CliError> {
+    let options = ForageLinkOptions::try_from(args)?;
     let hypothesis_id = options.hypothesis_id.ok_or_else(|| {
         CliError::InvalidArgument("forage link requires --hypothesis".to_string())
     })?;
@@ -697,11 +597,8 @@ where
     }
 }
 
-fn trace_checkpoint_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_trace_checkpoint_options(args)?;
+fn trace_checkpoint_command(args: TraceCheckpointArgs) -> Result<String, CliError> {
+    let options = TraceCheckpointOptions::from(args);
     let label = options.label.ok_or_else(|| {
         CliError::InvalidArgument("trace checkpoint requires --label".to_string())
     })?;
@@ -716,11 +613,8 @@ where
     }
 }
 
-fn trace_list_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_path_json_options(args, "trace list")?;
+fn trace_list_command(args: PathJsonArgs) -> Result<String, CliError> {
+    let options = PathJsonOptions::from(args);
     let path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let checkpoints = store.list_checkpoints()?;
@@ -738,456 +632,168 @@ where
     }
 }
 
-fn trace_drift_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_id_options(args, "checkpoint id")?;
-    let checkpoint_id = options.id.ok_or_else(|| {
-        CliError::InvalidArgument("trace drift requires <checkpoint-id>".to_string())
-    })?;
-    let path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn trace_drift_command(args: TraceCheckpointIdArgs) -> Result<String, CliError> {
+    let checkpoint_id = args.checkpoint_id;
+    let json = args.project.json;
+    let path = project_path_from_json(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let report = store.detect_drift(&checkpoint_id)?;
 
-    if options.project.json {
+    if json {
         Ok(report.to_json())
     } else {
         Ok(format_drift_report(&report))
     }
 }
 
-fn trace_revert_command<I>(args: I) -> Result<String, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let options = parse_single_id_options(args, "checkpoint id")?;
-    let checkpoint_id = options.id.ok_or_else(|| {
-        CliError::InvalidArgument("trace revert requires <checkpoint-id>".to_string())
-    })?;
-    let path = options.project.path.unwrap_or(std::env::current_dir()?);
+fn trace_revert_command(args: TraceCheckpointIdArgs) -> Result<String, CliError> {
+    let checkpoint_id = args.checkpoint_id;
+    let json = args.project.json;
+    let path = project_path_from_json(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
     let record = store.revert_to(&checkpoint_id)?;
 
-    if options.project.json {
+    if json {
         Ok(record.to_json())
     } else {
         Ok(format_revert_record(&record))
     }
 }
 
-fn parse_path_json_options<I>(args: I, command: &str) -> Result<PathJsonOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = PathJsonOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.json = true;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "{command} does not accept positional argument: {arg}"
-                )));
-            }
+impl From<PathJsonArgs> for PathJsonOptions {
+    fn from(args: PathJsonArgs) -> Self {
+        Self {
+            path: last_value(args.path),
+            json: args.json,
         }
     }
-
-    Ok(options)
 }
 
-fn parse_agent_run_options<I>(args: I) -> Result<AgentRunOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = AgentRunOptions::default();
-    let mut args = args.into_iter();
+impl TryFrom<AgentRunArgs> for AgentRunOptions {
+    type Error = CliError;
 
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--apply" => {
-                options.apply = true;
-            }
-            "--auto-run" => {
-                options.auto_run = true;
-            }
-            "--flow" => {
-                options.flow = Some(require_value("--flow", &mut args)?);
-            }
-            "--max-apply" => {
-                let max_apply = parse_usize_flag("--max-apply", &mut args)?;
-                options.max_apply = u32::try_from(max_apply).map_err(|_| {
-                    CliError::InvalidArgument(
-                        "--max-apply must fit in an unsigned 32-bit integer".to_string(),
-                    )
-                })?;
-            }
-            "--propose-synth" => {
-                options.propose_synth = true;
-            }
-            "--infer-params" => {
-                options.infer_params = true;
-            }
-            "--synthesizer" => {
-                options.synthesizer = Some(require_value("--synthesizer", &mut args)?);
-            }
-            "--auto-forage" => {
-                options.auto_forage = true;
-            }
-            "--forage-max" => {
-                options.forage_max = parse_u32_flag("--forage-max", &mut args)?;
-            }
-            "--forage-script" => {
-                options.forage_script =
-                    Some(PathBuf::from(require_value("--forage-script", &mut args)?));
-            }
-            "--python" => {
-                options.python = Some(require_value("--python", &mut args)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "agent run does not accept positional argument: {arg}"
-                )));
-            }
+    fn try_from(args: AgentRunArgs) -> Result<Self, Self::Error> {
+        let mut options = Self {
+            project: PathJsonOptions::from(args.project),
+            apply: args.apply,
+            auto_run: args.auto_run,
+            flow: last_value(args.flow),
+            max_apply: 5,
+            propose_synth: args.propose_synth,
+            infer_params: args.infer_params,
+            synthesizer: last_value(args.synthesizer),
+            auto_forage: args.auto_forage,
+            forage_max: DEFAULT_AUTO_FORAGE_MAX,
+            forage_script: last_value(args.forage_script),
+            python: last_value(args.python),
+        };
+
+        if let Some(value) = last_value(args.max_apply) {
+            let max_apply = parse_usize_value("--max-apply", &value)?;
+            options.max_apply = u32::try_from(max_apply).map_err(|_| {
+                CliError::InvalidArgument(
+                    "--max-apply must fit in an unsigned 32-bit integer".to_string(),
+                )
+            })?;
+        }
+        if let Some(value) = last_value(args.forage_max) {
+            options.forage_max = parse_u32_value("--forage-max", &value)?;
+        }
+
+        Ok(options)
+    }
+}
+
+impl From<BranchSelectArgs> for BranchSelectOptions {
+    fn from(args: BranchSelectArgs) -> Self {
+        Self {
+            project: PathJsonOptions::from(args.project),
+            explore: args.explore,
         }
     }
-
-    Ok(options)
 }
 
-fn parse_branch_select_options<I>(args: I) -> Result<BranchSelectOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = BranchSelectOptions::default();
-    let mut args = args.into_iter();
+impl TryFrom<DecisionResolveArgs> for DecisionResolveOptions {
+    type Error = CliError;
 
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--explore" => {
-                options.explore = true;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "branch select does not accept positional argument: {arg}"
-                )));
-            }
+    fn try_from(args: DecisionResolveArgs) -> Result<Self, Self::Error> {
+        Ok(Self {
+            project: PathJsonOptions::from(args.project),
+            decision_id: Some(args.decision_id),
+            choose: last_value(args.choose)
+                .map(|value| parse_usize_value("--choose", &value))
+                .transpose()?,
+            note: last_value(args.note),
+        })
+    }
+}
+
+impl TryFrom<ForageObserveArgs> for ForageObserveOptions {
+    type Error = CliError;
+
+    fn try_from(args: ForageObserveArgs) -> Result<Self, Self::Error> {
+        Ok(Self {
+            project: PathJsonOptions::from(args.project),
+            source: last_value(args.source),
+            external_id: last_value(args.external_id),
+            title: last_value(args.title),
+            access: last_value(args.access)
+                .map(|access| parse_access_status(&access))
+                .transpose()?,
+        })
+    }
+}
+
+impl From<ForageIngestArgs> for ForageIngestOptions {
+    fn from(args: ForageIngestArgs) -> Self {
+        Self {
+            project: PathJsonOptions::from(args.project),
+            source: last_value(args.source),
+            hits_file: Some(args.hits_file),
         }
     }
-
-    Ok(options)
 }
 
-fn parse_single_id_options<I>(args: I, label: &str) -> Result<SingleIdOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = SingleIdOptions::default();
-    let mut args = args.into_iter();
+impl TryFrom<ForageFetchArgs> for ForageFetchOptions {
+    type Error = CliError;
 
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                if options.id.is_some() {
-                    return Err(CliError::InvalidArgument(format!(
-                        "expected one {label}, got extra argument: {arg}"
-                    )));
-                }
-                options.id = Some(arg);
-            }
+    fn try_from(args: ForageFetchArgs) -> Result<Self, Self::Error> {
+        Ok(Self {
+            project: PathJsonOptions::from(args.project),
+            query: last_value(args.query),
+            source: last_value(args.source),
+            script: last_value(args.script),
+            max: last_value(args.max)
+                .map(|max| parse_u32_value("--max", &max))
+                .transpose()?,
+            python: last_value(args.python),
+        })
+    }
+}
+
+impl TryFrom<ForageLinkArgs> for ForageLinkOptions {
+    type Error = CliError;
+
+    fn try_from(args: ForageLinkArgs) -> Result<Self, Self::Error> {
+        Ok(Self {
+            project: PathJsonOptions::from(args.project),
+            hypothesis_id: last_value(args.hypothesis),
+            observation_id: last_value(args.observation),
+            stance: last_value(args.stance)
+                .map(|stance| parse_stance(&stance))
+                .transpose()?,
+            note: last_value(args.note),
+        })
+    }
+}
+
+impl From<TraceCheckpointArgs> for TraceCheckpointOptions {
+    fn from(args: TraceCheckpointArgs) -> Self {
+        Self {
+            project: PathJsonOptions::from(args.project),
+            label: last_value(args.label),
         }
     }
-
-    Ok(options)
-}
-
-fn parse_decision_resolve_options<I>(args: I) -> Result<DecisionResolveOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = DecisionResolveOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--choose" => {
-                options.choose = Some(parse_usize_flag("--choose", &mut args)?);
-            }
-            "--note" => {
-                options.note = Some(require_value("--note", &mut args)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                if options.decision_id.is_some() {
-                    return Err(CliError::InvalidArgument(format!(
-                        "expected one decision id, got extra argument: {arg}"
-                    )));
-                }
-                options.decision_id = Some(arg);
-            }
-        }
-    }
-
-    Ok(options)
-}
-
-fn parse_forage_observe_options<I>(args: I) -> Result<ForageObserveOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = ForageObserveOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--source" => {
-                options.source = Some(require_value("--source", &mut args)?);
-            }
-            "--external-id" => {
-                options.external_id = Some(require_value("--external-id", &mut args)?);
-            }
-            "--title" => {
-                options.title = Some(require_value("--title", &mut args)?);
-            }
-            "--access" => {
-                let access = require_value("--access", &mut args)?;
-                options.access = Some(parse_access_status(&access)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "forage observe does not accept positional argument: {arg}"
-                )));
-            }
-        }
-    }
-
-    Ok(options)
-}
-
-fn parse_forage_ingest_options<I>(args: I) -> Result<ForageIngestOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = ForageIngestOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--source" => {
-                options.source = Some(require_value("--source", &mut args)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                if options.hits_file.is_some() {
-                    return Err(CliError::InvalidArgument(format!(
-                        "expected one hits file, got extra argument: {arg}"
-                    )));
-                }
-                options.hits_file = Some(PathBuf::from(arg));
-            }
-        }
-    }
-
-    Ok(options)
-}
-
-fn parse_forage_fetch_options<I>(args: I) -> Result<ForageFetchOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = ForageFetchOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--query" => {
-                options.query = Some(require_value("--query", &mut args)?);
-            }
-            "--source" => {
-                options.source = Some(require_value("--source", &mut args)?);
-            }
-            "--script" => {
-                options.script = Some(PathBuf::from(require_value("--script", &mut args)?));
-            }
-            "--max" => {
-                options.max = Some(parse_u32_flag("--max", &mut args)?);
-            }
-            "--python" => {
-                options.python = Some(require_value("--python", &mut args)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "forage fetch does not accept positional argument: {arg}"
-                )));
-            }
-        }
-    }
-
-    Ok(options)
-}
-
-fn parse_forage_link_options<I>(args: I) -> Result<ForageLinkOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = ForageLinkOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--hypothesis" => {
-                options.hypothesis_id = Some(require_value("--hypothesis", &mut args)?);
-            }
-            "--observation" => {
-                options.observation_id = Some(require_value("--observation", &mut args)?);
-            }
-            "--stance" => {
-                let stance = require_value("--stance", &mut args)?;
-                options.stance = Some(parse_stance(&stance)?);
-            }
-            "--note" => {
-                options.note = Some(require_value("--note", &mut args)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "forage link does not accept positional argument: {arg}"
-                )));
-            }
-        }
-    }
-
-    Ok(options)
-}
-
-fn parse_trace_checkpoint_options<I>(args: I) -> Result<TraceCheckpointOptions, CliError>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut options = TraceCheckpointOptions::default();
-    let mut args = args.into_iter();
-
-    while let Some(arg) = next_arg(&mut args)? {
-        match arg.as_str() {
-            "--path" => {
-                options.project.path = Some(PathBuf::from(require_value("--path", &mut args)?));
-            }
-            "--json" => {
-                options.project.json = true;
-            }
-            "--label" => {
-                options.label = Some(require_value("--label", &mut args)?);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::InvalidArgument(format!("unknown option: {arg}")));
-            }
-            _ => {
-                return Err(CliError::InvalidArgument(format!(
-                    "trace checkpoint does not accept positional argument: {arg}"
-                )));
-            }
-        }
-    }
-
-    Ok(options)
-}
-
-fn parse_usize_flag<I>(flag: &str, args: &mut I) -> Result<usize, CliError>
-where
-    I: Iterator<Item = OsString>,
-{
-    let value = require_value(flag, args)?;
-    value
-        .parse::<usize>()
-        .map_err(|_| CliError::InvalidArgument(format!("{flag} must be a non-negative integer")))
-}
-
-fn parse_u32_flag<I>(flag: &str, args: &mut I) -> Result<u32, CliError>
-where
-    I: Iterator<Item = OsString>,
-{
-    let value = parse_usize_flag(flag, args)?;
-    u32::try_from(value).map_err(|_| {
-        CliError::InvalidArgument(format!("{flag} must fit in an unsigned 32-bit integer"))
-    })
 }
 
 fn validate_forage_script(script: &Path, command: &str, flag: &str) -> Result<(), CliError> {
@@ -1815,6 +1421,8 @@ fn stderr_summary(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
     use crate::run;
     use agentflow_core::argument::{
@@ -2103,58 +1711,6 @@ steps:
         assert!(json.contains(&hypothesis_id));
 
         let _ = std::fs::remove_dir_all(path);
-    }
-
-    #[test]
-    fn agent_run_parses_auto_forage_flags() {
-        let options = parse_agent_run_options(args(&[
-            "--auto-forage",
-            "--forage-max",
-            "3",
-            "--forage-script",
-            "fixture.sh",
-            "--python",
-            "/bin/sh",
-        ]))
-        .unwrap();
-
-        assert!(options.auto_forage);
-        assert_eq!(options.forage_max, 3);
-        assert_eq!(options.forage_script, Some(PathBuf::from("fixture.sh")));
-        assert_eq!(options.python.as_deref(), Some("/bin/sh"));
-    }
-
-    #[test]
-    fn agent_run_parses_propose_synth_flag() {
-        let default = parse_agent_run_options(std::iter::empty::<OsString>()).unwrap();
-        assert!(!default.propose_synth);
-
-        let options = parse_agent_run_options(args(&["--propose-synth"])).unwrap();
-
-        assert!(options.propose_synth);
-    }
-
-    #[test]
-    fn agent_run_parses_auto_run_flag() {
-        let default = parse_agent_run_options(std::iter::empty::<OsString>()).unwrap();
-        assert!(!default.auto_run);
-
-        let options = parse_agent_run_options(args(&["--auto-run"])).unwrap();
-
-        assert!(options.auto_run);
-    }
-
-    #[test]
-    fn agent_run_parses_infer_params_flags() {
-        let default = parse_agent_run_options(std::iter::empty::<OsString>()).unwrap();
-        assert!(!default.infer_params);
-        assert_eq!(default.synthesizer, None);
-
-        let options =
-            parse_agent_run_options(args(&["--infer-params", "--synthesizer", "stub -p"])).unwrap();
-
-        assert!(options.infer_params);
-        assert_eq!(options.synthesizer.as_deref(), Some("stub -p"));
     }
 
     #[test]

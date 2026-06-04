@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 agentflow-core = { path = "../agentflow-core" }
 agentflow-schemas = { path = "../agentflow-schemas" }
+clap = { version = "4", features = ["derive"] }
 
 [[bin]]
 name = "agentflow"

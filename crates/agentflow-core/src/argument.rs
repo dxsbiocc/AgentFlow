@@ -1,6 +1,8 @@
 use std::fmt;
 
 use rusqlite::params;
+use serde::de::{self, DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::domain::ToolMaturity;
 use crate::hypothesis::Confidence;
@@ -12,7 +14,8 @@ const AFFIRM_MARGIN: i32 = 3;
 const REFUTE_MARGIN: i32 = 3;
 const STRONG_MARGIN: i32 = 6;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EvidenceGrade {
     Observed,
     Inferred,
@@ -59,7 +62,8 @@ impl fmt::Display for EvidenceGrade {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Stance {
     Supports,
     Contradicts,
@@ -101,7 +105,7 @@ pub struct EvidenceLinkRequest {
     pub note: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceLink {
     pub id: String,
     pub hypothesis_id: String,
@@ -115,32 +119,12 @@ pub struct EvidenceLink {
 
 impl EvidenceLink {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"id\":\"{}\",",
-                "\"hypothesis_id\":\"{}\",",
-                "\"observation_id\":{},",
-                "\"source\":{},",
-                "\"grade\":\"{}\",",
-                "\"stance\":\"{}\",",
-                "\"note\":\"{}\",",
-                "\"created_at\":{}",
-                "}}"
-            ),
-            escape_json(&self.id),
-            escape_json(&self.hypothesis_id),
-            optional_json_string(self.observation_id.as_deref()),
-            optional_json_string(self.source.as_deref()),
-            self.grade.as_str(),
-            self.stance.as_str(),
-            escape_json(&self.note),
-            self.created_at
-        )
+        serde_json::to_string(self).expect("evidence link serializes to JSON")
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ClaimBasis {
     Observed,
     StatisticallyInferred,
@@ -172,7 +156,7 @@ impl fmt::Display for ClaimBasis {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelfDeceptionGate {
     pub supports: String,
     pub against: String,
@@ -217,47 +201,99 @@ impl Verdict {
 
     pub fn to_json(&self) -> String {
         match self {
-            Self::Affirmed | Self::Refuted => {
-                format!("{{\"verdict\":\"{}\"}}", self.as_str())
+            Self::Affirmed | Self::Refuted => serde_json::to_string(&VerdictTextPayload {
+                verdict: self.as_str().to_string(),
+            })
+            .expect("verdict serializes to JSON"),
+            Self::Inconclusive(InconclusiveKind::Provisional { missing }) => {
+                serde_json::to_string(&ProvisionalVerdictPayload {
+                    verdict: "inconclusive".to_string(),
+                    inconclusive_kind: "provisional".to_string(),
+                    missing: missing.clone(),
+                })
+                .expect("provisional verdict serializes to JSON")
             }
-            Self::Inconclusive(InconclusiveKind::Provisional { missing }) => format!(
-                concat!(
-                    "{{",
-                    "\"verdict\":\"inconclusive\",",
-                    "\"inconclusive_kind\":\"provisional\",",
-                    "\"missing\":{}",
-                    "}}"
-                ),
-                json_string_array(missing)
-            ),
-            Self::Inconclusive(InconclusiveKind::Fundamental { frontier }) => format!(
-                concat!(
-                    "{{",
-                    "\"verdict\":\"inconclusive\",",
-                    "\"inconclusive_kind\":\"fundamental\",",
-                    "\"frontier\":\"{}\"",
-                    "}}"
-                ),
-                escape_json(frontier)
-            ),
+            Self::Inconclusive(InconclusiveKind::Fundamental { frontier }) => {
+                serde_json::to_string(&FundamentalVerdictPayload {
+                    verdict: "inconclusive".to_string(),
+                    inconclusive_kind: "fundamental".to_string(),
+                    frontier: frontier.clone(),
+                })
+                .expect("fundamental verdict serializes to JSON")
+            }
         }
     }
 
     pub fn from_json(json: &str) -> Option<Self> {
-        match json_string_field(json, "verdict")?.as_str() {
+        let payload: VerdictPayload = serde_json::from_str(json).ok()?;
+        match payload.verdict.as_str() {
             "affirmed" => Some(Self::Affirmed),
             "refuted" => Some(Self::Refuted),
-            "inconclusive" => match json_string_field(json, "inconclusive_kind")?.as_str() {
+            "inconclusive" => match payload.inconclusive_kind?.as_str() {
                 "provisional" => Some(Self::Inconclusive(InconclusiveKind::Provisional {
-                    missing: json_string_array_field(json, "missing")?,
+                    missing: payload.missing?,
                 })),
                 "fundamental" => Some(Self::Inconclusive(InconclusiveKind::Fundamental {
-                    frontier: json_string_field(json, "frontier")?,
+                    frontier: payload.frontier?,
                 })),
                 _ => None,
             },
             _ => None,
         }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct VerdictTextPayload {
+    verdict: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProvisionalVerdictPayload {
+    verdict: String,
+    inconclusive_kind: String,
+    missing: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FundamentalVerdictPayload {
+    verdict: String,
+    inconclusive_kind: String,
+    frontier: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct VerdictPayload {
+    verdict: String,
+    inconclusive_kind: Option<String>,
+    missing: Option<Vec<String>>,
+    frontier: Option<String>,
+}
+
+fn report_verdict_from_parts(
+    verdict: &str,
+    inconclusive_kind: Option<&str>,
+    missing: Vec<String>,
+    frontier: Option<&str>,
+) -> Result<Verdict, String> {
+    match verdict {
+        "affirmed" => Ok(Verdict::Affirmed),
+        "refuted" => Ok(Verdict::Refuted),
+        "inconclusive" => match inconclusive_kind {
+            Some("provisional") => Ok(Verdict::Inconclusive(InconclusiveKind::Provisional {
+                missing,
+            })),
+            Some("fundamental") => frontier
+                .map(|frontier| {
+                    Verdict::Inconclusive(InconclusiveKind::Fundamental {
+                        frontier: frontier.to_string(),
+                    })
+                })
+                .ok_or_else(|| "fundamental verdict missing frontier".to_string()),
+            Some(kind) => Err(format!("invalid inconclusive kind {kind}")),
+            None => Err("inconclusive verdict missing inconclusive_kind".to_string()),
+        },
+        other => Err(format!("invalid verdict {other}")),
     }
 }
 
@@ -273,58 +309,101 @@ pub struct VerdictReport {
 
 impl VerdictReport {
     pub fn to_json(&self) -> String {
-        let (inconclusive_kind, missing, frontier) = match &self.verdict {
-            Verdict::Inconclusive(InconclusiveKind::Provisional { missing }) => {
-                (Some("provisional"), json_string_array(missing), None)
-            }
-            Verdict::Inconclusive(InconclusiveKind::Fundamental { frontier }) => (
-                Some("fundamental"),
-                "[]".to_string(),
-                Some(frontier.as_str()),
-            ),
-            Verdict::Affirmed | Verdict::Refuted => (None, "[]".to_string(), None),
-        };
-        let supporting = self
-            .supporting
-            .iter()
-            .map(EvidenceLink::to_json)
-            .collect::<Vec<_>>()
-            .join(",");
-        let contradicting = self
-            .contradicting
-            .iter()
-            .map(EvidenceLink::to_json)
-            .collect::<Vec<_>>()
-            .join(",");
-
-        format!(
-            concat!(
-                "{{",
-                "\"hypothesis_id\":\"{}\",",
-                "\"verdict\":\"{}\",",
-                "\"inconclusive_kind\":{},",
-                "\"missing\":{},",
-                "\"frontier\":{},",
-                "\"confidence\":\"{}\",",
-                "\"rationale\":\"{}\",",
-                "\"supporting\":[{}],",
-                "\"contradicting\":[{}]",
-                "}}"
-            ),
-            escape_json(&self.hypothesis_id),
-            self.verdict.as_str(),
-            optional_json_string(inconclusive_kind),
-            missing,
-            optional_json_string(frontier),
-            self.confidence.as_str(),
-            escape_json(&self.rationale),
-            supporting,
-            contradicting
-        )
+        serde_json::to_string(self).expect("verdict report serializes to JSON")
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+impl Serialize for VerdictReport {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        VerdictReportPayload::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for VerdictReport {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let payload = VerdictReportInput::deserialize(deserializer)?;
+        let verdict = report_verdict_from_parts(
+            &payload.verdict,
+            payload.inconclusive_kind.as_deref(),
+            payload.missing,
+            payload.frontier.as_deref(),
+        )
+        .map_err(de::Error::custom)?;
+
+        Ok(Self {
+            hypothesis_id: payload.hypothesis_id,
+            verdict,
+            confidence: payload.confidence,
+            supporting: payload.supporting,
+            contradicting: payload.contradicting,
+            rationale: payload.rationale,
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct VerdictReportPayload<'a> {
+    hypothesis_id: &'a str,
+    verdict: &'static str,
+    inconclusive_kind: Option<&'static str>,
+    missing: Vec<String>,
+    frontier: Option<&'a str>,
+    confidence: Confidence,
+    rationale: &'a str,
+    supporting: &'a [EvidenceLink],
+    contradicting: &'a [EvidenceLink],
+}
+
+impl<'a> From<&'a VerdictReport> for VerdictReportPayload<'a> {
+    fn from(report: &'a VerdictReport) -> Self {
+        let (inconclusive_kind, missing, frontier) = match &report.verdict {
+            Verdict::Inconclusive(InconclusiveKind::Provisional { missing }) => {
+                (Some("provisional"), missing.clone(), None)
+            }
+            Verdict::Inconclusive(InconclusiveKind::Fundamental { frontier }) => {
+                (Some("fundamental"), Vec::new(), Some(frontier.as_str()))
+            }
+            Verdict::Affirmed | Verdict::Refuted => (None, Vec::new(), None),
+        };
+
+        Self {
+            hypothesis_id: &report.hypothesis_id,
+            verdict: report.verdict.as_str(),
+            inconclusive_kind,
+            missing,
+            frontier,
+            confidence: report.confidence,
+            rationale: &report.rationale,
+            supporting: &report.supporting,
+            contradicting: &report.contradicting,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct VerdictReportInput {
+    hypothesis_id: String,
+    verdict: String,
+    inconclusive_kind: Option<String>,
+    #[serde(default)]
+    missing: Vec<String>,
+    frontier: Option<String>,
+    confidence: Confidence,
+    rationale: String,
+    #[serde(default)]
+    supporting: Vec<EvidenceLink>,
+    #[serde(default)]
+    contradicting: Vec<EvidenceLink>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VerdictTag {
     Affirmed,
     Refuted,
@@ -359,7 +438,7 @@ impl fmt::Display for VerdictTag {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerdictSummary {
     pub hypothesis_id: String,
     pub tag: VerdictTag,
@@ -370,22 +449,7 @@ pub struct VerdictSummary {
 
 impl VerdictSummary {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"hypothesis_id\":\"{}\",",
-                "\"tag\":\"{}\",",
-                "\"confidence\":\"{}\",",
-                "\"frontier\":{},",
-                "\"created_at\":{}",
-                "}}"
-            ),
-            escape_json(&self.hypothesis_id),
-            self.tag.as_str(),
-            self.confidence.as_str(),
-            optional_json_string(self.frontier.as_deref()),
-            self.created_at
-        )
+        serde_json::to_string(self).expect("verdict summary serializes to JSON")
     }
 }
 
@@ -623,7 +687,8 @@ impl ProjectStore {
             if reverted.contains(&event_id) {
                 continue;
             }
-            if json_string_field(&payload_json, "hypothesis_id").as_deref() == Some(hypothesis_id) {
+            if payload_hypothesis_id_from_json(&event_id, &payload_json)?.as_str() == hypothesis_id
+            {
                 evidence.push(evidence_from_event(event_id, &payload_json, created_at)?);
             }
         }
@@ -684,7 +749,8 @@ impl ProjectStore {
             if reverted.contains(&event_id) {
                 continue;
             }
-            if json_string_field(&payload_json, "hypothesis_id").as_deref() == Some(hypothesis_id) {
+            if payload_hypothesis_id_from_json(&event_id, &payload_json)?.as_str() == hypothesis_id
+            {
                 return Ok(Some(verdict_summary_from_event(
                     event_id,
                     &payload_json,
@@ -807,24 +873,15 @@ fn validate_non_empty(label: &str, value: &str) -> Result<(), StorageError> {
 }
 
 fn evidence_linked_payload_json(request: &EvidenceLinkRequest) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"hypothesis_id\":\"{}\",",
-            "\"observation_id\":{},",
-            "\"source\":{},",
-            "\"grade\":\"{}\",",
-            "\"stance\":\"{}\",",
-            "\"note\":\"{}\"",
-            "}}"
-        ),
-        escape_json(request.hypothesis_id.trim()),
-        optional_json_string(request.observation_id.as_deref().map(str::trim)),
-        optional_json_string(request.source.as_deref().map(str::trim)),
-        request.grade.as_str(),
-        request.stance.as_str(),
-        escape_json(request.note.trim())
-    )
+    serde_json::to_string(&EvidenceLinkedPayload {
+        hypothesis_id: request.hypothesis_id.trim().to_string(),
+        observation_id: trimmed_non_empty(request.observation_id.as_deref()),
+        source: trimmed_non_empty(request.source.as_deref()),
+        grade: request.grade,
+        stance: request.stance,
+        note: request.note.trim().to_string(),
+    })
+    .expect("evidence linked payload serializes to JSON")
 }
 
 fn evidence_from_event(
@@ -832,14 +889,15 @@ fn evidence_from_event(
     payload_json: &str,
     created_at: i64,
 ) -> Result<EvidenceLink, StorageError> {
+    let payload: EvidenceLinkedPayload = argument_payload_from_json(&id, payload_json)?;
     Ok(EvidenceLink {
-        id: id.clone(),
-        hypothesis_id: required_json_string(&id, payload_json, "hypothesis_id")?,
-        observation_id: json_nullable_string_field(payload_json, "observation_id"),
-        source: json_nullable_string_field(payload_json, "source"),
-        grade: parse_grade(&id, payload_json, "grade")?,
-        stance: parse_stance(&id, payload_json, "stance")?,
-        note: required_json_string(&id, payload_json, "note")?,
+        id,
+        hypothesis_id: payload.hypothesis_id,
+        observation_id: payload.observation_id,
+        source: payload.source,
+        grade: payload.grade,
+        stance: payload.stance,
+        note: payload.note,
         created_at,
     })
 }
@@ -848,24 +906,15 @@ fn verdict_rendered_payload_json(
     report: &VerdictReport,
     gate: Option<&SelfDeceptionGate>,
 ) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"hypothesis_id\":\"{}\",",
-            "\"verdict\":\"{}\",",
-            "\"confidence\":\"{}\",",
-            "\"frontier\":{},",
-            "\"rationale\":\"{}\",",
-            "\"gate\":{}",
-            "}}"
-        ),
-        escape_json(&report.hypothesis_id),
-        escape_json(&verdict_payload_text(&report.verdict)),
-        report.confidence.as_str(),
-        optional_json_string(verdict_frontier(&report.verdict)),
-        escape_json(&report.rationale),
-        self_deception_gate_json(gate)
-    )
+    serde_json::to_string(&VerdictRenderedPayload {
+        hypothesis_id: report.hypothesis_id.clone(),
+        verdict: verdict_payload_text(&report.verdict),
+        confidence: report.confidence,
+        frontier: verdict_frontier(&report.verdict).map(ToString::to_string),
+        rationale: report.rationale.clone(),
+        gate: gate.map(SelfDeceptionGatePayload::from),
+    })
+    .expect("verdict rendered payload serializes to JSON")
 }
 
 fn verdict_payload_text(verdict: &Verdict) -> String {
@@ -882,221 +931,113 @@ fn verdict_frontier(verdict: &Verdict) -> Option<&str> {
     }
 }
 
-fn self_deception_gate_json(gate: Option<&SelfDeceptionGate>) -> String {
-    gate.map_or_else(
-        || "null".to_string(),
-        |gate| {
-            format!(
-                concat!(
-                    "{{",
-                    "\"supports\":\"{}\",",
-                    "\"against\":\"{}\",",
-                    "\"alternatives\":\"{}\",",
-                    "\"data_quality_risks\":\"{}\",",
-                    "\"assumptions\":\"{}\",",
-                    "\"falsifier\":\"{}\",",
-                    "\"claim_basis\":\"{}\",",
-                    "\"not_yet_claimable\":\"{}\"",
-                    "}}"
-                ),
-                escape_json(gate.supports.trim()),
-                escape_json(gate.against.trim()),
-                escape_json(gate.alternatives.trim()),
-                escape_json(gate.data_quality_risks.trim()),
-                escape_json(gate.assumptions.trim()),
-                escape_json(gate.falsifier.trim()),
-                gate.claim_basis.as_str(),
-                escape_json(gate.not_yet_claimable.trim())
-            )
-        },
-    )
-}
-
-fn required_json_string(
-    event_id: &str,
-    payload_json: &str,
-    field: &str,
-) -> Result<String, StorageError> {
-    json_string_field(payload_json, field).ok_or_else(|| {
-        StorageError::InvalidInput(format!("argument event {event_id} is missing {field}"))
-    })
-}
-
-fn parse_grade(
-    event_id: &str,
-    payload_json: &str,
-    field: &str,
-) -> Result<EvidenceGrade, StorageError> {
-    let value = required_json_string(event_id, payload_json, field)?;
-    EvidenceGrade::parse(&value).ok_or_else(|| {
-        StorageError::InvalidInput(format!(
-            "argument event {event_id} has invalid evidence grade {value}"
-        ))
-    })
-}
-
-fn parse_stance(event_id: &str, payload_json: &str, field: &str) -> Result<Stance, StorageError> {
-    let value = required_json_string(event_id, payload_json, field)?;
-    Stance::parse(&value).ok_or_else(|| {
-        StorageError::InvalidInput(format!(
-            "argument event {event_id} has invalid stance {value}"
-        ))
-    })
-}
-
 fn verdict_summary_from_event(
     event_id: String,
     payload_json: &str,
     created_at: i64,
 ) -> Result<VerdictSummary, StorageError> {
-    let hypothesis_id = required_json_string(&event_id, payload_json, "hypothesis_id")?;
-    let verdict = required_json_string(&event_id, payload_json, "verdict")?;
-    let confidence = required_json_string(&event_id, payload_json, "confidence")?;
-    let tag = VerdictTag::parse(&verdict).ok_or_else(|| {
+    let payload: VerdictRenderedSummaryPayload =
+        argument_payload_from_json(&event_id, payload_json)?;
+    let tag = VerdictTag::parse(&payload.verdict).ok_or_else(|| {
         StorageError::InvalidInput(format!(
-            "argument event {event_id} has invalid verdict {verdict}"
-        ))
-    })?;
-    let confidence = Confidence::parse(&confidence).ok_or_else(|| {
-        StorageError::InvalidInput(format!(
-            "argument event {event_id} has invalid confidence {confidence}"
+            "argument event {event_id} has invalid verdict {}",
+            payload.verdict
         ))
     })?;
 
     Ok(VerdictSummary {
-        hypothesis_id,
+        hypothesis_id: payload.hypothesis_id,
         tag,
-        confidence,
-        frontier: json_nullable_string_field(payload_json, "frontier"),
+        confidence: payload.confidence,
+        frontier: payload.frontier,
         created_at,
     })
 }
 
-fn optional_json_string(value: Option<&str>) -> String {
-    value.filter(|inner| !inner.trim().is_empty()).map_or_else(
-        || "null".to_string(),
-        |inner| format!("\"{}\"", escape_json(inner)),
-    )
+#[derive(Debug, Serialize, Deserialize)]
+struct EvidenceLinkedPayload {
+    hypothesis_id: String,
+    observation_id: Option<String>,
+    source: Option<String>,
+    grade: EvidenceGrade,
+    stance: Stance,
+    note: String,
 }
 
-fn json_string_array(values: &[String]) -> String {
-    let items = values
-        .iter()
-        .map(|value| format!("\"{}\"", escape_json(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{items}]")
+#[derive(Debug, Serialize)]
+struct VerdictRenderedPayload {
+    hypothesis_id: String,
+    verdict: String,
+    confidence: Confidence,
+    frontier: Option<String>,
+    rationale: String,
+    gate: Option<SelfDeceptionGatePayload>,
 }
 
-fn json_string_field(json: &str, field: &str) -> Option<String> {
-    let marker = format!("\"{field}\":\"");
-    let start = json.find(&marker)? + marker.len();
-    let rest = &json[start..];
-    let end = find_json_string_end(rest)?;
-    Some(unescape_json_string(&rest[..end]))
+#[derive(Debug, Deserialize)]
+struct VerdictRenderedSummaryPayload {
+    hypothesis_id: String,
+    verdict: String,
+    confidence: Confidence,
+    frontier: Option<String>,
 }
 
-fn json_nullable_string_field(json: &str, field: &str) -> Option<String> {
-    json_string_field(json, field)
+#[derive(Debug, Serialize)]
+struct SelfDeceptionGatePayload {
+    supports: String,
+    against: String,
+    alternatives: String,
+    data_quality_risks: String,
+    assumptions: String,
+    falsifier: String,
+    claim_basis: ClaimBasis,
+    not_yet_claimable: String,
 }
 
-fn json_string_array_field(json: &str, field: &str) -> Option<Vec<String>> {
-    let marker = format!("\"{field}\":[");
-    let start = json.find(&marker)? + marker.len();
-    let rest = &json[start..];
-    let end = find_json_array_end(rest)?;
-    parse_json_string_array(&rest[..end])
-}
-
-fn parse_json_string_array(input: &str) -> Option<Vec<String>> {
-    let mut values = Vec::new();
-    let mut rest = input.trim();
-    if rest.is_empty() {
-        return Some(values);
-    }
-
-    loop {
-        rest = rest.trim_start();
-        let string_body = rest.strip_prefix('"')?;
-        let end = find_json_string_end(string_body)?;
-        values.push(unescape_json_string(&string_body[..end]));
-        rest = string_body[end + 1..].trim_start();
-        if rest.is_empty() {
-            return Some(values);
-        }
-        rest = rest.strip_prefix(',')?;
-    }
-}
-
-fn find_json_string_end(input: &str) -> Option<usize> {
-    let mut escaped = false;
-    for (index, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(index),
-            _ => {}
+impl From<&SelfDeceptionGate> for SelfDeceptionGatePayload {
+    fn from(gate: &SelfDeceptionGate) -> Self {
+        Self {
+            supports: gate.supports.trim().to_string(),
+            against: gate.against.trim().to_string(),
+            alternatives: gate.alternatives.trim().to_string(),
+            data_quality_risks: gate.data_quality_risks.trim().to_string(),
+            assumptions: gate.assumptions.trim().to_string(),
+            falsifier: gate.falsifier.trim().to_string(),
+            claim_basis: gate.claim_basis,
+            not_yet_claimable: gate.not_yet_claimable.trim().to_string(),
         }
     }
-    None
 }
 
-fn find_json_array_end(input: &str) -> Option<usize> {
-    let mut escaped = false;
-    let mut in_string = false;
-    for (index, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' if in_string => escaped = true,
-            '"' => in_string = !in_string,
-            ']' if !in_string => return Some(index),
-            _ => {}
-        }
-    }
-    None
+#[derive(Debug, Deserialize)]
+struct HypothesisIdPayload {
+    hypothesis_id: String,
 }
 
-fn unescape_json_string(input: &str) -> String {
-    let mut output = String::new();
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('"') => output.push('"'),
-                Some('\\') => output.push('\\'),
-                Some('n') => output.push('\n'),
-                Some('r') => output.push('\r'),
-                Some('t') => output.push('\t'),
-                Some(other) => output.push(other),
-                None => {}
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-    output
+fn payload_hypothesis_id_from_json(
+    event_id: &str,
+    payload_json: &str,
+) -> Result<String, StorageError> {
+    let payload: HypothesisIdPayload = argument_payload_from_json(event_id, payload_json)?;
+    Ok(payload.hypothesis_id)
 }
 
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => output.push(ch),
-        }
-    }
-    output
+fn argument_payload_from_json<T>(event_id: &str, payload_json: &str) -> Result<T, StorageError>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_str(payload_json).map_err(|err| {
+        StorageError::InvalidInput(format!(
+            "argument event {event_id} has invalid payload: {err}"
+        ))
+    })
+}
+
+fn trimmed_non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|inner| !inner.is_empty())
+        .map(ToString::to_string)
 }
 
 #[cfg(test)]
@@ -1262,6 +1203,245 @@ steps:
                 rationale: "fixed test verdict".to_string(),
             }
         }
+    }
+
+    #[test]
+    fn enum_json_strings_match_display_contract() {
+        for grade in [
+            EvidenceGrade::Observed,
+            EvidenceGrade::Inferred,
+            EvidenceGrade::LiteratureSupported,
+            EvidenceGrade::Hypothesis,
+            EvidenceGrade::Unsupported,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&grade).unwrap(),
+                format!("\"{}\"", grade.as_str())
+            );
+        }
+        for stance in [Stance::Supports, Stance::Contradicts, Stance::Neutral] {
+            assert_eq!(
+                serde_json::to_string(&stance).unwrap(),
+                format!("\"{}\"", stance.as_str())
+            );
+        }
+        for basis in [
+            ClaimBasis::Observed,
+            ClaimBasis::StatisticallyInferred,
+            ClaimBasis::Speculative,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&basis).unwrap(),
+                format!("\"{}\"", basis.as_str())
+            );
+        }
+        for tag in [
+            VerdictTag::Affirmed,
+            VerdictTag::Refuted,
+            VerdictTag::InconclusiveProvisional,
+            VerdictTag::InconclusiveFundamental,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&tag).unwrap(),
+                format!("\"{}\"", tag.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn json_outputs_match_legacy_bytes() {
+        let link = EvidenceLink {
+            id: "event_1".to_string(),
+            hypothesis_id: "hypothesis_1".to_string(),
+            observation_id: Some("observation_1".to_string()),
+            source: Some("Source \"A\"\n".to_string()),
+            grade: EvidenceGrade::LiteratureSupported,
+            stance: Stance::Contradicts,
+            note: "Quote \" and newline\nslash \\ tab\t".to_string(),
+            created_at: 42,
+        };
+        assert_eq!(
+            link.to_json(),
+            "{\"id\":\"event_1\",\"hypothesis_id\":\"hypothesis_1\",\"observation_id\":\"observation_1\",\"source\":\"Source \\\"A\\\"\\n\",\"grade\":\"literature_supported\",\"stance\":\"contradicts\",\"note\":\"Quote \\\" and newline\\nslash \\\\ tab\\t\",\"created_at\":42}"
+        );
+
+        assert_eq!(Verdict::Affirmed.to_json(), "{\"verdict\":\"affirmed\"}");
+        assert_eq!(Verdict::Refuted.to_json(), "{\"verdict\":\"refuted\"}");
+        assert_eq!(
+            Verdict::Inconclusive(InconclusiveKind::Provisional {
+                missing: vec![
+                    "need \"observed\"".to_string(),
+                    "replicate\nagain".to_string(),
+                ],
+            })
+            .to_json(),
+            "{\"verdict\":\"inconclusive\",\"inconclusive_kind\":\"provisional\",\"missing\":[\"need \\\"observed\\\"\",\"replicate\\nagain\"]}"
+        );
+        assert_eq!(
+            Verdict::Inconclusive(InconclusiveKind::Fundamental {
+                frontier: "external \"replication\"\nfrontier".to_string(),
+            })
+            .to_json(),
+            "{\"verdict\":\"inconclusive\",\"inconclusive_kind\":\"fundamental\",\"frontier\":\"external \\\"replication\\\"\\nfrontier\"}"
+        );
+
+        let supporting = evidence_link("support_1", EvidenceGrade::Observed, Stance::Supports);
+        let contradicting =
+            evidence_link("contradict_1", EvidenceGrade::Inferred, Stance::Contradicts);
+        let provisional_report = VerdictReport {
+            hypothesis_id: "hypothesis_1".to_string(),
+            verdict: Verdict::Inconclusive(InconclusiveKind::Provisional {
+                missing: vec!["more evidence".to_string()],
+            }),
+            confidence: Confidence::Low,
+            supporting: vec![supporting],
+            contradicting: vec![contradicting],
+            rationale: "Need \"more\"\n".to_string(),
+        };
+        assert_eq!(
+            provisional_report.to_json(),
+            "{\"hypothesis_id\":\"hypothesis_1\",\"verdict\":\"inconclusive\",\"inconclusive_kind\":\"provisional\",\"missing\":[\"more evidence\"],\"frontier\":null,\"confidence\":\"low\",\"rationale\":\"Need \\\"more\\\"\\n\",\"supporting\":[{\"id\":\"support_1\",\"hypothesis_id\":\"hypothesis_1\",\"observation_id\":null,\"source\":null,\"grade\":\"observed\",\"stance\":\"supports\",\"note\":\"supports via observed\",\"created_at\":1}],\"contradicting\":[{\"id\":\"contradict_1\",\"hypothesis_id\":\"hypothesis_1\",\"observation_id\":null,\"source\":null,\"grade\":\"inferred\",\"stance\":\"contradicts\",\"note\":\"contradicts via inferred\",\"created_at\":1}]}"
+        );
+        assert_eq!(
+            super::verdict_rendered_payload_json(&provisional_report, None),
+            "{\"hypothesis_id\":\"hypothesis_1\",\"verdict\":\"inconclusive_provisional\",\"confidence\":\"low\",\"frontier\":null,\"rationale\":\"Need \\\"more\\\"\\n\",\"gate\":null}"
+        );
+
+        let fundamental_report = VerdictReport {
+            hypothesis_id: "hypothesis_1".to_string(),
+            verdict: Verdict::Inconclusive(InconclusiveKind::Fundamental {
+                frontier: "external replication".to_string(),
+            }),
+            confidence: Confidence::Medium,
+            supporting: Vec::new(),
+            contradicting: Vec::new(),
+            rationale: "Frontier".to_string(),
+        };
+        assert_eq!(
+            fundamental_report.to_json(),
+            "{\"hypothesis_id\":\"hypothesis_1\",\"verdict\":\"inconclusive\",\"inconclusive_kind\":\"fundamental\",\"missing\":[],\"frontier\":\"external replication\",\"confidence\":\"medium\",\"rationale\":\"Frontier\",\"supporting\":[],\"contradicting\":[]}"
+        );
+        assert_eq!(
+            super::verdict_rendered_payload_json(&fundamental_report, Some(&valid_gate())),
+            "{\"hypothesis_id\":\"hypothesis_1\",\"verdict\":\"inconclusive_fundamental\",\"confidence\":\"medium\",\"frontier\":\"external replication\",\"rationale\":\"Frontier\",\"gate\":{\"supports\":\"Observed evidence supports the claim\",\"against\":\"Contradictory evidence has been checked\",\"alternatives\":\"Alternative explanations remain less consistent\",\"data_quality_risks\":\"Sampling bias is limited by replication\",\"assumptions\":\"Measurements are comparable across runs\",\"falsifier\":\"A replicated contradiction would overturn this claim\",\"claim_basis\":\"observed\",\"not_yet_claimable\":\"No causal mechanism is claimed yet\"}}"
+        );
+
+        assert_eq!(
+            super::evidence_linked_payload_json(&EvidenceLinkRequest {
+                hypothesis_id: " hypothesis_1 ".to_string(),
+                observation_id: Some(" observation_1 ".to_string()),
+                source: Some(" Source \"A\" ".to_string()),
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: " Note\n ".to_string(),
+            }),
+            "{\"hypothesis_id\":\"hypothesis_1\",\"observation_id\":\"observation_1\",\"source\":\"Source \\\"A\\\"\",\"grade\":\"observed\",\"stance\":\"supports\",\"note\":\"Note\"}"
+        );
+
+        assert_eq!(
+            (super::VerdictSummary {
+                hypothesis_id: "hypothesis_1".to_string(),
+                tag: VerdictTag::InconclusiveFundamental,
+                confidence: Confidence::High,
+                frontier: Some("frontier\n".to_string()),
+                created_at: 99,
+            })
+            .to_json(),
+            "{\"hypothesis_id\":\"hypothesis_1\",\"tag\":\"inconclusive_fundamental\",\"confidence\":\"high\",\"frontier\":\"frontier\\n\",\"created_at\":99}"
+        );
+    }
+
+    #[test]
+    fn legacy_handwritten_payloads_parse_with_json_whitespace_and_ordering() {
+        let path = temp_project_path("legacy-payload");
+        let store = ProjectStore::init(&path, Some("Argument Demo")).unwrap();
+        let hypothesis_id = record_hypothesis(&store);
+
+        store
+            .append_event(crate::storage::EventRecord {
+                flow_id: None,
+                step_id: None,
+                run_id: None,
+                event_type: super::EVIDENCE_LINKED_EVENT.to_string(),
+                payload_json: format!(
+                    r#"{{
+                        "note": "Legacy \"evidence\"\nparses",
+                        "stance": "contradicts",
+                        "grade": "inferred",
+                        "source": null,
+                        "observation_id": "observation_legacy",
+                        "hypothesis_id": "{hypothesis_id}"
+                    }}"#
+                ),
+            })
+            .unwrap();
+        store
+            .append_event(crate::storage::EventRecord {
+                flow_id: None,
+                step_id: None,
+                run_id: None,
+                event_type: super::VERDICT_RENDERED_EVENT.to_string(),
+                payload_json: format!(
+                    r#"{{
+                        "gate": null,
+                        "rationale": "Legacy verdict parses",
+                        "frontier": "external replication",
+                        "confidence": "medium",
+                        "verdict": "inconclusive_fundamental",
+                        "hypothesis_id": "{hypothesis_id}"
+                    }}"#
+                ),
+            })
+            .unwrap();
+
+        let evidence = store.evidence_for(&hypothesis_id).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].observation_id.as_deref(),
+            Some("observation_legacy")
+        );
+        assert_eq!(evidence[0].source, None);
+        assert_eq!(evidence[0].grade, EvidenceGrade::Inferred);
+        assert_eq!(evidence[0].stance, Stance::Contradicts);
+        assert_eq!(evidence[0].note, "Legacy \"evidence\"\nparses");
+
+        let summary = store.latest_verdict_for(&hypothesis_id).unwrap().unwrap();
+        assert_eq!(summary.tag, VerdictTag::InconclusiveFundamental);
+        assert_eq!(summary.confidence, Confidence::Medium);
+        assert_eq!(summary.frontier.as_deref(), Some("external replication"));
+
+        let parsed_link: EvidenceLink = serde_json::from_str(
+            r#"{
+                "created_at": 7,
+                "note": "Legacy domain link",
+                "stance": "supports",
+                "grade": "observed",
+                "source": "manual",
+                "observation_id": null,
+                "hypothesis_id": "hypothesis_legacy",
+                "id": "event_legacy"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(parsed_link.id, "event_legacy");
+        assert_eq!(parsed_link.grade, EvidenceGrade::Observed);
+        assert_eq!(parsed_link.source.as_deref(), Some("manual"));
+
+        assert_eq!(
+            Verdict::from_json(
+                r#"{
+                    "missing": ["observed support", "replication"],
+                    "inconclusive_kind": "provisional",
+                    "verdict": "inconclusive"
+                }"#
+            )
+            .unwrap(),
+            Verdict::Inconclusive(InconclusiveKind::Provisional {
+                missing: vec!["observed support".to_string(), "replication".to_string()],
+            })
+        );
+
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]

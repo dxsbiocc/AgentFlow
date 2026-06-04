@@ -1,3 +1,9 @@
+use std::fmt;
+
+use serde::de::{self, MapAccess, Visitor};
+use serde::ser::{SerializeMap, SerializeStruct};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 use crate::argument::VerdictTag;
 use crate::graph_patch::GraphPatchRecord;
 use crate::hypothesis::{Confidence, HypothesisStatus};
@@ -8,7 +14,8 @@ const DEEPEN_SCORE: i32 = 30;
 const ABANDON_SCORE: i32 = 10;
 const HOLD_SCORE: i32 = 0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CandidateKind {
     Deepen,
     Spawn,
@@ -16,7 +23,7 @@ pub enum CandidateKind {
     Hold,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchCandidate {
     pub hypothesis_id: String,
     pub statement: String,
@@ -32,7 +39,8 @@ pub struct BranchPolicy {
     pub explore_enabled: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SelectionMode {
     Exploit,
     Explore,
@@ -55,7 +63,79 @@ pub enum BranchAction {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Serialize for BranchAction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Deepen { reason } => {
+                let mut state = serializer.serialize_struct("BranchAction", 2)?;
+                state.serialize_field("kind", "deepen")?;
+                state.serialize_field("reason", reason)?;
+                state.end()
+            }
+            Self::Spawn { reason } => {
+                let mut state = serializer.serialize_struct("BranchAction", 2)?;
+                state.serialize_field("kind", "spawn")?;
+                state.serialize_field("reason", reason)?;
+                state.end()
+            }
+            Self::Abandon {
+                reason,
+                recommend_status,
+            } => {
+                let mut state = serializer.serialize_struct("BranchAction", 3)?;
+                state.serialize_field("kind", "abandon")?;
+                state.serialize_field("reason", reason)?;
+                state.serialize_field("recommend_status", recommend_status)?;
+                state.end()
+            }
+            Self::Hold { reason } => {
+                let mut state = serializer.serialize_struct("BranchAction", 2)?;
+                state.serialize_field("kind", "hold")?;
+                state.serialize_field("reason", reason)?;
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BranchAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let payload = BranchActionPayload::deserialize(deserializer)?;
+        match payload.kind.as_str() {
+            "deepen" => Ok(Self::Deepen {
+                reason: payload.reason,
+            }),
+            "spawn" => Ok(Self::Spawn {
+                reason: payload.reason,
+            }),
+            "abandon" => Ok(Self::Abandon {
+                reason: payload.reason,
+                recommend_status: payload.recommend_status.ok_or_else(|| {
+                    de::Error::custom("abandon branch action missing recommend_status")
+                })?,
+            }),
+            "hold" => Ok(Self::Hold {
+                reason: payload.reason,
+            }),
+            other => Err(de::Error::custom(format!("invalid branch action {other}"))),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BranchActionPayload {
+    kind: String,
+    reason: String,
+    recommend_status: Option<HypothesisStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchDecision {
     pub candidate: BranchCandidate,
     pub action: BranchAction,
@@ -64,41 +144,13 @@ pub struct BranchDecision {
 
 impl BranchCandidate {
     pub fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{",
-                "\"hypothesis_id\":\"{}\",",
-                "\"statement\":\"{}\",",
-                "\"verdict\":{},",
-                "\"confidence\":{},",
-                "\"kind\":\"{}\",",
-                "\"evidence_count\":{},",
-                "\"score\":{}",
-                "}}"
-            ),
-            escape_json(&self.hypothesis_id),
-            escape_json(&self.statement),
-            self.verdict
-                .map(|verdict| format!("\"{}\"", verdict.as_str()))
-                .unwrap_or_else(|| "null".to_string()),
-            self.confidence
-                .map(|confidence| format!("\"{}\"", confidence.as_str()))
-                .unwrap_or_else(|| "null".to_string()),
-            candidate_kind_as_str(self.kind),
-            self.evidence_count,
-            self.score
-        )
+        serde_json::to_string(self).expect("branch candidate serializes to JSON")
     }
 }
 
 impl BranchDecision {
     pub fn to_json(&self) -> String {
-        format!(
-            "{{\"candidate\":{},\"action\":{},\"selected_by\":\"{}\"}}",
-            self.candidate.to_json(),
-            branch_action_json(&self.action),
-            selection_mode_as_str(self.selected_by)
-        )
+        serde_json::to_string(self).expect("branch decision serializes to JSON")
     }
 }
 
@@ -129,6 +181,53 @@ pub struct ProposedStep {
     pub inputs: Vec<(String, String)>,
     pub params: Vec<(String, String)>,
     pub outputs: Vec<(String, String)>,
+}
+
+impl Serialize for ProposedStep {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("ProposedStep", 6)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("tool", &self.tool)?;
+        state.serialize_field("needs", &self.needs)?;
+        state.serialize_field("inputs", &PairObject(self.inputs.clone()))?;
+        state.serialize_field("params", &PairObject(self.params.clone()))?;
+        state.serialize_field("outputs", &PairObject(self.outputs.clone()))?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ProposedStep {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let payload = ProposedStepPayload::deserialize(deserializer)?;
+        Ok(Self {
+            id: payload.id,
+            tool: payload.tool,
+            needs: payload.needs,
+            inputs: payload.inputs.0,
+            params: payload.params.0,
+            outputs: payload.outputs.0,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ProposedStepPayload {
+    id: String,
+    tool: String,
+    #[serde(default)]
+    needs: Vec<String>,
+    #[serde(default)]
+    inputs: PairObject,
+    #[serde(default)]
+    params: PairObject,
+    #[serde(default)]
+    outputs: PairObject,
 }
 
 impl ProjectStore {
@@ -304,55 +403,6 @@ fn action_reason(action: &BranchAction) -> &str {
     }
 }
 
-fn candidate_kind_as_str(kind: CandidateKind) -> &'static str {
-    match kind {
-        CandidateKind::Deepen => "deepen",
-        CandidateKind::Spawn => "spawn",
-        CandidateKind::Abandon => "abandon",
-        CandidateKind::Hold => "hold",
-    }
-}
-
-fn selection_mode_as_str(mode: SelectionMode) -> &'static str {
-    match mode {
-        SelectionMode::Exploit => "exploit",
-        SelectionMode::Explore => "explore",
-    }
-}
-
-fn branch_action_json(action: &BranchAction) -> String {
-    match action {
-        BranchAction::Deepen { reason } => format!(
-            "{{\"kind\":\"deepen\",\"reason\":\"{}\"}}",
-            escape_json(reason)
-        ),
-        BranchAction::Spawn { reason } => format!(
-            "{{\"kind\":\"spawn\",\"reason\":\"{}\"}}",
-            escape_json(reason)
-        ),
-        BranchAction::Abandon {
-            reason,
-            recommend_status,
-        } => format!(
-            concat!(
-                "{{",
-                "\"kind\":\"abandon\",",
-                "\"reason\":\"{}\",",
-                "\"recommend_status\":\"{}\"",
-                "}}"
-            ),
-            escape_json(reason),
-            recommend_status.as_str()
-        ),
-        BranchAction::Hold { reason } => {
-            format!(
-                "{{\"kind\":\"hold\",\"reason\":\"{}\"}}",
-                escape_json(reason)
-            )
-        }
-    }
-}
-
 fn validate_proposed_step(step: &ProposedStep) -> Result<(), StorageError> {
     validate_non_empty("branch step id", &step.id)?;
     validate_non_empty("branch step tool", &step.tool)?;
@@ -384,65 +434,94 @@ fn validate_non_empty(label: &str, value: &str) -> Result<(), StorageError> {
 }
 
 fn patch_json_for(step: &ProposedStep) -> String {
-    format!(
-        concat!(
-            "{{\"ops\":[{{",
-            "\"op\":\"add_step\",",
-            "\"id\":\"{}\",",
-            "\"tool\":\"{}\",",
-            "\"needs\":{},",
-            "\"inputs\":{},",
-            "\"params\":{},",
-            "\"outputs\":{}",
-            "}}]}}"
-        ),
-        escape_json(step.id.trim()),
-        escape_json(step.tool.trim()),
-        string_array_json(&step.needs),
-        pairs_json(&step.inputs),
-        pairs_json(&step.params),
-        pairs_json(&step.outputs)
-    )
+    serde_json::to_string(&GraphPatchPayload {
+        ops: vec![AddStepOpPayload {
+            op: "add_step",
+            id: step.id.trim().to_string(),
+            tool: step.tool.trim().to_string(),
+            needs: trimmed_strings(&step.needs),
+            inputs: PairObject(trimmed_pairs(&step.inputs)),
+            params: PairObject(trimmed_pairs(&step.params)),
+            outputs: PairObject(trimmed_pairs(&step.outputs)),
+        }],
+    })
+    .expect("branch patch payload serializes to JSON")
 }
 
-fn string_array_json(values: &[String]) -> String {
-    let items = values
-        .iter()
-        .map(|value| format!("\"{}\"", escape_json(value.trim())))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{items}]")
+#[derive(Debug, Serialize)]
+struct GraphPatchPayload {
+    ops: Vec<AddStepOpPayload>,
 }
 
-fn pairs_json(pairs: &[(String, String)]) -> String {
-    let fields = pairs
-        .iter()
-        .map(|(key, value)| {
-            format!(
-                "\"{}\":\"{}\"",
-                escape_json(key.trim()),
-                escape_json(value.trim())
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{fields}}}")
+#[derive(Debug, Serialize)]
+struct AddStepOpPayload {
+    op: &'static str,
+    id: String,
+    tool: String,
+    needs: Vec<String>,
+    inputs: PairObject,
+    params: PairObject,
+    outputs: PairObject,
 }
 
-fn escape_json(input: &str) -> String {
-    let mut output = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => output.push(ch),
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PairObject(Vec<(String, String)>);
+
+impl Serialize for PairObject {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in &self.0 {
+            map.serialize_entry(key, value)?;
         }
+        map.end()
     }
-    output
+}
+
+impl<'de> Deserialize<'de> for PairObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(PairObjectVisitor)
+    }
+}
+
+struct PairObjectVisitor;
+
+impl<'de> Visitor<'de> for PairObjectVisitor {
+    type Value = PairObject;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object with string keys and string values")
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut pairs = Vec::with_capacity(access.size_hint().unwrap_or(0));
+        while let Some((key, value)) = access.next_entry::<String, String>()? {
+            pairs.push((key, value));
+        }
+        Ok(PairObject(pairs))
+    }
+}
+
+fn trimmed_strings(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim().to_string())
+        .collect()
+}
+
+fn trimmed_pairs(pairs: &[(String, String)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -594,6 +673,124 @@ mod tests {
             params: vec![("gene".to_string(), "TP53".to_string())],
             outputs: vec![("report".to_string(), "branch_report".to_string())],
         }
+    }
+
+    #[test]
+    fn json_outputs_match_legacy_bytes() {
+        let candidate = BranchCandidate {
+            hypothesis_id: "hypothesis_1".to_string(),
+            statement: "Quote \" and newline\nslash \\ tab\t".to_string(),
+            verdict: Some(crate::argument::VerdictTag::InconclusiveProvisional),
+            confidence: Some(Confidence::Medium),
+            kind: CandidateKind::Deepen,
+            evidence_count: 2,
+            score: 33,
+        };
+        assert_eq!(
+            candidate.to_json(),
+            "{\"hypothesis_id\":\"hypothesis_1\",\"statement\":\"Quote \\\" and newline\\nslash \\\\ tab\\t\",\"verdict\":\"inconclusive_provisional\",\"confidence\":\"medium\",\"kind\":\"deepen\",\"evidence_count\":2,\"score\":33}"
+        );
+
+        let hold = BranchCandidate {
+            hypothesis_id: "hypothesis_2".to_string(),
+            statement: "Waiting".to_string(),
+            verdict: None,
+            confidence: None,
+            kind: CandidateKind::Hold,
+            evidence_count: 0,
+            score: 0,
+        };
+        assert_eq!(
+            hold.to_json(),
+            "{\"hypothesis_id\":\"hypothesis_2\",\"statement\":\"Waiting\",\"verdict\":null,\"confidence\":null,\"kind\":\"hold\",\"evidence_count\":0,\"score\":0}"
+        );
+
+        let decision = super::BranchDecision {
+            candidate,
+            action: BranchAction::Abandon {
+                reason: "Quote \" and newline\n".to_string(),
+                recommend_status: crate::hypothesis::HypothesisStatus::Superseded,
+            },
+            selected_by: SelectionMode::Explore,
+        };
+        assert_eq!(
+            decision.to_json(),
+            "{\"candidate\":{\"hypothesis_id\":\"hypothesis_1\",\"statement\":\"Quote \\\" and newline\\nslash \\\\ tab\\t\",\"verdict\":\"inconclusive_provisional\",\"confidence\":\"medium\",\"kind\":\"deepen\",\"evidence_count\":2,\"score\":33},\"action\":{\"kind\":\"abandon\",\"reason\":\"Quote \\\" and newline\\n\",\"recommend_status\":\"superseded\"},\"selected_by\":\"explore\"}"
+        );
+
+        assert_eq!(
+            super::patch_json_for(&ProposedStep {
+                id: " step \"scan\" ".to_string(),
+                tool: " local/scan ".to_string(),
+                needs: vec![" input_step ".to_string()],
+                inputs: vec![(" table ".to_string(), " artifact_1 ".to_string())],
+                params: vec![(" gene ".to_string(), " TP53 ".to_string())],
+                outputs: vec![(" report ".to_string(), " branch_report ".to_string())],
+            }),
+            "{\"ops\":[{\"op\":\"add_step\",\"id\":\"step \\\"scan\\\"\",\"tool\":\"local/scan\",\"needs\":[\"input_step\"],\"inputs\":{\"table\":\"artifact_1\"},\"params\":{\"gene\":\"TP53\"},\"outputs\":{\"report\":\"branch_report\"}}]}"
+        );
+    }
+
+    #[test]
+    fn legacy_handwritten_payloads_parse_with_json_whitespace_and_ordering() {
+        let decision: super::BranchDecision = serde_json::from_str(
+            r#"{
+                "selected_by": "explore",
+                "action": {
+                    "recommend_status": "contradicted",
+                    "reason": "Legacy branch action",
+                    "kind": "abandon"
+                },
+                "candidate": {
+                    "score": 13,
+                    "evidence_count": 2,
+                    "kind": "abandon",
+                    "confidence": "medium",
+                    "verdict": "refuted",
+                    "statement": "Legacy branch candidate",
+                    "hypothesis_id": "hypothesis_legacy"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(decision.candidate.hypothesis_id, "hypothesis_legacy");
+        assert_eq!(
+            decision.candidate.verdict,
+            Some(crate::argument::VerdictTag::Refuted)
+        );
+        assert_eq!(decision.candidate.confidence, Some(Confidence::Medium));
+        assert_eq!(decision.candidate.kind, CandidateKind::Abandon);
+        assert_eq!(decision.selected_by, SelectionMode::Explore);
+        assert!(matches!(
+            decision.action,
+            BranchAction::Abandon {
+                recommend_status: crate::hypothesis::HypothesisStatus::Contradicted,
+                ..
+            }
+        ));
+
+        let step: ProposedStep = serde_json::from_str(
+            r#"{
+                "outputs": {"report": "branch_report"},
+                "params": {"gene": "TP53"},
+                "inputs": {"table": "artifact_1"},
+                "needs": ["producer_step"],
+                "tool": "local/scan",
+                "id": "branch_scan"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(step.id, "branch_scan");
+        assert_eq!(
+            step.inputs,
+            vec![("table".to_string(), "artifact_1".to_string())]
+        );
+        assert_eq!(step.params, vec![("gene".to_string(), "TP53".to_string())]);
+        assert_eq!(
+            step.outputs,
+            vec![("report".to_string(), "branch_report".to_string())]
+        );
     }
 
     #[test]

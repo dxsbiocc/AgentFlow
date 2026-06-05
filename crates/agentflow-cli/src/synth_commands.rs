@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -16,15 +17,31 @@ use crate::{last_value, CliError};
 pub(crate) const DEFAULT_SYNTHESIZER: &str = "claude -p";
 const SYNTH_VERSION: &str = "0.1.0";
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(60);
+const CBIOPORTAL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+const CBIOPORTAL_API_BASE: &str = "https://www.cbioportal.org/api";
 const MAX_AUTO_SYNTH_ATTEMPTS: usize = 3;
 const VALIDATION_PATH: &str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
 const PRIMARY_VALIDATION_GENE: &str = "TP53";
 const ALTERNATE_VALIDATION_GENE: &str = "EGFR";
+const CBIOPORTAL_DISCOVERY_FETCH_PY: &str = r#"import json
+import sys
+import urllib.request
+
+url = sys.argv[1]
+timeout = float(sys.argv[2])
+request = urllib.request.Request(url, headers={"Accept": "application/json"})
+with urllib.request.urlopen(request, timeout=timeout) as response:
+    body = response.read().decode("utf-8")
+json.loads(body)
+print(body, end="" if body.endswith("\n") else "\n")
+"#;
 const DEFAULT_SYNTH_DOMAIN_PARAMS: &[SynthDomainParam] = &[SynthDomainParam {
     name: "gene",
     type_name: "string",
     required: true,
 }];
+
+type JsonObject = HashMap<String, String>;
 
 #[derive(Debug, Clone, Copy)]
 struct SynthDomainParam {
@@ -177,7 +194,9 @@ pub(crate) fn auto_synthesize_agent_tool(
     capability_need: &str,
     representative_gene: Option<&str>,
 ) -> Result<AutoSynthToolResult, CliError> {
-    let base_prompt = build_auto_synth_prompt(hypothesis_statement, capability_need);
+    let grounding = discover_cbioportal_grounding(hypothesis_statement);
+    let base_prompt =
+        build_auto_synth_prompt(hypothesis_statement, capability_need, grounding.as_deref());
     let runtime_gene = representative_gene
         .map(str::trim)
         .filter(|gene| !gene.is_empty())
@@ -347,10 +366,478 @@ fn build_synth_prompt(description: &str) -> String {
     )
 }
 
-fn build_auto_synth_prompt(hypothesis_statement: &str, capability_need: &str) -> String {
+pub(crate) fn discover_cbioportal_grounding(hypothesis_statement: &str) -> Option<String> {
+    discover_cbioportal_grounding_with_fetcher(hypothesis_statement, CBIOPORTAL_API_BASE, |url| {
+        fetch_cbioportal_json_with_python(url, CBIOPORTAL_DISCOVERY_TIMEOUT)
+    })
+}
+
+fn discover_cbioportal_grounding_with_fetcher<F>(
+    hypothesis_statement: &str,
+    api_base: &str,
+    mut fetch_json: F,
+) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let cancer_terms = cancer_terms_for_hypothesis(hypothesis_statement);
+    if cancer_terms.is_empty() {
+        return None;
+    }
+
+    let api_base = api_base.trim_end_matches('/');
+    let studies = parse_json_string_objects(&fetch_json(&format!("{api_base}/studies"))?);
+    let study_id = choose_cbioportal_study(&studies, &cancer_terms)?;
+    let encoded_study_id = url_path_component(&study_id);
+    let profiles = parse_json_string_objects(&fetch_json(&format!(
+        "{api_base}/studies/{encoded_study_id}/molecular-profiles"
+    ))?);
+    let mrna_profile_id = choose_cbioportal_mrna_profile(&profiles)?;
+    let sample_lists = parse_json_string_objects(&fetch_json(&format!(
+        "{api_base}/studies/{encoded_study_id}/sample-lists"
+    ))?);
+    let sample_list_id = choose_cbioportal_sample_list(&sample_lists, &study_id)?;
+
+    Some(format!(
+        "Discovered real cBioPortal identifiers: studyId={study_id}, mrnaMolecularProfileId={mrna_profile_id}, sampleListId={sample_list_id}, api_base={api_base}. Use these EXACT identifiers; do not guess."
+    ))
+}
+
+fn cancer_terms_for_hypothesis(statement: &str) -> Vec<&'static str> {
+    const CANCER_TERM_GROUPS: &[(&[&str], &[&str])] = &[
+        (
+            &["liver", "hepatocellular", "hcc", "lihc"],
+            &["lihc", "hepatocellular", "liver", "hcc"],
+        ),
+        (&["breast", "brca"], &["brca", "breast"]),
+        (
+            &["lung", "luad", "lusc", "nsclc"],
+            &["luad", "lusc", "lung", "nsclc"],
+        ),
+        (
+            &["colon", "colorectal", "coad", "read"],
+            &["coad", "read", "colorectal", "colon"],
+        ),
+        (&["prostate", "prad"], &["prad", "prostate"]),
+        (&["ovarian", "ovary", "ov"], &["ov", "ovarian"]),
+        (&["melanoma", "skcm"], &["skcm", "melanoma"]),
+        (&["pancreatic", "pancreas", "paad"], &["paad", "pancreatic"]),
+        (&["glioblastoma", "gbm"], &["gbm", "glioblastoma"]),
+        (
+            &["kidney", "renal", "kirc", "kirp"],
+            &["kirc", "kirp", "kidney", "renal"],
+        ),
+        (
+            &["gastric", "stomach", "stad"],
+            &["stad", "gastric", "stomach"],
+        ),
+        (&["bladder", "blca"], &["blca", "bladder"]),
+        (
+            &["endometrial", "uterine", "ucec"],
+            &["ucec", "endometrial", "uterine"],
+        ),
+        (&["head and neck", "hnsc"], &["hnsc", "head and neck"]),
+        (&["thyroid", "thca"], &["thca", "thyroid"]),
+        (&["leukemia", "aml", "laml"], &["laml", "aml", "leukemia"]),
+    ];
+
+    let lower = statement.to_ascii_lowercase();
+    let mut terms = Vec::new();
+    for (needles, group_terms) in CANCER_TERM_GROUPS {
+        if needles
+            .iter()
+            .any(|needle| contains_domain_term(&lower, needle))
+        {
+            for term in *group_terms {
+                if !terms.contains(term) {
+                    terms.push(*term);
+                }
+            }
+        }
+    }
+    terms
+}
+
+fn choose_cbioportal_study(studies: &[JsonObject], cancer_terms: &[&str]) -> Option<String> {
+    studies
+        .iter()
+        .filter_map(|study| {
+            let study_id = json_field(study, "studyId")?;
+            let score = score_cbioportal_study(study, cancer_terms)?;
+            Some((study_id.to_string(), score))
+        })
+        .max_by_key(|(_, score)| *score)
+        .map(|(study_id, _)| study_id)
+}
+
+fn score_cbioportal_study(study: &JsonObject, cancer_terms: &[&str]) -> Option<i32> {
+    let study_id = json_field(study, "studyId")?.to_ascii_lowercase();
+    let cancer_type = json_field(study, "cancerTypeId")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let name = json_field(study, "name")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let description = json_field(study, "description")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let haystack = format!("{study_id} {cancer_type} {name} {description}");
+    let mut score = 0;
+    let mut matched_cancer = false;
+
+    for term in cancer_terms {
+        if contains_domain_term(&study_id, term) || contains_domain_term(&cancer_type, term) {
+            score += 45;
+            matched_cancer = true;
+        } else if contains_domain_term(&haystack, term) {
+            score += 20;
+            matched_cancer = true;
+        }
+    }
+    if !matched_cancer {
+        return None;
+    }
+    if study_id.contains("pan_can_atlas") || name.contains("pancancer atlas") {
+        score += 80;
+    }
+    if study_id.contains("tcga") {
+        score += 25;
+    }
+    if study_id.contains("2018") {
+        score += 5;
+    }
+    if study_id.contains("cell_line") || study_id.contains("ccle") {
+        score -= 30;
+    }
+    Some(score)
+}
+
+fn choose_cbioportal_mrna_profile(profiles: &[JsonObject]) -> Option<String> {
+    profiles
+        .iter()
+        .filter_map(|profile| {
+            let profile_id = json_field(profile, "molecularProfileId")?;
+            let score = score_cbioportal_mrna_profile(profile)?;
+            Some((profile_id.to_string(), score))
+        })
+        .max_by_key(|(_, score)| *score)
+        .map(|(profile_id, _)| profile_id)
+}
+
+fn score_cbioportal_mrna_profile(profile: &JsonObject) -> Option<i32> {
+    let profile_id = json_field(profile, "molecularProfileId")?.to_ascii_lowercase();
+    let alteration_type = json_field(profile, "molecularAlterationType")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let datatype = json_field(profile, "datatype")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let name = json_field(profile, "name")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let description = json_field(profile, "description")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let haystack = format!("{profile_id} {alteration_type} {datatype} {name} {description}");
+    let mut score = 0;
+
+    if alteration_type == "mrna_expression" {
+        score += 100;
+    }
+    if haystack.contains("mrna") {
+        score += 35;
+    }
+    if haystack.contains("rna_seq") || haystack.contains("rna seq") {
+        score += 30;
+    }
+    if haystack.contains("expression") {
+        score += 20;
+    }
+    if datatype == "continuous" {
+        score += 20;
+    }
+    if profile_id.contains("rna_seq_v2_mrna") {
+        score += 70;
+    }
+    if profile_id.ends_with("_mrna") {
+        score += 20;
+    }
+    if haystack.contains("zscore") || haystack.contains("z-score") {
+        score -= 25;
+    }
+    if score <= 0 {
+        return None;
+    }
+    Some(score)
+}
+
+fn choose_cbioportal_sample_list(sample_lists: &[JsonObject], study_id: &str) -> Option<String> {
+    sample_lists
+        .iter()
+        .filter_map(|sample_list| {
+            let sample_list_id = json_field(sample_list, "sampleListId")?;
+            let score = score_cbioportal_sample_list(sample_list, study_id)?;
+            Some((sample_list_id.to_string(), score))
+        })
+        .max_by_key(|(_, score)| *score)
+        .map(|(sample_list_id, _)| sample_list_id)
+}
+
+fn score_cbioportal_sample_list(sample_list: &JsonObject, study_id: &str) -> Option<i32> {
+    let sample_list_id = json_field(sample_list, "sampleListId")?.to_ascii_lowercase();
+    let category = json_field(sample_list, "category")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let name = json_field(sample_list, "name")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let description = json_field(sample_list, "description")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let haystack = format!("{sample_list_id} {category} {name} {description}");
+    let mut score = 0;
+    let all_id = format!("{}_all", study_id.to_ascii_lowercase());
+
+    if sample_list_id == all_id {
+        score += 120;
+    }
+    if sample_list_id.ends_with("_all") {
+        score += 80;
+    }
+    if category.contains("all_cases") || haystack.contains("all samples") {
+        score += 45;
+    }
+    if sample_list_id.contains("sequenced") {
+        score += 15;
+    }
+    if score <= 0 {
+        return None;
+    }
+    Some(score)
+}
+
+fn fetch_cbioportal_json_with_python(url: &str, timeout: Duration) -> Option<String> {
+    let mut command = Command::new("/usr/bin/env");
+    command
+        .arg("python3")
+        .arg("-c")
+        .arg(CBIOPORTAL_DISCOVERY_FETCH_PY)
+        .arg(url)
+        .arg(timeout.as_secs_f64().to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_child_process_group(&mut command);
+    let mut child = command.spawn().ok()?;
+    let started = SystemTime::now();
+
+    loop {
+        if child.try_wait().ok()?.is_some() {
+            let output = child.wait_with_output().ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            return (!stdout.trim().is_empty()).then_some(stdout);
+        }
+
+        if started.elapsed().unwrap_or_default() >= timeout {
+            kill_child_process_group(&mut child);
+            let _ = child.wait();
+            return None;
+        }
+
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn parse_json_string_objects(json: &str) -> Vec<JsonObject> {
+    let mut objects = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut object_start = 0usize;
+
+    for (index, ch) in json.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    object_start = index;
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let object = parse_json_object_string_fields(&json[object_start..=index]);
+                    if !object.is_empty() {
+                        objects.push(object);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    objects
+}
+
+fn parse_json_object_string_fields(object: &str) -> JsonObject {
+    let mut fields = JsonObject::new();
+    let mut cursor = 0usize;
+
+    while let Some(relative_start) = object[cursor..].find('"') {
+        let key_start = cursor + relative_start;
+        let Some((key, after_key)) = parse_json_string_at(object, key_start) else {
+            break;
+        };
+        let colon = skip_json_whitespace(object, after_key);
+        if !object[colon..].starts_with(':') {
+            cursor = after_key;
+            continue;
+        }
+        let value_start = skip_json_whitespace(object, colon + 1);
+        if !object[value_start..].starts_with('"') {
+            cursor = value_start;
+            continue;
+        }
+        let Some((value, after_value)) = parse_json_string_at(object, value_start) else {
+            break;
+        };
+        fields.insert(key, value);
+        cursor = after_value;
+    }
+
+    fields
+}
+
+fn parse_json_string_at(value: &str, start: usize) -> Option<(String, usize)> {
+    if !value[start..].starts_with('"') {
+        return None;
+    }
+    let mut output = String::new();
+    let mut chars = value[start + 1..].char_indices().peekable();
+
+    while let Some((offset, ch)) = chars.next() {
+        let absolute_index = start + 1 + offset;
+        match ch {
+            '"' => return Some((output, absolute_index + ch.len_utf8())),
+            '\\' => {
+                let (_, escaped) = chars.next()?;
+                match escaped {
+                    '"' => output.push('"'),
+                    '\\' => output.push('\\'),
+                    '/' => output.push('/'),
+                    'b' => output.push('\u{0008}'),
+                    'f' => output.push('\u{000c}'),
+                    'n' => output.push('\n'),
+                    'r' => output.push('\r'),
+                    't' => output.push('\t'),
+                    'u' => {
+                        let mut hex = String::new();
+                        for _ in 0..4 {
+                            let (_, digit) = chars.next()?;
+                            hex.push(digit);
+                        }
+                        let codepoint = u32::from_str_radix(&hex, 16).ok()?;
+                        output.push(char::from_u32(codepoint)?);
+                    }
+                    other => output.push(other),
+                }
+            }
+            other => output.push(other),
+        }
+    }
+
+    None
+}
+
+fn skip_json_whitespace(value: &str, start: usize) -> usize {
+    value[start..]
+        .char_indices()
+        .find_map(|(offset, ch)| (!ch.is_whitespace()).then_some(start + offset))
+        .unwrap_or(value.len())
+}
+
+fn json_field<'a>(object: &'a JsonObject, key: &str) -> Option<&'a str> {
+    object
+        .get(key)
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn contains_domain_term(haystack: &str, term: &str) -> bool {
+    if term.chars().all(|ch| ch.is_ascii_alphanumeric()) && term.len() <= 4 {
+        contains_ascii_word(haystack, term)
+    } else {
+        haystack.contains(term)
+    }
+}
+
+fn contains_ascii_word(haystack: &str, needle: &str) -> bool {
+    let mut search_start = 0usize;
+    while let Some(relative_index) = haystack[search_start..].find(needle) {
+        let start = search_start + relative_index;
+        let end = start + needle.len();
+        let before = haystack[..start].chars().next_back();
+        let after = haystack[end..].chars().next();
+        let before_boundary = before.is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        let after_boundary = after.is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        if before_boundary && after_boundary {
+            return true;
+        }
+        search_start = end;
+    }
+    false
+}
+
+fn url_path_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn build_auto_synth_prompt(
+    hypothesis_statement: &str,
+    capability_need: &str,
+    grounding: Option<&str>,
+) -> String {
+    let grounding_section = grounding
+        .map(str::trim)
+        .filter(|block| !block.is_empty())
+        .map(|block| {
+            format!(
+                concat!(
+                    "\nIMPORTANT LIVE API GROUNDING (queried immediately before synthesis):\n",
+                    "{}\n",
+                    "When using cBioPortal, use the exact studyId, mRNA molecular profile id, sample list id, and api_base above. ",
+                    "Do not substitute remembered identifiers.\n\n"
+                ),
+                block
+            )
+        })
+        .unwrap_or_default();
     format!(
         concat!(
             "You are writing an AgentFlow exploratory analysis tool. Use only Python 3 standard library.\n",
+            "{}",
             "The generated tool spec will declare a required domain parameter named gene, so runtime receives AGENTFLOW_PARAM_GENE.\n",
             "The tool must support two modes with the same calculation logic:\n",
             "1. Runtime mode: when SYNTH_INPUT is unset, read domain parameters from AGENTFLOW_PARAM_<UPPER_NAME>, especially AGENTFLOW_PARAM_GENE.\n",
@@ -385,6 +872,7 @@ fn build_auto_synth_prompt(hypothesis_statement: &str, capability_need: &str) ->
             "===EXPECT===\n",
             "<one substring that must appear in stdout and AGENTFLOW_OUTPUT_RESULT>\n"
         ),
+        grounding_section,
         hypothesis_statement,
         capability_need
     )
@@ -1839,6 +2327,7 @@ steps:
         let prompt = build_auto_synth_prompt(
             "MID1IP1 immunotherapy biomarker claim",
             "Need survival and immune-correlation evidence",
+            None,
         );
 
         assert!(prompt.contains("禁止硬编码"));
@@ -1851,6 +2340,134 @@ steps:
         assert!(prompt.contains("https://www.cbioportal.org/api"));
         assert!(prompt.contains("SYNTH_INPUT"));
         assert!(prompt.contains("tcga_survival_assoc.py"));
+    }
+
+    #[test]
+    fn cbioportal_grounding_discovers_liver_pan_can_atlas_identifiers() {
+        let grounding = discover_cbioportal_grounding_with_fetcher(
+            "High THRSP expression is protective in hepatocellular carcinoma",
+            CBIOPORTAL_API_BASE,
+            |url| match url {
+                "https://www.cbioportal.org/api/studies" => Some(
+                    r#"[
+                      {"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Cancer (TCGA, PanCancer Atlas)","description":"Breast carcinoma","cancerTypeId":"brca"},
+                      {"studyId":"lihc_tcga","name":"Liver Hepatocellular Carcinoma (TCGA, Firehose Legacy)","description":"LIHC legacy cohort","cancerTypeId":"lihc"},
+                      {"studyId":"lihc_tcga_pan_can_atlas_2018","name":"Liver Hepatocellular Carcinoma (TCGA, PanCancer Atlas)","description":"Hepatocellular carcinoma","cancerTypeId":"lihc"}
+                    ]"#
+                    .to_string(),
+                ),
+                "https://www.cbioportal.org/api/studies/lihc_tcga_pan_can_atlas_2018/molecular-profiles" => Some(
+                    r#"[
+                      {"molecularProfileId":"lihc_tcga_pan_can_atlas_2018_mutations","molecularAlterationType":"MUTATION_EXTENDED","datatype":"MAF","name":"Mutations"},
+                      {"molecularProfileId":"lihc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","molecularAlterationType":"MRNA_EXPRESSION","datatype":"CONTINUOUS","name":"mRNA expression (RNA Seq V2 RSEM)"}
+                    ]"#
+                    .to_string(),
+                ),
+                "https://www.cbioportal.org/api/studies/lihc_tcga_pan_can_atlas_2018/sample-lists" => Some(
+                    r#"[
+                      {"sampleListId":"lihc_tcga_pan_can_atlas_2018_sequenced","category":"all_cases_with_mutation_and_cna_data","name":"Sequenced tumors"},
+                      {"sampleListId":"lihc_tcga_pan_can_atlas_2018_all","category":"all_cases_in_study","name":"All samples"}
+                    ]"#
+                    .to_string(),
+                ),
+                _ => None,
+            },
+        )
+        .expect("stubbed cBioPortal endpoints should ground LIHC");
+
+        assert_eq!(
+            grounding,
+            "Discovered real cBioPortal identifiers: studyId=lihc_tcga_pan_can_atlas_2018, mrnaMolecularProfileId=lihc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna, sampleListId=lihc_tcga_pan_can_atlas_2018_all, api_base=https://www.cbioportal.org/api. Use these EXACT identifiers; do not guess."
+        );
+    }
+
+    #[test]
+    fn cbioportal_grounding_returns_none_on_failure_or_no_match() {
+        let fetch_failure = discover_cbioportal_grounding_with_fetcher(
+            "High THRSP expression is protective in hepatocellular carcinoma",
+            CBIOPORTAL_API_BASE,
+            |_url| None,
+        );
+        assert!(fetch_failure.is_none());
+
+        let no_match = discover_cbioportal_grounding_with_fetcher(
+            "High THRSP expression is protective in hepatocellular carcinoma",
+            CBIOPORTAL_API_BASE,
+            |url| {
+                match url {
+                "https://www.cbioportal.org/api/studies" => Some(
+                    r#"[
+                      {"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Cancer (TCGA, PanCancer Atlas)","description":"Breast carcinoma","cancerTypeId":"brca"}
+                    ]"#
+                    .to_string(),
+                ),
+                _ => None,
+            }
+            },
+        );
+        assert!(no_match.is_none());
+    }
+
+    #[test]
+    fn auto_synth_prompt_injects_grounding_when_available() {
+        let grounding = discover_cbioportal_grounding_with_fetcher(
+            "High THRSP expression is protective in hepatocellular carcinoma",
+            CBIOPORTAL_API_BASE,
+            |url| {
+                match url {
+                "https://www.cbioportal.org/api/studies" => Some(
+                    r#"[
+                      {"studyId":"lihc_tcga_pan_can_atlas_2018","name":"Liver Hepatocellular Carcinoma (TCGA, PanCancer Atlas)","description":"Hepatocellular carcinoma","cancerTypeId":"lihc"}
+                    ]"#
+                    .to_string(),
+                ),
+                "https://www.cbioportal.org/api/studies/lihc_tcga_pan_can_atlas_2018/molecular-profiles" => Some(
+                    r#"[
+                      {"molecularProfileId":"lihc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna","molecularAlterationType":"MRNA_EXPRESSION","datatype":"CONTINUOUS","name":"mRNA expression"}
+                    ]"#
+                    .to_string(),
+                ),
+                "https://www.cbioportal.org/api/studies/lihc_tcga_pan_can_atlas_2018/sample-lists" => Some(
+                    r#"[
+                      {"sampleListId":"lihc_tcga_pan_can_atlas_2018_all","category":"all_cases_in_study","name":"All samples"}
+                    ]"#
+                    .to_string(),
+                ),
+                _ => None,
+            }
+            },
+        );
+        let prompt = build_auto_synth_prompt(
+            "High THRSP expression is protective in hepatocellular carcinoma",
+            "Need expression-survival association evidence",
+            grounding.as_deref(),
+        );
+
+        let grounding_pos = prompt
+            .find("Discovered real cBioPortal identifiers")
+            .expect("prompt should include discovered identifiers");
+        let hypothesis_pos = prompt
+            .find("Research hypothesis:")
+            .expect("prompt should include hypothesis marker");
+        assert!(grounding_pos < hypothesis_pos);
+        assert!(prompt.contains(
+            "studyId=lihc_tcga_pan_can_atlas_2018, mrnaMolecularProfileId=lihc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna, sampleListId=lihc_tcga_pan_can_atlas_2018_all"
+        ));
+        assert!(prompt.contains("Use these EXACT identifiers; do not guess."));
+    }
+
+    #[test]
+    fn auto_synth_prompt_without_grounding_keeps_few_shot_contract() {
+        let prompt = build_auto_synth_prompt(
+            "MID1IP1 immunotherapy biomarker claim",
+            "Need survival and immune-correlation evidence",
+            None,
+        );
+
+        assert!(!prompt.contains("Discovered real cBioPortal identifiers"));
+        assert!(prompt.contains("tcga_survival_assoc.py"));
+        assert!(prompt.contains("===SCRIPT==="));
+        assert!(prompt.contains("AGENTFLOW_PARAM_GENE"));
     }
 
     #[test]

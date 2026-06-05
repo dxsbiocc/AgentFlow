@@ -19,6 +19,7 @@ use crate::tool_select::{CapabilityQuery, Fit, ToolCandidate};
 
 const AGENT_CYCLE_COMPLETED_EVENT: &str = "agent.cycle_completed";
 const PARAMS_INFERRED_EVENT: &str = "agent.params_inferred";
+const TOOL_SYNTHESIZED_EVENT: &str = "agent.tool_synthesized";
 const TOOL_GAP_HYPOTHESIS_MARKER: &str = "hypothesis_id = ";
 const STANCE_ASSESSMENT_OBSERVATION_MARKER: &str = "observation_id = ";
 
@@ -112,6 +113,44 @@ impl RelevanceScorer for NoopRelevanceScorer {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct NoopToolSynthesizer;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolSynthesisOutcome {
+    Registered { tool_ref: String },
+    Rejected { reason: String },
+}
+
+impl ToolSynthesisOutcome {
+    pub fn registered(tool_ref: impl Into<String>) -> Self {
+        Self::Registered {
+            tool_ref: tool_ref.into(),
+        }
+    }
+
+    pub fn rejected(reason: impl Into<String>) -> Self {
+        Self::Rejected {
+            reason: reason.into(),
+        }
+    }
+}
+
+pub trait ToolSynthesizer {
+    fn synthesize(&self, hypothesis_statement: &str, capability_need: &str)
+        -> ToolSynthesisOutcome;
+}
+
+impl ToolSynthesizer for NoopToolSynthesizer {
+    fn synthesize(
+        &self,
+        _hypothesis_statement: &str,
+        _capability_need: &str,
+    ) -> ToolSynthesisOutcome {
+        ToolSynthesisOutcome::rejected("auto-synth unavailable")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppliedAction {
@@ -158,6 +197,8 @@ struct AppliedStepFinalization<'a> {
     step_id: &'a str,
     step: &'a ProposedStep,
     inferred_param_names: &'a [String],
+    auto_synth_tool_ref: Option<&'a str>,
+    capability_need: Option<&'a str>,
     auto_run: bool,
 }
 
@@ -238,6 +279,27 @@ impl ProjectStore {
         config: ApplyConfig,
         inferer: &dyn ParamInferer,
         scorer: &dyn RelevanceScorer,
+    ) -> Result<CycleReport, StorageError> {
+        self.run_cycle_inner(config, inferer, scorer, &NoopToolSynthesizer, false)
+    }
+
+    pub fn run_cycle_with_synth(
+        &self,
+        config: ApplyConfig,
+        inferer: &dyn ParamInferer,
+        scorer: &dyn RelevanceScorer,
+        synthesizer: &dyn ToolSynthesizer,
+    ) -> Result<CycleReport, StorageError> {
+        self.run_cycle_inner(config, inferer, scorer, synthesizer, true)
+    }
+
+    fn run_cycle_inner(
+        &self,
+        config: ApplyConfig,
+        inferer: &dyn ParamInferer,
+        scorer: &dyn RelevanceScorer,
+        synthesizer: &dyn ToolSynthesizer,
+        auto_synth: bool,
     ) -> Result<CycleReport, StorageError> {
         let checkpoint = self.create_checkpoint("agent_cycle")?;
         let engine = RuleBasedEngine;
@@ -330,13 +392,96 @@ impl ProjectStore {
                     raised_decisions.push(point);
                 }
                 BranchAction::Deepen { .. } | BranchAction::Spawn { .. } => {
-                    let (proposal, inferred_param_names) = self.enrich_branch_proposal(
+                    let (mut proposal, mut inferred_param_names) = self.enrich_branch_proposal(
                         decision,
                         &available_input_types,
                         &available,
                         inferer,
                         scorer,
                     )?;
+                    let mut auto_synth_tool_ref = None;
+                    let mut synthesized_capability_need = None;
+                    if auto_synth && auto_synth_gap(&proposal) {
+                        let flow_id = config.flow.clone().unwrap_or_else(|| {
+                            auto_flow_id(&proposal.decision.candidate.hypothesis_id)
+                        });
+                        let ctx = StepContext {
+                            cost: Cost::Moderate,
+                            reversible: true,
+                            equivalent_branches: self.has_equivalent_tool_branches(
+                                &proposal.decision,
+                                &available_input_types,
+                            )?,
+                            conflicts_user_premise: false,
+                            mutates_goal: false,
+                            near_budget: applied_budget_count(&applied) as u32 >= config.max_apply,
+                        };
+                        if let Some(kind) = policy.assess(&ctx) {
+                            let point = self.raise_decision_point(
+                                kind,
+                                &graph_patch_apply_digest(&proposal.decision, &flow_id),
+                                graph_patch_apply_options(
+                                    &proposal.decision.candidate.hypothesis_id,
+                                    &flow_id,
+                                ),
+                                0,
+                            )?;
+                            raised_decisions.push(point);
+                            proposal.drafted_step = None;
+                        } else {
+                            let capability_need = auto_synth_capability_need(&proposal);
+                            match synthesizer.synthesize(
+                                &proposal.decision.candidate.statement,
+                                &capability_need,
+                            ) {
+                                ToolSynthesisOutcome::Registered { tool_ref } => {
+                                    match self.draft_synthesized_step(
+                                        &tool_ref,
+                                        &proposal.decision,
+                                        &available,
+                                        inferer,
+                                    ) {
+                                        Ok((step, synthesized_inferred_params)) => {
+                                            proposal.matched_tool = Some(tool_ref.clone());
+                                            proposal.matched_fit = Some("synthesized".to_string());
+                                            proposal.match_reason = Some(
+                                                "auto_synth: fixture-smoked exploratory tool"
+                                                    .to_string(),
+                                            );
+                                            proposal.drafted_step = Some(step);
+                                            inferred_param_names = synthesized_inferred_params;
+                                            auto_synth_tool_ref = Some(tool_ref);
+                                            synthesized_capability_need = Some(capability_need);
+                                        }
+                                        Err(error) => {
+                                            proposal.drafted_step = None;
+                                            apply_failures.push(ApplyFailure {
+                                                hypothesis_id: proposal
+                                                    .decision
+                                                    .candidate
+                                                    .hypothesis_id
+                                                    .clone(),
+                                                reason: format!(
+                                                    "auto-synth registered tool but could not draft step: {error}"
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                                ToolSynthesisOutcome::Rejected { reason } => {
+                                    proposal.drafted_step = None;
+                                    apply_failures.push(ApplyFailure {
+                                        hypothesis_id: proposal
+                                            .decision
+                                            .candidate
+                                            .hypothesis_id
+                                            .clone(),
+                                        reason: format!("auto-synth skipped: {reason}"),
+                                    });
+                                }
+                            }
+                        }
+                    }
                     if config.propose_synth && proposal.matched_tool.is_none() {
                         let hypothesis_id = &proposal.decision.candidate.hypothesis_id;
                         if pending_tool_gap_hypotheses.insert(hypothesis_id.clone()) {
@@ -349,7 +494,8 @@ impl ProjectStore {
                             raised_decisions.push(point);
                         }
                     }
-                    if config.apply {
+                    let should_apply_step = config.apply || auto_synth_tool_ref.is_some();
+                    if should_apply_step {
                         if let Some(step) = proposal.drafted_step.as_ref() {
                             let flow_id = config.flow.clone().unwrap_or_else(|| {
                                 auto_flow_id(&proposal.decision.candidate.hypothesis_id)
@@ -417,7 +563,12 @@ impl ProjectStore {
                                                         step_id: &step_id,
                                                         step,
                                                         inferred_param_names: &inferred_param_names,
-                                                        auto_run: config.auto_run,
+                                                        auto_synth_tool_ref: auto_synth_tool_ref
+                                                            .as_deref(),
+                                                        capability_need:
+                                                            synthesized_capability_need.as_deref(),
+                                                        auto_run: config.auto_run
+                                                            || auto_synth_tool_ref.is_some(),
                                                     },
                                                     ApplyCycleOutputs {
                                                         applied: &mut applied,
@@ -626,6 +777,31 @@ impl ProjectStore {
         ))
     }
 
+    fn draft_synthesized_step(
+        &self,
+        tool_ref: &str,
+        decision: &BranchDecision,
+        available: &[(String, String)],
+        inferer: &dyn ParamInferer,
+    ) -> Result<(ProposedStep, Vec<String>), StorageError> {
+        let executable = self.executable_tool(tool_ref)?;
+        let mut drafted_step = self.draft_step_for(tool_ref, available)?;
+        let inferred_param_names = infer_replace_params(
+            &mut drafted_step,
+            &decision.candidate.statement,
+            inferer,
+            &executable.params,
+        );
+        let needs = self.infer_step_needs(&drafted_step)?;
+        Ok((
+            ProposedStep {
+                needs,
+                ..drafted_step
+            },
+            inferred_param_names,
+        ))
+    }
+
     fn has_equivalent_tool_branches(
         &self,
         decision: &BranchDecision,
@@ -704,6 +880,15 @@ impl ProjectStore {
             finalization.step,
             finalization.inferred_param_names,
         )?;
+        if let Some(tool_ref) = finalization.auto_synth_tool_ref {
+            self.emit_tool_synthesized_for_step(
+                finalization.flow_id,
+                finalization.step_id,
+                finalization.hypothesis_id,
+                tool_ref,
+                finalization.capability_need.unwrap_or(""),
+            )?;
+        }
         outputs.applied.push(finalization.action);
         if finalization.auto_run {
             self.auto_run_applied_step(
@@ -715,6 +900,31 @@ impl ProjectStore {
                 outputs.raised_decisions,
             )?;
         }
+        Ok(())
+    }
+
+    fn emit_tool_synthesized_for_step(
+        &self,
+        flow_id: &str,
+        step_id: &str,
+        hypothesis_id: &str,
+        tool_ref: &str,
+        capability_need: &str,
+    ) -> Result<(), StorageError> {
+        self.append_event(EventRecord {
+            flow_id: Some(flow_id.to_string()),
+            step_id: Some(step_id.to_string()),
+            run_id: None,
+            event_type: TOOL_SYNTHESIZED_EVENT.to_string(),
+            payload_json: tool_synthesized_payload_json(
+                flow_id,
+                step_id,
+                hypothesis_id,
+                tool_ref,
+                capability_need,
+            ),
+        })?;
+        self.touch_project()?;
         Ok(())
     }
 
@@ -823,6 +1033,10 @@ impl ProjectStore {
             observation.flow_id.as_deref(),
             observation.step_id.as_deref(),
         )?;
+        let auto_synth_tool_ref = self.auto_synthesized_tool_for_observation(
+            observation.flow_id.as_deref(),
+            observation.step_id.as_deref(),
+        )?;
         let mut digest = stance_assessment_digest(
             step_id,
             observation_id,
@@ -833,6 +1047,10 @@ impl ProjectStore {
         if !inferred_params.is_empty() {
             digest.push('\n');
             digest.push_str(&inferred_param_warning(&inferred_params));
+        }
+        if let Some(tool_ref) = auto_synth_tool_ref {
+            digest.push('\n');
+            digest.push_str(&auto_synth_warning(&tool_ref));
         }
         let point = self.raise_decision_point(
             DecisionKind::StanceAssessment,
@@ -909,6 +1127,41 @@ impl ProjectStore {
 
         Ok(params)
     }
+
+    fn auto_synthesized_tool_for_observation(
+        &self,
+        flow_id: Option<&str>,
+        step_id: Option<&str>,
+    ) -> Result<Option<String>, StorageError> {
+        let (Some(flow_id), Some(step_id)) = (flow_id, step_id) else {
+            return Ok(None);
+        };
+        let mut stmt = self.connection().prepare(
+            "SELECT flow_id, step_id, payload_json
+             FROM events
+             WHERE event_type = ?1
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![TOOL_SYNTHESIZED_EVENT], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+
+        for row in rows {
+            let (event_flow_id, event_step_id, payload_json) = row?;
+            let payload = tool_synthesized_payload_from_json(&payload_json)?;
+            let candidate_flow_id = event_flow_id.unwrap_or(payload.flow_id);
+            let candidate_step_id = event_step_id.unwrap_or(payload.step_id);
+            if candidate_flow_id == flow_id && step_ids_match(flow_id, step_id, &candidate_step_id)
+            {
+                return Ok(Some(payload.tool_ref));
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -923,6 +1176,15 @@ struct ParamsInferredPayload {
 struct InferredParamPayload {
     name: String,
     value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ToolSynthesizedPayload {
+    flow_id: String,
+    step_id: String,
+    hypothesis_id: String,
+    tool_ref: String,
+    capability_need: String,
 }
 
 fn inferred_param_payloads(
@@ -969,6 +1231,31 @@ fn params_inferred_payload_from_json(
     })
 }
 
+fn tool_synthesized_payload_json(
+    flow_id: &str,
+    step_id: &str,
+    hypothesis_id: &str,
+    tool_ref: &str,
+    capability_need: &str,
+) -> String {
+    serde_json::to_string(&ToolSynthesizedPayload {
+        flow_id: flow_id.to_string(),
+        step_id: step_id.to_string(),
+        hypothesis_id: hypothesis_id.to_string(),
+        tool_ref: tool_ref.to_string(),
+        capability_need: capability_need.to_string(),
+    })
+    .expect("tool synthesized payload serializes to JSON")
+}
+
+fn tool_synthesized_payload_from_json(
+    payload_json: &str,
+) -> Result<ToolSynthesizedPayload, StorageError> {
+    serde_json::from_str(payload_json).map_err(|err| {
+        StorageError::InvalidInput(format!("tool synthesized event has invalid payload: {err}"))
+    })
+}
+
 fn inferred_params_for_observation(
     store: &ProjectStore,
     flow_id: Option<&str>,
@@ -987,6 +1274,12 @@ fn inferred_param_warning(params: &[(String, String)]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("⚠ 该结果依赖 LLM 推断的未确认参数：{params}（请人工确认参数正确再据此判定立场）")
+}
+
+fn auto_synth_warning(tool_ref: &str) -> String {
+    format!(
+        "⚠ 该结果来自自动合成工具 {tool_ref}（冒烟验证、exploratory 封顶）；请人工确认工具是否真答了问题。"
+    )
 }
 
 fn step_ids_match(flow_id: &str, requested: &str, candidate: &str) -> bool {
@@ -1086,6 +1379,36 @@ fn infer_replace_params(
         }
     }
     inferred_param_names
+}
+
+fn auto_synth_gap(proposal: &EnrichedProposal) -> bool {
+    proposal.matched_tool.is_none() || proposal.matched_fit.as_deref() == Some(Fit::Low.as_str())
+}
+
+fn auto_synth_capability_need(proposal: &EnrichedProposal) -> String {
+    let statement = &proposal.decision.candidate.statement;
+    match (
+        proposal.matched_tool.as_deref(),
+        proposal.matched_fit.as_deref(),
+        proposal.match_reason.as_deref(),
+    ) {
+        (None, _, _) => {
+            format!("能力需求 = {statement}；现状 = 无注册工具匹配（registry_match 失败）")
+        }
+        (Some(tool_ref), Some(fit), Some(reason)) => {
+            format!(
+                "能力需求 = {statement}；现状 = 最佳候选 {tool_ref} fit={fit}，不足以自动执行；匹配原因：{reason}"
+            )
+        }
+        (Some(tool_ref), Some(fit), None) => {
+            format!("能力需求 = {statement}；现状 = 最佳候选 {tool_ref} fit={fit}，不足以自动执行")
+        }
+        (Some(tool_ref), None, _) => {
+            format!(
+                "能力需求 = {statement}；现状 = 最佳候选 {tool_ref} 缺少 fit 评估，视为能力缺口"
+            )
+        }
+    }
 }
 
 fn proposal_keywords(statement: &str) -> Vec<String> {
@@ -1425,7 +1748,7 @@ mod tests {
 
     use super::{
         proposal_keywords, AppliedAction, ApplyConfig, CycleOutcome, NoopParamInferer,
-        NoopRelevanceScorer, ParamInferer, RelevanceScorer,
+        NoopRelevanceScorer, ParamInferer, RelevanceScorer, ToolSynthesisOutcome, ToolSynthesizer,
     };
 
     fn temp_project_path(test_name: &str) -> PathBuf {
@@ -1931,6 +2254,88 @@ runtime:
             } else {
                 self.fallback
             }
+        }
+    }
+
+    struct StubToolSynthesizer<'a> {
+        store: &'a ProjectStore,
+        script_path: PathBuf,
+        tool_name: &'static str,
+        calls: RefCell<Vec<(String, String)>>,
+        should_register: bool,
+    }
+
+    impl<'a> StubToolSynthesizer<'a> {
+        fn registering(
+            store: &'a ProjectStore,
+            root: &std::path::Path,
+            tool_name: &'static str,
+        ) -> Self {
+            let script_path = root.join(format!("{tool_name}.sh"));
+            std::fs::write(
+                &script_path,
+                "printf '# Auto synth report\nstatus: ok\n' > \"$AGENTFLOW_OUTPUT_RESULT\"\n",
+            )
+            .unwrap();
+            Self {
+                store,
+                script_path,
+                tool_name,
+                calls: RefCell::new(Vec::new()),
+                should_register: true,
+            }
+        }
+
+        fn none(store: &'a ProjectStore) -> Self {
+            Self {
+                store,
+                script_path: PathBuf::new(),
+                tool_name: "unused",
+                calls: RefCell::new(Vec::new()),
+                should_register: false,
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl ToolSynthesizer for StubToolSynthesizer<'_> {
+        fn synthesize(
+            &self,
+            hypothesis_statement: &str,
+            capability_need: &str,
+        ) -> ToolSynthesisOutcome {
+            self.calls.borrow_mut().push((
+                hypothesis_statement.to_string(),
+                capability_need.to_string(),
+            ));
+            if !self.should_register {
+                return ToolSynthesisOutcome::rejected("stub synthesizer returned no candidate");
+            }
+            let command = self.script_path.display();
+            let spec = ToolSpec::from_simple_yaml(&format!(
+                r#"schema_version: agentflow.tool.v0
+namespace: synth
+name: {}
+version: 0.1.0
+maturity: exploratory
+description: Auto synth THRSP pathway validation report for custom validation
+outputs:
+  result:
+    type: Markdown
+    observer: artifact_summary
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {command}
+"#,
+                self.tool_name
+            ))
+            .unwrap();
+            ToolSynthesisOutcome::registered(self.store.register_tool(spec).unwrap().tool_ref)
         }
     }
 
@@ -3076,6 +3481,272 @@ steps:
             Some("analysis/marker_deepen")
         );
         assert_eq!(event_count(&store, "handoff.decision_point_raised"), 0);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_synth_success_registers_runs_marks_provenance_and_warns_l4() {
+        let (path, store) = init_project("auto-synth-success");
+        let statement = "Auto synth THRSP pathway validation needs custom validation";
+        let hypothesis_id = record_hypothesis(&store, statement);
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+        let synthesizer =
+            StubToolSynthesizer::registering(&store, &path, "auto_synth_thrsp_validation");
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: false,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &NoopRelevanceScorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        assert_eq!(synthesizer.calls().len(), 1);
+        assert_eq!(synthesizer.calls()[0].0, statement);
+        assert!(synthesizer.calls()[0].1.contains("无注册工具匹配"));
+        assert_eq!(report.branch_proposals.len(), 1);
+        let proposal = &report.branch_proposals[0];
+        assert_eq!(
+            proposal.matched_tool.as_deref(),
+            Some("synth/auto_synth_thrsp_validation")
+        );
+        assert_eq!(proposal.matched_fit.as_deref(), Some("synthesized"));
+        assert!(proposal
+            .match_reason
+            .as_deref()
+            .unwrap()
+            .contains("auto_synth"));
+        let auto_flow_id = format!("auto_{hypothesis_id}");
+        assert!(report.applied.iter().any(|action| matches!(
+            action,
+            AppliedAction::FlowAutoCreated { flow_id } if flow_id == &auto_flow_id
+        )));
+        let observation_id = report
+            .applied
+            .iter()
+            .find_map(|action| match action {
+                AppliedAction::StepRun {
+                    observation_id: Some(observation_id),
+                    ..
+                } => Some(observation_id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(event_count(&store, "agent.tool_synthesized"), 1);
+
+        let point = report
+            .raised_decisions
+            .iter()
+            .find(|point| point.kind == DecisionKind::StanceAssessment)
+            .unwrap();
+        assert!(point.digest.contains("自动合成工具"));
+        assert!(point.digest.contains("冒烟验证"));
+        assert!(point.digest.contains("exploratory 封顶"));
+        assert!(point.digest.contains("请人工确认工具是否真答了问题"));
+
+        let linked = store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id,
+                observation_id: Some(observation_id),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note: "Human accepted auto synth output for this fixture.".to_string(),
+            })
+            .unwrap();
+        assert_eq!(linked.grade, EvidenceGrade::Inferred);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_synth_none_path_does_not_register_or_run() {
+        let (path, store) = init_project("auto-synth-none");
+        let hypothesis_id =
+            record_hypothesis(&store, "Auto synth missing backend needs custom validation");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+        let synthesizer = StubToolSynthesizer::none(&store);
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: false,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &NoopRelevanceScorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        assert_eq!(synthesizer.calls().len(), 1);
+        assert_eq!(report.branch_proposals.len(), 1);
+        assert!(report.branch_proposals[0].matched_tool.is_none());
+        assert!(report.branch_proposals[0].drafted_step.is_none());
+        assert!(report
+            .apply_failures
+            .iter()
+            .any(|failure| failure.reason.contains("auto-synth skipped")));
+        assert!(report.applied.is_empty());
+        assert!(report.raised_decisions.is_empty());
+        assert_eq!(event_count(&store, "tool_registered"), 0);
+        assert_eq!(event_count(&store, "agent.tool_synthesized"), 0);
+        assert!(store.list_observations().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_synth_treats_low_fit_as_gap_but_legacy_propose_synth_does_not() {
+        let (path, store) = setup_semantic_project("auto-synth-low-fit-gap");
+        let legacy = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: false,
+                auto_run: false,
+                flow: None,
+                max_apply: 5,
+                propose_synth: true,
+            })
+            .unwrap();
+        assert_eq!(
+            legacy.branch_proposals[0].matched_tool.as_deref(),
+            Some("analysis/score_low_current")
+        );
+        assert_eq!(
+            legacy.branch_proposals[0].matched_fit.as_deref(),
+            Some("low")
+        );
+        assert!(legacy.raised_decisions.is_empty());
+
+        let synthesizer = StubToolSynthesizer::none(&store);
+        let auto_synth = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: true,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &NoopRelevanceScorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        assert_eq!(synthesizer.calls().len(), 1);
+        assert!(synthesizer.calls()[0].1.contains("fit=low"));
+        assert_eq!(
+            auto_synth.branch_proposals[0].matched_tool.as_deref(),
+            Some("analysis/score_low_current")
+        );
+        assert!(auto_synth.branch_proposals[0].drafted_step.is_none());
+        assert!(auto_synth
+            .apply_failures
+            .iter()
+            .any(|failure| failure.reason.contains("auto-synth skipped")));
+        assert!(!auto_synth
+            .applied
+            .iter()
+            .any(|action| matches!(action, AppliedAction::StepRun { .. })));
+        assert_eq!(event_count(&store, "agent.tool_synthesized"), 0);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_synth_budget_preflight_does_not_register_tool() {
+        let (path, store) = init_project("auto-synth-budget-preflight");
+        let hypothesis_id =
+            record_hypothesis(&store, "Auto synth budget gate needs custom validation");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+        let synthesizer = StubToolSynthesizer::registering(&store, &path, "auto_synth_budget");
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: false,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 0,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &NoopRelevanceScorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        assert!(synthesizer.calls().is_empty());
+        assert_eq!(event_count(&store, "tool_registered"), 0);
+        assert_eq!(event_count(&store, "agent.tool_synthesized"), 0);
+        assert!(report.applied.is_empty());
+        assert!(report.apply_failures.is_empty());
+        assert!(report
+            .raised_decisions
+            .iter()
+            .any(|point| point.kind == DecisionKind::BudgetThreshold));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_synth_default_off_preserves_low_fit_application_behavior() {
+        let (path, store) = setup_semantic_project("auto-synth-default-off-low-fit");
+
+        let report = store
+            .run_cycle_with_apply_config(ApplyConfig {
+                apply: true,
+                auto_run: false,
+                flow: None,
+                max_apply: 5,
+                propose_synth: false,
+            })
+            .unwrap();
+
+        assert_eq!(
+            report.branch_proposals[0].matched_tool.as_deref(),
+            Some("analysis/score_low_current")
+        );
+        assert_eq!(
+            report.branch_proposals[0].matched_fit.as_deref(),
+            Some("low")
+        );
+        assert!(report.branch_proposals[0].drafted_step.is_some());
+        assert!(report
+            .apply_failures
+            .iter()
+            .any(|failure| failure.reason.contains("artifact_REPLACE_cohort_table")));
+        assert_eq!(event_count(&store, "agent.tool_synthesized"), 0);
 
         let _ = std::fs::remove_dir_all(path);
     }

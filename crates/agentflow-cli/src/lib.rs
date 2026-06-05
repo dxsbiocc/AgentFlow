@@ -1,6 +1,7 @@
 mod agent_commands;
 mod agent_ops_commands;
 mod cli_args;
+mod llm_commands;
 mod synth_commands;
 
 use std::ffi::OsString;
@@ -62,6 +63,7 @@ pub fn usage() -> String {
         "  agentflow tools match [--output <type>] [--input <type>]... [--keyword <kw>]... [--json] [--path <path>]",
         "  agentflow tools draft-step <tool-ref> [--input <type>:<artifact-id>]... [--hypothesis <id>] [--infer-params] [--synthesizer <cmd>] [--json] [--path <path>]",
         "  agentflow synth --name <n> --description <text> --fixture <input-file> --expect <substring> [--synthesizer <cmd>] [--path <path>]",
+        "  agentflow llm config --provider anthropic|openai|gemini|deepseek (--api-key <key>|--api-key-env <env-var>) [--model <model>] [--base-url <url>] [--synthesizer <cmd>] [--json] [--path <path>]",
         "  agentflow env check <tool-ref> [--json] [--path <path>]",
         "  agentflow env prepare <tool-ref> [--json] [--path <path>]",
         "  agentflow env export <tool-ref> [--json] [--path <path>]",
@@ -93,7 +95,7 @@ pub fn usage() -> String {
         "  agentflow evidence list --hypothesis <id> [--json] [--path <path>]",
         "  agentflow verdict render --hypothesis <id> [--json] [--path <path>] [--gate-supports <text> --gate-against <text> --gate-alternatives <text> --gate-data-risks <text> --gate-assumptions <text> --gate-falsifier <text> --gate-claim-basis observed|inferred|speculative --gate-not-yet <text>]",
         "  agentflow verdict show --hypothesis <id> [--json] [--path <path>]",
-        "  agentflow agent run [--apply] [--auto-run] [--flow <flow-id>] [--max-apply <n>] [--propose-synth] [--infer-params] [--semantic-match] [--synthesizer <cmd>] [--auto-forage] [--forage-max <n>] [--forage-script <path>] [--python <bin>] [--json] [--path <path>]",
+        "  agentflow agent run [--apply] [--auto-run] [--flow <flow-id>] [--max-apply <n>] [--propose-synth] [--auto-synth] [--infer-params] [--semantic-match] [--synthesizer <cmd>] [--auto-forage] [--forage-max <n>] [--forage-script <path>] [--python <bin>] [--json] [--path <path>]",
         "  agentflow branch candidates [--json] [--path <path>]",
         "  agentflow branch select [--explore] [--json] [--path <path>]",
         "  agentflow decision list [--json] [--path <path>]",
@@ -924,11 +926,16 @@ fn tools_draft_step_command(args: ToolsDraftStepArgs) -> Result<String, CliError
             CliError::InvalidArgument("--infer-params requires --hypothesis <id>".to_string())
         })?;
         let hypothesis = store.inspect_hypothesis(hypothesis_id)?;
-        let synthesizer = options
-            .synthesizer
-            .as_deref()
-            .unwrap_or(synth_commands::DEFAULT_SYNTHESIZER);
-        infer_draft_step_params(&mut step, &hypothesis.statement, synthesizer);
+        let synthesizer = synth_commands::configured_or_default_synthesizer(
+            store.root_path(),
+            options.synthesizer,
+        )?;
+        infer_draft_step_params(
+            store.root_path(),
+            &mut step,
+            &hypothesis.statement,
+            &synthesizer,
+        );
     }
 
     if options.project.json {
@@ -939,6 +946,7 @@ fn tools_draft_step_command(args: ToolsDraftStepArgs) -> Result<String, CliError
 }
 
 fn infer_draft_step_params(
+    project_root: &Path,
     step: &mut agentflow_core::branch::ProposedStep,
     statement: &str,
     synthesizer: &str,
@@ -951,7 +959,9 @@ fn infer_draft_step_params(
         let prompt = format!(
             "Research hypothesis: \"{statement}\". A bioinformatics analysis tool needs a value for the parameter \"{param_name}\". Reply with ONLY the value (e.g. a gene symbol like THRSP), no explanation, no quotes."
         );
-        let Ok(candidate) = synth_commands::run_synthesizer(synthesizer, &prompt) else {
+        let Ok(candidate) =
+            synth_commands::run_project_synthesizer(project_root, synthesizer, &prompt)
+        else {
             continue;
         };
         let stripped = synth_commands::strip_markdown_fence(&candidate);
@@ -2635,6 +2645,7 @@ steps:
         assert!(output.contains("agentflow env check <tool-ref>"));
         assert!(output.contains("agentflow env prepare <tool-ref>"));
         assert!(output.contains("agentflow env export <tool-ref>"));
+        assert!(output.contains("agentflow llm config --provider anthropic|openai|gemini|deepseek"));
     }
 
     #[test]
@@ -2667,6 +2678,270 @@ steps:
         .unwrap();
         assert!(status.contains("\"schema_version\":\"agentflow.status.v0\""));
         assert!(status.contains("\"name\":\"Demo\""));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn llm_config_writes_secret_env_without_leaking_output() {
+        let path = temp_project_path("llm-config");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let output = run(args(&[
+            "agentflow",
+            "llm",
+            "config",
+            "--provider",
+            "anthropic",
+            "--api-key",
+            "test-secret-1234",
+            "--model",
+            "claude-test-model",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(output.contains("\"schema_version\":\"agentflow.llm_config.v0\""));
+        assert!(output.contains("\"api_key_var\":\"ANTHROPIC_API_KEY\""));
+        assert!(!output.contains("test-secret-1234"));
+        let env_path = path.join(".agentflow/llm.env");
+        let env = fs::read_to_string(&env_path).unwrap();
+        assert!(env.contains("AGENTFLOW_LLM_PROVIDER='anthropic'"));
+        assert!(env.contains("ANTHROPIC_API_KEY='test-secret-1234'"));
+        assert!(env.contains("ANTHROPIC_MODEL='claude-test-model'"));
+        assert!(path.join(".agentflow/llm-synth.sh").exists());
+        assert!(path.join(".agentflow/llm-synth.py").exists());
+        let synth_py = fs::read_to_string(path.join(".agentflow/llm-synth.py")).unwrap();
+        assert!(synth_py.contains("LLM connection error:"));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&env_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn llm_config_deepseek_defaults_model_and_writes_base_url() {
+        let path = temp_project_path("llm-config-deepseek");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let output = run(args(&[
+            "agentflow",
+            "llm",
+            "config",
+            "--provider",
+            "deepseek",
+            "--api-key",
+            "test-deepseek-secret",
+            "--base-url",
+            "https://api.deepseek.com/v1",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(output.contains("\"provider\":\"deepseek\""));
+        assert!(output.contains("\"api_key_var\":\"DEEPSEEK_API_KEY\""));
+        assert!(output.contains("\"model\":\"deepseek-v4-flash\""));
+        assert!(output.contains("\"base_url_configured\":true"));
+        assert!(!output.contains("test-deepseek-secret"));
+        let env = fs::read_to_string(path.join(".agentflow/llm.env")).unwrap();
+        assert!(env.contains("AGENTFLOW_LLM_PROVIDER='deepseek'"));
+        assert!(env.contains("DEEPSEEK_API_KEY='test-deepseek-secret'"));
+        assert!(env.contains("DEEPSEEK_MODEL='deepseek-v4-flash'"));
+        assert!(env.contains("DEEPSEEK_BASE_URL='https://api.deepseek.com/v1'"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn llm_config_generated_shell_exports_env_to_python() {
+        let path = temp_project_path("llm-config-shell-export");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        run(args(&[
+            "agentflow",
+            "llm",
+            "config",
+            "--provider",
+            "deepseek",
+            "--api-key",
+            "test-deepseek-secret",
+            "--base-url",
+            "https://api.deepseek.com/v1",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        fs::write(
+            path.join(".agentflow/llm-synth.py"),
+            r#"#!/usr/bin/env python3
+import os
+print(os.environ["AGENTFLOW_LLM_PROVIDER"])
+print(os.environ["DEEPSEEK_MODEL"])
+print(os.environ["DEEPSEEK_BASE_URL"])
+"#,
+        )
+        .unwrap();
+
+        let output = std::process::Command::new(path.join(".agentflow/llm-synth.sh"))
+            .arg("unused")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("deepseek\n"));
+        assert!(stdout.contains("deepseek-v4-flash\n"));
+        assert!(stdout.contains("https://api.deepseek.com/v1\n"));
+        assert!(!stdout.contains("test-deepseek-secret"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn llm_config_default_synthesizer_survives_paths_with_spaces() {
+        let path = temp_project_path("llm config with spaces");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let output = run(args(&[
+            "agentflow",
+            "llm",
+            "config",
+            "--provider",
+            "anthropic",
+            "--api-key",
+            "test-secret-1234",
+            "--model",
+            "claude-test-model",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(!output.contains("test-secret-1234"));
+        let configured =
+            crate::synth_commands::configured_or_default_synthesizer(&path, None).unwrap();
+        let argv = crate::synth_commands::split_synthesizer_command(&configured).unwrap();
+        let expected_root = fs::canonicalize(&path).unwrap();
+        assert_eq!(
+            argv,
+            vec![expected_root
+                .join(".agentflow/llm-synth.sh")
+                .display()
+                .to_string()]
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn configured_llm_env_drives_default_synthesizer() {
+        let path = temp_project_path("llm-env-synth");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let fixture = path.join("fixture.txt");
+        fs::write(&fixture, "expected-line\n").unwrap();
+        let stub = path.join("env_synth.sh");
+        fs::write(
+            &stub,
+            r#"#!/bin/sh
+if [ "${ANTHROPIC_API_KEY:-}" != "test-secret-1234" ]; then
+  echo "missing configured key" >&2
+  exit 7
+fi
+cat <<'PY'
+import os
+from pathlib import Path
+print(Path(os.environ["SYNTH_INPUT"]).read_text(), end="")
+PY
+"#,
+        )
+        .unwrap();
+        make_executable(&stub);
+        let synthesizer = format!("/bin/sh {}", stub.display());
+        run(args(&[
+            "agentflow",
+            "llm",
+            "config",
+            "--provider",
+            "anthropic",
+            "--api-key",
+            "test-secret-1234",
+            "--model",
+            "claude-test-model",
+            "--synthesizer",
+            &synthesizer,
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let output = run(args(&[
+            "agentflow",
+            "synth",
+            "--name",
+            "llm_env_echo",
+            "--description",
+            "Echo the fixture",
+            "--fixture",
+            fixture.to_str().unwrap(),
+            "--expect",
+            "expected-line",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(output.contains("VALIDATED"));
+        assert!(output.contains("synth/llm_env_echo"));
 
         let _ = fs::remove_dir_all(path);
     }

@@ -5,6 +5,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -2287,6 +2290,7 @@ fn run_local_command(
 
     let timeout = Duration::from_secs(timeout_seconds);
     let started = Instant::now();
+    configure_timeout_process_group(&mut command);
     let mut child = command.spawn()?;
     loop {
         if child.try_wait()?.is_some() {
@@ -2300,7 +2304,7 @@ fn run_local_command(
             });
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
+            kill_timeout_process_group(&mut child);
             let output = child.wait_with_output()?;
             return Ok(LocalCommandOutput {
                 status: output.status,
@@ -2312,6 +2316,24 @@ fn run_local_command(
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn configure_timeout_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+}
+
+fn kill_timeout_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("/bin/kill")
+            .arg("-TERM")
+            .arg(format!("-{}", child.id()))
+            .status();
+    }
+    let _ = child.kill();
 }
 
 fn validate_outputs(outputs: &OutputPaths) -> Result<(), StorageError> {

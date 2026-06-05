@@ -3,8 +3,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentflow_core::agent::{
-    AppliedAction, ApplyConfig, CycleReport, EnrichedProposal, NoopParamInferer, ParamInferer,
-    RelevanceScorer,
+    AppliedAction, ApplyConfig, CycleReport, EnrichedProposal, NoopParamInferer,
+    NoopRelevanceScorer, ParamInferer, RelevanceScorer, ToolSynthesisOutcome, ToolSynthesizer,
 };
 use agentflow_core::argument::{EvidenceLink, Stance, VerdictSummary, VerdictTag};
 use agentflow_core::branch::{
@@ -36,6 +36,7 @@ struct AgentRunOptions {
     flow: Option<String>,
     max_apply: u32,
     propose_synth: bool,
+    auto_synth: bool,
     infer_params: bool,
     semantic_match: bool,
     synthesizer: Option<String>,
@@ -61,6 +62,7 @@ impl Default for AgentRunOptions {
             flow: None,
             max_apply: 5,
             propose_synth: false,
+            auto_synth: false,
             infer_params: false,
             semantic_match: false,
             synthesizer: None,
@@ -203,32 +205,63 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
         max_apply: options.max_apply,
         propose_synth: options.propose_synth,
     };
-    let synthesizer = options
-        .synthesizer
-        .unwrap_or_else(|| synth_commands::DEFAULT_SYNTHESIZER.to_string());
-    let report = match (options.infer_params, options.semantic_match) {
-        (true, true) => {
-            let inferer = LlmParamInferer {
-                synthesizer: &synthesizer,
-            };
-            let scorer = LlmRelevanceScorer {
-                synthesizer: &synthesizer,
-            };
-            store.run_cycle_with_scorer(config, &inferer, &scorer)?
+    let synthesizer =
+        synth_commands::configured_or_default_synthesizer(store.root_path(), options.synthesizer)?;
+    let report = if options.auto_synth {
+        let inferer = LlmParamInferer {
+            store: &store,
+            synthesizer: &synthesizer,
+        };
+        let scorer = LlmRelevanceScorer {
+            store: &store,
+            synthesizer: &synthesizer,
+        };
+        let tool_synthesizer = LlmToolSynthesizer {
+            store: &store,
+            synthesizer: &synthesizer,
+        };
+        let noop_inferer = NoopParamInferer;
+        let noop_scorer = NoopRelevanceScorer;
+        let inferer: &dyn ParamInferer = if options.infer_params {
+            &inferer
+        } else {
+            &noop_inferer
+        };
+        let scorer: &dyn RelevanceScorer = if options.semantic_match {
+            &scorer
+        } else {
+            &noop_scorer
+        };
+        store.run_cycle_with_synth(config, inferer, scorer, &tool_synthesizer)?
+    } else {
+        match (options.infer_params, options.semantic_match) {
+            (true, true) => {
+                let inferer = LlmParamInferer {
+                    store: &store,
+                    synthesizer: &synthesizer,
+                };
+                let scorer = LlmRelevanceScorer {
+                    store: &store,
+                    synthesizer: &synthesizer,
+                };
+                store.run_cycle_with_scorer(config, &inferer, &scorer)?
+            }
+            (true, false) => {
+                let inferer = LlmParamInferer {
+                    store: &store,
+                    synthesizer: &synthesizer,
+                };
+                store.run_cycle_with(config, &inferer)?
+            }
+            (false, true) => {
+                let scorer = LlmRelevanceScorer {
+                    store: &store,
+                    synthesizer: &synthesizer,
+                };
+                store.run_cycle_with_scorer(config, &NoopParamInferer, &scorer)?
+            }
+            (false, false) => store.run_cycle_with_apply_config(config)?,
         }
-        (true, false) => {
-            let inferer = LlmParamInferer {
-                synthesizer: &synthesizer,
-            };
-            store.run_cycle_with(config, &inferer)?
-        }
-        (false, true) => {
-            let scorer = LlmRelevanceScorer {
-                synthesizer: &synthesizer,
-            };
-            store.run_cycle_with_scorer(config, &NoopParamInferer, &scorer)?
-        }
-        (false, false) => store.run_cycle_with_apply_config(config)?,
     };
 
     if options.project.json {
@@ -527,19 +560,26 @@ fn auto_forage_pass(
 }
 
 struct LlmParamInferer<'a> {
+    store: &'a ProjectStore,
     synthesizer: &'a str,
 }
 
 impl ParamInferer for LlmParamInferer<'_> {
     fn infer(&self, hypothesis_statement: &str, param_name: &str) -> Option<String> {
         let prompt = param_inference_prompt(hypothesis_statement, param_name);
-        let candidate = synth_commands::run_synthesizer(self.synthesizer, &prompt).ok()?;
+        let candidate = synth_commands::run_project_synthesizer(
+            self.store.root_path(),
+            self.synthesizer,
+            &prompt,
+        )
+        .ok()?;
         let stripped = synth_commands::strip_markdown_fence(&candidate);
         first_non_empty_line(&stripped).map(ToOwned::to_owned)
     }
 }
 
 struct LlmRelevanceScorer<'a> {
+    store: &'a ProjectStore,
     synthesizer: &'a str,
 }
 
@@ -551,9 +591,45 @@ impl RelevanceScorer for LlmRelevanceScorer<'_> {
         tool_description: &str,
     ) -> Option<bool> {
         let prompt = relevance_prompt(hypothesis_statement, tool_ref, tool_description);
-        let candidate = synth_commands::run_synthesizer(self.synthesizer, &prompt).ok()?;
+        let candidate = synth_commands::run_project_synthesizer(
+            self.store.root_path(),
+            self.synthesizer,
+            &prompt,
+        )
+        .ok()?;
         let stripped = synth_commands::strip_markdown_fence(&candidate);
         parse_yes_no(&stripped)
+    }
+}
+
+struct LlmToolSynthesizer<'a> {
+    store: &'a ProjectStore,
+    synthesizer: &'a str,
+}
+
+impl ToolSynthesizer for LlmToolSynthesizer<'_> {
+    fn synthesize(
+        &self,
+        hypothesis_statement: &str,
+        capability_need: &str,
+    ) -> ToolSynthesisOutcome {
+        match synth_commands::auto_synthesize_agent_tool(
+            self.store,
+            self.synthesizer,
+            hypothesis_statement,
+            capability_need,
+        ) {
+            Ok(synth_commands::AutoSynthToolResult::Registered(tool_ref)) => {
+                ToolSynthesisOutcome::registered(tool_ref)
+            }
+            Ok(synth_commands::AutoSynthToolResult::Rejected(reason)) => {
+                ToolSynthesisOutcome::rejected(reason)
+            }
+            Err(error) => ToolSynthesisOutcome::rejected(format!(
+                "auto-synth backend or registration failed: {}",
+                error.message()
+            )),
+        }
     }
 }
 
@@ -734,6 +810,7 @@ impl TryFrom<AgentRunArgs> for AgentRunOptions {
             flow: last_value(args.flow),
             max_apply: 5,
             propose_synth: args.propose_synth,
+            auto_synth: args.auto_synth,
             infer_params: args.infer_params,
             semantic_match: args.semantic_match,
             synthesizer: last_value(args.synthesizer),
@@ -1786,6 +1863,33 @@ steps:
         format!("/bin/sh {}", stub_path.display())
     }
 
+    fn write_auto_synthesizer_stub(path: &Path) -> String {
+        let stub_path = path.join("agent-run-auto-synth.sh");
+        std::fs::write(
+            &stub_path,
+            r##"#!/bin/sh
+cat <<'EOF'
+===SCRIPT===
+import os
+
+result = "# Auto synth report\nAUTO_SYNTH_OK\n"
+output_path = os.environ.get("AGENTFLOW_OUTPUT_RESULT")
+if output_path:
+    with open(output_path, "w", encoding="utf-8") as handle:
+        handle.write(result)
+print(result, end="")
+===FIXTURE===
+marker,value
+THRSP,3
+===EXPECT===
+AUTO_SYNTH_OK
+EOF
+"##,
+        )
+        .unwrap();
+        format!("/bin/sh {}", stub_path.display())
+    }
+
     fn shell_single_quoted(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
@@ -1843,6 +1947,61 @@ steps:
         assert!(json.contains("\"outcome\":\"advanced\""));
         assert!(json.contains("\"matched_tool\":null"));
         assert!(json.contains(&hypothesis_id));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn agent_run_help_mentions_auto_synth() {
+        let usage = run(args(&["agentflow", "--help"])).unwrap();
+        assert!(usage.contains("[--auto-synth]"));
+
+        let help = run(args(&["agentflow", "agent", "run", "--help"])).unwrap();
+        assert!(help.contains("--auto-synth"));
+    }
+
+    #[test]
+    fn agent_run_auto_synth_registers_runs_and_reports_from_cli() {
+        let path = temp_project_path("agent-run-auto-synth");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis_with_statement(
+            &store,
+            "Auto synth THRSP pathway validation needs custom validation",
+        );
+        link_weak_evidence(&store, &hypothesis_id);
+        let synthesizer = write_auto_synthesizer_stub(&path);
+
+        let json = run(args(&[
+            "agentflow",
+            "agent",
+            "run",
+            "--auto-synth",
+            "--synthesizer",
+            &synthesizer,
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(
+            json.contains("\"matched_tool\":\"synth/auto_synth_"),
+            "{json}"
+        );
+        assert!(json.contains("\"matched_fit\":\"synthesized\""));
+        assert!(json.contains("auto_synth"));
+        assert!(json.contains("stance_assessment"));
+        assert_eq!(store.list_observations().unwrap().len(), 1);
+        let tools = run(args(&[
+            "agentflow",
+            "tools",
+            "list",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(tools.contains("synth/auto_synth_"));
+        assert!(tools.contains("[exploratory]"));
 
         let _ = std::fs::remove_dir_all(path);
     }

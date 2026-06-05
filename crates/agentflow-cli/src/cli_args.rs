@@ -56,6 +56,7 @@ enum TopCommand {
     Doctor(PathJsonArgs),
     Tools(ToolsArgs),
     Synth(SynthArgs),
+    Llm(LlmArgs),
     Env(EnvArgs),
     Import(ImportArgs),
     Artifacts(ArtifactsArgs),
@@ -217,6 +218,35 @@ pub(crate) struct SynthArgs {
 pub(crate) struct EnvArgs {
     #[command(subcommand)]
     pub(crate) command: EnvCommand,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct LlmArgs {
+    #[command(subcommand)]
+    pub(crate) command: LlmCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum LlmCommand {
+    Config(LlmConfigArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct LlmConfigArgs {
+    #[arg(long, value_name = "anthropic|openai|gemini|deepseek")]
+    pub(crate) provider: Vec<String>,
+    #[arg(long, value_name = "key")]
+    pub(crate) api_key: Vec<String>,
+    #[arg(long, value_name = "env-var")]
+    pub(crate) api_key_env: Vec<String>,
+    #[arg(long, value_name = "model")]
+    pub(crate) model: Vec<String>,
+    #[arg(long, value_name = "url")]
+    pub(crate) base_url: Vec<String>,
+    #[arg(long, value_name = "cmd")]
+    pub(crate) synthesizer: Vec<String>,
+    #[command(flatten)]
+    pub(crate) project: PathJsonArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -545,7 +575,13 @@ pub(crate) struct AgentRunArgs {
     #[arg(long)]
     pub(crate) apply: bool,
     #[arg(long)]
+    pub(crate) no_apply: bool,
+    #[arg(long)]
     pub(crate) auto_run: bool,
+    #[arg(long)]
+    pub(crate) no_auto_run: bool,
+    #[arg(long)]
+    pub(crate) dry_run: bool,
     #[arg(long, value_name = "flow-id")]
     pub(crate) flow: Vec<String>,
     #[arg(long, value_name = "n")]
@@ -553,13 +589,23 @@ pub(crate) struct AgentRunArgs {
     #[arg(long)]
     pub(crate) propose_synth: bool,
     #[arg(long)]
+    pub(crate) auto_synth: bool,
+    #[arg(long)]
+    pub(crate) no_auto_synth: bool,
+    #[arg(long)]
     pub(crate) infer_params: bool,
     #[arg(long)]
+    pub(crate) no_infer_params: bool,
+    #[arg(long)]
     pub(crate) semantic_match: bool,
+    #[arg(long)]
+    pub(crate) no_semantic_match: bool,
     #[arg(long, value_name = "cmd")]
     pub(crate) synthesizer: Vec<String>,
     #[arg(long)]
     pub(crate) auto_forage: bool,
+    #[arg(long)]
+    pub(crate) no_auto_forage: bool,
     #[arg(long, value_name = "n")]
     pub(crate) forage_max: Vec<String>,
     #[arg(long, value_name = "path")]
@@ -888,6 +934,7 @@ fn dispatch(cli: Cli) -> Result<String, CliError> {
         TopCommand::Doctor(args) => crate::doctor_command(args),
         TopCommand::Tools(args) => crate::tools_command(args),
         TopCommand::Synth(args) => crate::synth_commands::synth_command(args),
+        TopCommand::Llm(args) => crate::llm_commands::llm_command(args),
         TopCommand::Env(args) => crate::env_command(args),
         TopCommand::Import(args) => crate::import_command(args),
         TopCommand::Artifacts(args) => crate::artifacts_command(args),

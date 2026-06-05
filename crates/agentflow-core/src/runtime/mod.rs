@@ -5,6 +5,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -850,6 +853,8 @@ impl ProjectStore {
         let run_id = format!("run_{}", now_unix_nanos());
         let attempt_id = format!("attempt_{}", now_unix_nanos());
         let workdir = project_dir(self.root_path()).join("work").join(&attempt_id);
+        fs::create_dir_all(&workdir)?;
+        let workdir = fs::canonicalize(&workdir)?;
         let stdout_path = workdir.join("stdout.log");
         let stderr_path = workdir.join("stderr.log");
         let resolved_outputs = output_paths(&workdir, &outputs);
@@ -2287,6 +2292,7 @@ fn run_local_command(
 
     let timeout = Duration::from_secs(timeout_seconds);
     let started = Instant::now();
+    configure_timeout_process_group(&mut command);
     let mut child = command.spawn()?;
     loop {
         if child.try_wait()?.is_some() {
@@ -2300,7 +2306,7 @@ fn run_local_command(
             });
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
+            kill_timeout_process_group(&mut child);
             let output = child.wait_with_output()?;
             return Ok(LocalCommandOutput {
                 status: output.status,
@@ -2312,6 +2318,24 @@ fn run_local_command(
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn configure_timeout_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+}
+
+fn kill_timeout_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("/bin/kill")
+            .arg("-TERM")
+            .arg(format!("-{}", child.id()))
+            .status();
+    }
+    let _ = child.kill();
 }
 
 fn validate_outputs(outputs: &OutputPaths) -> Result<(), StorageError> {
@@ -3620,6 +3644,79 @@ runtime:
             .items
             .iter()
             .any(|item| item.name == "backend" && item.status == "failed"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn run_flow_uses_absolute_output_env_for_relative_project_paths() {
+        let path = PathBuf::from(format!(
+            "target/agentflow-runtime-relative-{}-{}",
+            std::process::id(),
+            now_unix_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Runtime Relative Demo")).unwrap();
+        let script_path = path.join("absolute_output_check.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+case "$AGENTFLOW_OUTPUT_REPORT" in
+  /*) ;;
+  *) echo "output path is not absolute: $AGENTFLOW_OUTPUT_REPORT" >&2; exit 7 ;;
+esac
+if [ ! -d "$(dirname "$AGENTFLOW_OUTPUT_REPORT")" ]; then
+  echo "output parent missing: $AGENTFLOW_OUTPUT_REPORT" >&2
+  exit 8
+fi
+printf 'absolute output ok\n' > "$AGENTFLOW_OUTPUT_REPORT"
+"#,
+        )
+        .unwrap();
+        let script_path = fs::canonicalize(&script_path).unwrap();
+        register_tool(
+            &store,
+            format!(
+                r#"
+schema_version: agentflow.tool.v0
+namespace: report
+name: absolute_output_check
+version: 0.1.0
+maturity: wrapped
+description: Verify output env paths are absolute
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {}
+"#,
+                script_path.display()
+            ),
+        );
+        let flow = FlowDraft::from_simple_yaml(
+            r#"
+schema_version: agentflow.flow.v0
+id: absolute_output_demo
+name: Absolute output demo
+steps:
+  - id: check
+    tool: report/absolute_output_check
+    reason: Ensure output env path is absolute
+    needs: []
+    outputs:
+      report: report
+"#,
+        )
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+
+        let summary = store.run_flow("absolute_output_demo").unwrap();
+        assert_eq!(summary.completed_steps, 1);
+        assert_eq!(summary.failed_steps, 0);
+        assert!(summary.attempts[0].workdir.is_absolute());
 
         let _ = fs::remove_dir_all(path);
     }

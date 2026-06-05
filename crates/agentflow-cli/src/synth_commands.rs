@@ -19,6 +19,7 @@ const SYNTH_VERSION: &str = "0.1.0";
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(60);
 const CBIOPORTAL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 const CBIOPORTAL_API_BASE: &str = "https://www.cbioportal.org/api";
+const CBIOPORTAL_CLIENT_RELATIVE_DIR: &str = "examples/tools";
 const MAX_AUTO_SYNTH_ATTEMPTS: usize = 3;
 const VALIDATION_PATH: &str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
 const PRIMARY_VALIDATION_GENE: &str = "TP53";
@@ -827,7 +828,7 @@ fn build_auto_synth_prompt(
                 concat!(
                     "\nIMPORTANT LIVE API GROUNDING (queried immediately before synthesis):\n",
                     "{}\n",
-                    "When using cBioPortal, use the exact studyId, mRNA molecular profile id, sample list id, and api_base above. ",
+                    "When using cBioPortal through the verified client, use the exact studyId, mRNA molecular profile id, sample list id, and api_base above as grounding context. ",
                     "Do not substitute remembered identifiers.\n\n"
                 ),
                 block
@@ -836,12 +837,25 @@ fn build_auto_synth_prompt(
         .unwrap_or_default();
     format!(
         concat!(
-            "You are writing an AgentFlow exploratory analysis tool. Use only Python 3 standard library.\n",
+            "You are writing an AgentFlow exploratory analysis tool. Use Python 3 standard library plus the provided verified cBioPortal client module.\n",
             "{}",
             "The generated tool spec will declare a required domain parameter named gene, so runtime receives AGENTFLOW_PARAM_GENE.\n",
+            "Verified client extracted from examples/tools/tcga_survival_assoc.py:\n",
+            "import agentflow_cbioportal as cbio\n",
+            "resolve_study(cancer_keyword) -> str\n",
+            "    Return a real cBioPortal study id for a cancer keyword; prefers TCGA PanCancer Atlas; raises if unavailable.\n",
+            "fetch_expression(study_id, gene) -> dict\n",
+            "    Return sample_id -> mRNA expression value using the resolved mRNA profile and molecular-data POST fetch.\n",
+            "fetch_overall_survival(study_id) -> dict\n",
+            "    Return patient_id -> (OS_MONTHS, os_event_bool) using clinical-data POST fetch.\n",
+            "fetch_clinical_attribute(study_id, attr) -> dict\n",
+            "    Return patient_id -> clinical attribute value using clinical-data POST fetch.\n",
+            "Use the client in runtime mode: import agentflow_cbioportal, call cbio.resolve_study/cbio.fetch_expression/cbio.fetch_overall_survival/cbio.fetch_clinical_attribute as needed.\n",
+            "do not write HTTP/API calls, urllib calls, requests calls, endpoint discovery, or cBioPortal client code yourself; only write analysis logic.\n",
+            "For cBioPortal data the verified client uses https://www.cbioportal.org/api and raises instead of fabricating data.\n",
             "The tool must support two modes with the same calculation logic:\n",
             "1. Runtime mode: when SYNTH_INPUT is unset, read domain parameters from AGENTFLOW_PARAM_<UPPER_NAME>, especially AGENTFLOW_PARAM_GENE.\n",
-            "   Fetch real data from public sources such as cBioPortal REST at https://www.cbioportal.org/api (other public sources are allowed).\n",
+            "   Fetch real cBioPortal data through agentflow_cbioportal, then compute association/grouping/statistics yourself.\n",
             "   Write the main Markdown/Text result to the path in AGENTFLOW_OUTPUT_RESULT and also print it to stdout.\n",
             "2. Validation mode: when SYNTH_INPUT is set, read that fixture file, run the same deterministic calculation logic offline, write AGENTFLOW_OUTPUT_RESULT, and print stdout.\n",
             "禁止硬编码或编造 HR、p-value、correlation、effect size、biomarker grade、sample count, or any other numeric/stance result.\n",
@@ -850,16 +864,18 @@ fn build_auto_synth_prompt(
             "Never silently succeed with default/illustrative fallback data.\n",
             "During validation, SYNTH_INPUT will point to two meaningfully different fixtures; AGENTFLOW_PARAM_GENE will be TP53 for the first fixture and EGFR for the second fixture; the normalized output must change when these inputs change.\n",
             "If neither SYNTH_INPUT fixture data nor runtime real public data is available, exit non-zero instead of inventing data.\n\n",
-            "Few-shot runtime contract from examples/tools/tcga_survival_assoc.py, adapted to AGENTFLOW_OUTPUT_RESULT:\n",
-            "import os, urllib.request, urllib.parse, json\n",
-            "API = \"https://www.cbioportal.org/api\"\n",
+            "Minimal runtime shape:\n",
+            "import os\n",
+            "from pathlib import Path\n",
+            "import agentflow_cbioportal as cbio\n",
             "gene = os.environ.get(\"AGENTFLOW_PARAM_GENE\")\n",
             "out = os.environ.get(\"AGENTFLOW_OUTPUT_RESULT\")\n",
             "if not gene or not out: raise SystemExit(\"AGENTFLOW_PARAM_GENE and AGENTFLOW_OUTPUT_RESULT are required\")\n",
-            "url = API + \"/genes/\" + urllib.parse.quote(gene)\n",
-            "with urllib.request.urlopen(url, timeout=60) as resp:\n",
-            "    gene_info = json.load(resp)\n",
-            "open(out, \"w\").write(\"Gene: %s\\nentrez: %s\\n\" % (gene, gene_info[\"entrezGeneId\"]))\n\n",
+            "study = cbio.resolve_study(\"hepatocellular carcinoma\")\n",
+            "expr = cbio.fetch_expression(study, gene)\n",
+            "surv = cbio.fetch_overall_survival(study)\n",
+            "# analyze expr/surv honestly; if required data is absent, let the client exception fail loudly\n",
+            "Path(out).write_text(\"...real computed result...\\n\", encoding=\"utf-8\")\n\n",
             "Research hypothesis:\n{}\n\n",
             "Capability gap:\n{}\n\n",
             "Return exactly four sections with these markers and no extra text:\n",
@@ -886,7 +902,7 @@ fn build_auto_synth_repair_prompt(base_prompt: &str, error: &str, candidate_code
             "这是代码:\n{}\n\n",
             "修正它,仍遵守 no-fabrication 与双模契约: ",
             "SYNTH_INPUT fixture validation must stay deterministic and input-sensitive; ",
-            "runtime mode must read AGENTFLOW_PARAM_GENE, fetch/use real data, write AGENTFLOW_OUTPUT_RESULT, ",
+            "runtime mode must read AGENTFLOW_PARAM_GENE, import/use agentflow_cbioportal for cBioPortal data instead of writing HTTP/API calls, write AGENTFLOW_OUTPUT_RESULT, ",
             "print non-empty output, and loudly exit non-zero instead of fabricating fallback/default data. ",
             "Return exactly the same four sections: ===SCRIPT===, ===FIXTURE===, ===ALT_FIXTURE===, ===EXPECT===."
         ),
@@ -1197,6 +1213,7 @@ fn run_python_script(
     command
         .env_clear()
         .env("PATH", VALIDATION_PATH)
+        .env("PYTHONPATH", cbioportal_pythonpath_value())
         .env("AGENTFLOW_WORKDIR", workdir)
         .env("AGENTFLOW_OUTPUT_RESULT", &result_path)
         .arg("python3")
@@ -1292,6 +1309,7 @@ fn synthesized_tool_yaml(name: &str, description: &str, script_path: &Path) -> S
     let description = yaml_single_line(description);
     let maturity = ToolMaturity::Exploratory.as_str();
     let params_yaml = synthesized_params_yaml(DEFAULT_SYNTH_DOMAIN_PARAMS);
+    let pythonpath_env_arg = cbioportal_pythonpath_env_arg();
     format!(
         r#"schema_version: {}
 namespace: synth
@@ -1306,6 +1324,7 @@ runtime:
   backend: local
   command:
     - /usr/bin/env
+    - {}
     - python3
     - {}
 "#,
@@ -1315,6 +1334,7 @@ runtime:
         maturity,
         description,
         params_yaml,
+        pythonpath_env_arg,
         script_path.display()
     )
 }
@@ -1323,6 +1343,7 @@ fn synthesized_agent_tool_yaml(name: &str, description: &str, script_path: &Path
     let description = yaml_single_line(description);
     let maturity = ToolMaturity::Exploratory.as_str();
     let params_yaml = synthesized_params_yaml(DEFAULT_SYNTH_DOMAIN_PARAMS);
+    let pythonpath_env_arg = cbioportal_pythonpath_env_arg();
     format!(
         r#"schema_version: {}
 namespace: synth
@@ -1339,6 +1360,7 @@ runtime:
   timeout_seconds: 60
   command:
     - /usr/bin/env
+    - {}
     - python3
     - {}
 "#,
@@ -1348,8 +1370,27 @@ runtime:
         maturity,
         description,
         params_yaml,
+        pythonpath_env_arg,
         script_path.display()
     )
+}
+
+fn cbioportal_client_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("AGENTFLOW_CBIOPORTAL_CLIENT_DIR") {
+        return PathBuf::from(dir);
+    }
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(CBIOPORTAL_CLIENT_RELATIVE_DIR);
+    fs::canonicalize(&dir).unwrap_or(dir)
+}
+
+fn cbioportal_pythonpath_value() -> String {
+    cbioportal_client_dir().display().to_string()
+}
+
+fn cbioportal_pythonpath_env_arg() -> String {
+    format!("PYTHONPATH={}", cbioportal_pythonpath_value())
 }
 
 fn synthesized_params_yaml(params: &[SynthDomainParam]) -> String {
@@ -1757,6 +1798,27 @@ else:
             "--path".to_string(),
             path.display().to_string(),
         ])
+    }
+
+    #[test]
+    fn cbioportal_client_self_test_passes_without_network() {
+        let client = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("examples/tools/agentflow_cbioportal.py");
+
+        let output = std::process::Command::new("/usr/bin/env")
+            .arg("python3")
+            .arg(&client)
+            .arg("--self-test")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "client self-test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -2323,6 +2385,119 @@ steps:
     }
 
     #[test]
+    fn auto_synth_cbioportal_client_import_works_in_validation_and_registered_runtime() {
+        let path = temp_project_path("auto-cbio-client-import");
+        init_project(&path);
+        let store = ProjectStore::open(&path).unwrap();
+        let candidate = r##"===SCRIPT===
+import os
+from pathlib import Path
+import agentflow_cbioportal as cbio
+
+cbio.resolve_study = lambda cancer_keyword: "lihc_tcga_pan_can_atlas_2018"
+cbio.fetch_expression = lambda study_id, gene: {
+    f"{gene}_S1": 1.0,
+    f"{gene}_S2": 3.5,
+}
+cbio.fetch_overall_survival = lambda study_id: {
+    f"{study_id}_P1": (12.0, True),
+    f"{study_id}_P2": (30.0, False),
+}
+
+def emit(text):
+    output_path = os.environ.get("AGENTFLOW_OUTPUT_RESULT")
+    if not output_path:
+        raise SystemExit("AGENTFLOW_OUTPUT_RESULT is required")
+    Path(output_path).write_text(text, encoding="utf-8")
+    print(text, end="")
+
+gene = os.environ.get("AGENTFLOW_PARAM_GENE")
+if not gene:
+    raise SystemExit("AGENTFLOW_PARAM_GENE is required")
+mode = "runtime"
+fixture_value = "none"
+input_path = os.environ.get("SYNTH_INPUT")
+if input_path:
+    mode = "fixture"
+    fixture_value = Path(input_path).read_text(encoding="utf-8").strip()
+study = cbio.resolve_study("liver hepatocellular carcinoma")
+expr = cbio.fetch_expression(study, gene)
+surv = cbio.fetch_overall_survival(study)
+emit(
+    "# Auto synth report\n"
+    "CBIO_STUB_OK\n"
+    f"mode={mode}\n"
+    f"fixture={fixture_value}\n"
+    f"gene={gene}\n"
+    f"study={study}\n"
+    f"expression_samples={len(expr)}\n"
+    f"survival_patients={len(surv)}\n"
+)
+===FIXTURE===
+primary fixture value
+===ALT_FIXTURE===
+alternate fixture value
+===EXPECT===
+CBIO_STUB_OK
+"##;
+        let stub = write_stub_synthesizer(&path, "stub_auto_cbio_client.sh", candidate);
+        let synthesizer = format!("/bin/sh {}", stub.display());
+
+        let tool_ref = match auto_synthesize_agent_tool(
+            &store,
+            &synthesizer,
+            "MID1IP1 expression survival association in hepatocellular carcinoma",
+            "Need a cBioPortal-backed expression-survival association tool",
+            Some("MID1IP1"),
+        )
+        .unwrap()
+        {
+            AutoSynthToolResult::Registered(tool_ref) => tool_ref,
+            AutoSynthToolResult::Rejected(reason) => {
+                panic!("client-importing candidate should register: {reason}")
+            }
+        };
+
+        let inspection = store.inspect_tool(&tool_ref).unwrap();
+        assert!(inspection.spec_json.contains("PYTHONPATH="));
+
+        let flow = FlowDraft::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.flow.v0
+id: auto_cbio_runtime
+name: Auto cBio runtime
+steps:
+  - id: run_cbio
+    tool: {tool_ref}
+    needs: []
+    params:
+      gene: MID1IP1
+    outputs:
+      result: runtime_result
+"#
+        ))
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+        let summary = store.run_flow("auto_cbio_runtime").unwrap();
+        assert_eq!(summary.completed_steps, 1);
+        assert_eq!(summary.failed_steps, 0);
+
+        let computed = store
+            .list_artifacts()
+            .unwrap()
+            .into_iter()
+            .filter(|artifact| artifact.kind == "computed")
+            .collect::<Vec<_>>();
+        assert_eq!(computed.len(), 1);
+        let output = fs::read_to_string(&computed[0].path).unwrap();
+        assert!(output.contains("CBIO_STUB_OK"));
+        assert!(output.contains("mode=runtime"));
+        assert!(output.contains("gene=MID1IP1"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn auto_synth_prompt_forbids_default_or_illustrative_fallbacks() {
         let prompt = build_auto_synth_prompt(
             "MID1IP1 immunotherapy biomarker claim",
@@ -2340,6 +2515,26 @@ steps:
         assert!(prompt.contains("https://www.cbioportal.org/api"));
         assert!(prompt.contains("SYNTH_INPUT"));
         assert!(prompt.contains("tcga_survival_assoc.py"));
+    }
+
+    #[test]
+    fn auto_synth_prompt_directs_llm_to_use_verified_cbioportal_client() {
+        let prompt = build_auto_synth_prompt(
+            "MID1IP1 expression survival association in hepatocellular carcinoma",
+            "Need expression-survival association evidence",
+            Some("Discovered real cBioPortal identifiers: studyId=lihc_tcga_pan_can_atlas_2018, mrnaMolecularProfileId=lihc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna, sampleListId=lihc_tcga_pan_can_atlas_2018_all, api_base=https://www.cbioportal.org/api. Use these EXACT identifiers; do not guess."),
+        );
+
+        assert!(prompt.contains("import agentflow_cbioportal"));
+        assert!(prompt.contains("resolve_study(cancer_keyword) -> str"));
+        assert!(prompt.contains("fetch_expression(study_id, gene) -> dict"));
+        assert!(prompt.contains("fetch_overall_survival(study_id) -> dict"));
+        assert!(prompt.contains("do not write HTTP/API calls"));
+        assert!(prompt.contains("only write analysis logic"));
+        assert!(prompt.contains("AGENTFLOW_PARAM_GENE"));
+        assert!(prompt.contains("AGENTFLOW_OUTPUT_RESULT"));
+        assert!(prompt.contains("SYNTH_INPUT"));
+        assert!(prompt.contains("Discovered real cBioPortal identifiers"));
     }
 
     #[test]

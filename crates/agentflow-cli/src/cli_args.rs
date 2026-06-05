@@ -575,7 +575,13 @@ pub(crate) struct AgentRunArgs {
     #[arg(long)]
     pub(crate) apply: bool,
     #[arg(long)]
+    pub(crate) no_apply: bool,
+    #[arg(long)]
     pub(crate) auto_run: bool,
+    #[arg(long)]
+    pub(crate) no_auto_run: bool,
+    #[arg(long)]
+    pub(crate) dry_run: bool,
     #[arg(long, value_name = "flow-id")]
     pub(crate) flow: Vec<String>,
     #[arg(long, value_name = "n")]
@@ -585,13 +591,21 @@ pub(crate) struct AgentRunArgs {
     #[arg(long)]
     pub(crate) auto_synth: bool,
     #[arg(long)]
+    pub(crate) no_auto_synth: bool,
+    #[arg(long)]
     pub(crate) infer_params: bool,
     #[arg(long)]
+    pub(crate) no_infer_params: bool,
+    #[arg(long)]
     pub(crate) semantic_match: bool,
+    #[arg(long)]
+    pub(crate) no_semantic_match: bool,
     #[arg(long, value_name = "cmd")]
     pub(crate) synthesizer: Vec<String>,
     #[arg(long)]
     pub(crate) auto_forage: bool,
+    #[arg(long)]
+    pub(crate) no_auto_forage: bool,
     #[arg(long, value_name = "n")]
     pub(crate) forage_max: Vec<String>,
     #[arg(long, value_name = "path")]

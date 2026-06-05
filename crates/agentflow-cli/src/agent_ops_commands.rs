@@ -57,16 +57,16 @@ impl Default for AgentRunOptions {
     fn default() -> Self {
         Self {
             project: PathJsonOptions::default(),
-            apply: false,
-            auto_run: false,
+            apply: true,
+            auto_run: true,
             flow: None,
             max_apply: 5,
             propose_synth: false,
-            auto_synth: false,
-            infer_params: false,
-            semantic_match: false,
+            auto_synth: true,
+            infer_params: true,
+            semantic_match: true,
             synthesizer: None,
-            auto_forage: false,
+            auto_forage: true,
             forage_max: DEFAULT_AUTO_FORAGE_MAX,
             forage_script: None,
             python: None,
@@ -803,22 +803,31 @@ impl TryFrom<AgentRunArgs> for AgentRunOptions {
     type Error = CliError;
 
     fn try_from(args: AgentRunArgs) -> Result<Self, Self::Error> {
+        let dry_run = args.dry_run;
         let mut options = Self {
             project: PathJsonOptions::from(args.project),
-            apply: args.apply,
-            auto_run: args.auto_run,
+            apply: !args.no_apply,
+            auto_run: !args.no_auto_run,
             flow: last_value(args.flow),
             max_apply: 5,
             propose_synth: args.propose_synth,
-            auto_synth: args.auto_synth,
-            infer_params: args.infer_params,
-            semantic_match: args.semantic_match,
+            auto_synth: !args.no_auto_synth,
+            infer_params: !args.no_infer_params,
+            semantic_match: !args.no_semantic_match,
             synthesizer: last_value(args.synthesizer),
-            auto_forage: args.auto_forage,
+            auto_forage: !args.no_auto_forage,
             forage_max: DEFAULT_AUTO_FORAGE_MAX,
             forage_script: last_value(args.forage_script),
             python: last_value(args.python),
         };
+        if dry_run {
+            options.apply = false;
+            options.auto_run = false;
+            options.auto_synth = false;
+            options.infer_params = false;
+            options.semantic_match = false;
+            options.auto_forage = false;
+        }
 
         if let Some(value) = last_value(args.max_apply) {
             let max_apply = parse_usize_value("--max-apply", &value)?;
@@ -1573,6 +1582,35 @@ mod tests {
         items.iter().map(OsString::from).collect()
     }
 
+    fn agent_run_args_for_test() -> AgentRunArgs {
+        AgentRunArgs {
+            apply: false,
+            no_apply: false,
+            auto_run: false,
+            no_auto_run: false,
+            dry_run: false,
+            flow: Vec::new(),
+            max_apply: Vec::new(),
+            propose_synth: false,
+            auto_synth: false,
+            no_auto_synth: false,
+            infer_params: false,
+            no_infer_params: false,
+            semantic_match: false,
+            no_semantic_match: false,
+            synthesizer: Vec::new(),
+            auto_forage: false,
+            no_auto_forage: false,
+            forage_max: Vec::new(),
+            forage_script: Vec::new(),
+            python: Vec::new(),
+            project: PathJsonArgs {
+                path: Vec::new(),
+                json: false,
+            },
+        }
+    }
+
     fn temp_project_path(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "agentflow-cli-c2-{test_name}-{}-{}",
@@ -1871,16 +1909,27 @@ steps:
 cat <<'EOF'
 ===SCRIPT===
 import os
+from pathlib import Path
 
-result = "# Auto synth report\nAUTO_SYNTH_OK\n"
+input_path = os.environ.get("SYNTH_INPUT")
+if input_path:
+    lines = Path(input_path).read_text(encoding="utf-8").strip().splitlines()
+    value = lines[-1].split(",")[-1]
+else:
+    value = os.environ.get("AGENTFLOW_PARAM_GENE")
+    if not value:
+        raise SystemExit("AGENTFLOW_PARAM_GENE is required")
+result = f"# Auto synth report\nAUTO_SYNTH_OK\ngene={value}\nsource_value={value}\n"
 output_path = os.environ.get("AGENTFLOW_OUTPUT_RESULT")
 if output_path:
-    with open(output_path, "w", encoding="utf-8") as handle:
-        handle.write(result)
+    Path(output_path).write_text(result, encoding="utf-8")
 print(result, end="")
 ===FIXTURE===
 marker,value
 THRSP,3
+===ALT_FIXTURE===
+marker,value
+THRSP,99
 ===EXPECT===
 AUTO_SYNTH_OK
 EOF
@@ -1924,6 +1973,7 @@ EOF
             "agentflow",
             "agent",
             "run",
+            "--dry-run",
             "--path",
             path.to_str().unwrap(),
         ]))
@@ -1938,6 +1988,7 @@ EOF
             "agentflow",
             "agent",
             "run",
+            "--dry-run",
             "--json",
             "--path",
             path.to_str().unwrap(),
@@ -1955,9 +2006,13 @@ EOF
     fn agent_run_help_mentions_auto_synth() {
         let usage = run(args(&["agentflow", "--help"])).unwrap();
         assert!(usage.contains("[--auto-synth]"));
+        assert!(usage.contains("[--dry-run]"));
+        assert!(usage.contains("[--no-auto-synth]"));
 
         let help = run(args(&["agentflow", "agent", "run", "--help"])).unwrap();
         assert!(help.contains("--auto-synth"));
+        assert!(help.contains("--no-auto-synth"));
+        assert!(help.contains("--dry-run"));
     }
 
     #[test]
@@ -1976,6 +2031,7 @@ EOF
             "agent",
             "run",
             "--auto-synth",
+            "--no-auto-forage",
             "--synthesizer",
             &synthesizer,
             "--json",
@@ -2007,6 +2063,89 @@ EOF
     }
 
     #[test]
+    fn agent_run_defaults_to_forage_synth_apply_and_run_with_support_stubs() {
+        let path = temp_project_path("agent-run-default-full-auto");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis_with_statement(
+            &store,
+            "Auto synth THRSP pathway validation needs custom validation",
+        );
+        link_weak_evidence(&store, &hypothesis_id);
+        let synthesizer = write_auto_synthesizer_stub(&path);
+        let forage_script = path.join("forage-fixture.sh");
+        write_auto_forage_script(&forage_script, None);
+
+        let json = run(args(&[
+            "agentflow",
+            "agent",
+            "run",
+            "--synthesizer",
+            &synthesizer,
+            "--forage-max",
+            "1",
+            "--forage-script",
+            forage_script.to_str().unwrap(),
+            "--python",
+            "/bin/sh",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(json.contains("\"auto_forage\":{"), "{json}");
+        assert!(json.contains("\"hypotheses_foraged\":1"), "{json}");
+        assert!(json.contains("\"matched_fit\":\"synthesized\""), "{json}");
+        assert!(json.contains("\"type\":\"step_run\""), "{json}");
+        assert!(json.contains("\"kind\":\"stance_assessment\""), "{json}");
+        assert!(!json.contains("--auto-synth"), "{json}");
+        assert!(!store.list_observations().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn agent_run_options_default_to_full_auto_and_support_opt_outs() {
+        let default_args = agent_run_args_for_test();
+        let options = AgentRunOptions::try_from(default_args).unwrap();
+        assert!(options.apply);
+        assert!(options.auto_run);
+        assert!(options.auto_synth);
+        assert!(options.infer_params);
+        assert!(options.semantic_match);
+        assert!(options.auto_forage);
+
+        let dry_run_args = AgentRunArgs {
+            dry_run: true,
+            ..agent_run_args_for_test()
+        };
+        let dry_run = AgentRunOptions::try_from(dry_run_args).unwrap();
+        assert!(!dry_run.apply);
+        assert!(!dry_run.auto_run);
+        assert!(!dry_run.auto_synth);
+        assert!(!dry_run.infer_params);
+        assert!(!dry_run.semantic_match);
+        assert!(!dry_run.auto_forage);
+
+        let no_args = AgentRunArgs {
+            no_apply: true,
+            no_auto_run: true,
+            no_auto_synth: true,
+            no_infer_params: true,
+            no_semantic_match: true,
+            no_auto_forage: true,
+            ..agent_run_args_for_test()
+        };
+        let old_behavior = AgentRunOptions::try_from(no_args).unwrap();
+        assert!(!old_behavior.apply);
+        assert!(!old_behavior.auto_run);
+        assert!(!old_behavior.auto_synth);
+        assert!(!old_behavior.infer_params);
+        assert!(!old_behavior.semantic_match);
+        assert!(!old_behavior.auto_forage);
+    }
+
+    #[test]
     fn agent_run_semantic_match_promotes_relevant_low_tool_from_stub_backend() {
         let path = temp_project_path("agent-run-semantic-match");
         let store = init_project(&path);
@@ -2020,6 +2159,12 @@ EOF
             "agentflow",
             "agent",
             "run",
+            "--no-apply",
+            "--no-auto-run",
+            "--no-auto-synth",
+            "--no-infer-params",
+            "--no-semantic-match",
+            "--no-auto-forage",
             "--json",
             "--path",
             path.to_str().unwrap(),
@@ -2035,6 +2180,11 @@ EOF
             "agent",
             "run",
             "--semantic-match",
+            "--no-apply",
+            "--no-auto-run",
+            "--no-auto-synth",
+            "--no-infer-params",
+            "--no-auto-forage",
             "--synthesizer",
             &synthesizer,
             "--json",
@@ -2066,6 +2216,12 @@ EOF
             "agentflow",
             "agent",
             "run",
+            "--no-apply",
+            "--no-auto-run",
+            "--no-auto-synth",
+            "--no-infer-params",
+            "--no-semantic-match",
+            "--no-auto-forage",
             "--json",
             "--path",
             path.to_str().unwrap(),
@@ -2079,6 +2235,11 @@ EOF
             "agent",
             "run",
             "--infer-params",
+            "--no-apply",
+            "--no-auto-run",
+            "--no-auto-synth",
+            "--no-semantic-match",
+            "--no-auto-forage",
             "--synthesizer",
             &synthesizer,
             "--json",
@@ -2110,6 +2271,11 @@ EOF
             "agent",
             "run",
             "--auto-forage",
+            "--no-apply",
+            "--no-auto-run",
+            "--no-auto-synth",
+            "--no-infer-params",
+            "--no-semantic-match",
             "--forage-max",
             "2",
             "--forage-script",
@@ -2162,6 +2328,11 @@ EOF
             "agent",
             "run",
             "--auto-forage",
+            "--no-apply",
+            "--no-auto-run",
+            "--no-auto-synth",
+            "--no-infer-params",
+            "--no-semantic-match",
             "--forage-script",
             script.to_str().unwrap(),
             "--python",
@@ -2198,6 +2369,11 @@ EOF
             "agent",
             "run",
             "--auto-forage",
+            "--no-apply",
+            "--no-auto-run",
+            "--no-auto-synth",
+            "--no-infer-params",
+            "--no-semantic-match",
             "--forage-script",
             script.to_str().unwrap(),
             "--python",
@@ -2238,6 +2414,11 @@ EOF
             "agent",
             "run",
             "--apply",
+            "--no-auto-run",
+            "--no-auto-synth",
+            "--no-infer-params",
+            "--no-semantic-match",
+            "--no-auto-forage",
             "--max-apply",
             "1",
             "--json",
@@ -2276,6 +2457,10 @@ EOF
             "--flow",
             "auto_flow",
             "--auto-run",
+            "--no-auto-synth",
+            "--no-infer-params",
+            "--no-semantic-match",
+            "--no-auto-forage",
             "--json",
             "--path",
             path.to_str().unwrap(),

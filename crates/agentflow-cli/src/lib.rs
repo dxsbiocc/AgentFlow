@@ -95,7 +95,7 @@ pub fn usage() -> String {
         "  agentflow evidence list --hypothesis <id> [--json] [--path <path>]",
         "  agentflow verdict render --hypothesis <id> [--json] [--path <path>] [--gate-supports <text> --gate-against <text> --gate-alternatives <text> --gate-data-risks <text> --gate-assumptions <text> --gate-falsifier <text> --gate-claim-basis observed|inferred|speculative --gate-not-yet <text>]",
         "  agentflow verdict show --hypothesis <id> [--json] [--path <path>]",
-        "  agentflow agent run [--apply] [--auto-run] [--flow <flow-id>] [--max-apply <n>] [--propose-synth] [--auto-synth] [--infer-params] [--semantic-match] [--synthesizer <cmd>] [--auto-forage] [--forage-max <n>] [--forage-script <path>] [--python <bin>] [--json] [--path <path>]",
+        "  agentflow agent run [--apply] [--no-apply] [--auto-run] [--no-auto-run] [--dry-run] [--flow <flow-id>] [--max-apply <n>] [--propose-synth] [--auto-synth] [--no-auto-synth] [--infer-params] [--no-infer-params] [--semantic-match] [--no-semantic-match] [--synthesizer <cmd>] [--auto-forage] [--no-auto-forage] [--forage-max <n>] [--forage-script <path>] [--python <bin>] [--json] [--path <path>]",
         "  agentflow branch candidates [--json] [--path <path>]",
         "  agentflow branch select [--explore] [--json] [--path <path>]",
         "  agentflow decision list [--json] [--path <path>]",
@@ -2771,6 +2771,42 @@ steps:
         assert!(env.contains("DEEPSEEK_API_KEY='test-deepseek-secret'"));
         assert!(env.contains("DEEPSEEK_MODEL='deepseek-v4-flash'"));
         assert!(env.contains("DEEPSEEK_BASE_URL='https://api.deepseek.com/v1'"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn llm_config_deepseek_accepts_explicit_v4_pro_model() {
+        let path = temp_project_path("llm-config-deepseek-pro");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let output = run(args(&[
+            "agentflow",
+            "llm",
+            "config",
+            "--provider",
+            "deepseek",
+            "--api-key",
+            "test-deepseek-secret",
+            "--model",
+            "deepseek-v4-pro",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(output.contains("\"model\":\"deepseek-v4-pro\""));
+        let env = fs::read_to_string(path.join(".agentflow/llm.env")).unwrap();
+        assert!(env.contains("DEEPSEEK_MODEL='deepseek-v4-pro'"));
 
         let _ = fs::remove_dir_all(path);
     }

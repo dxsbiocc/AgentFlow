@@ -17,6 +17,20 @@ pub(crate) const DEFAULT_SYNTHESIZER: &str = "claude -p";
 const SYNTH_VERSION: &str = "0.1.0";
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(60);
 const VALIDATION_PATH: &str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
+const PRIMARY_VALIDATION_GENE: &str = "TP53";
+const ALTERNATE_VALIDATION_GENE: &str = "EGFR";
+const DEFAULT_SYNTH_DOMAIN_PARAMS: &[SynthDomainParam] = &[SynthDomainParam {
+    name: "gene",
+    type_name: "string",
+    required: true,
+}];
+
+#[derive(Debug, Clone, Copy)]
+struct SynthDomainParam {
+    name: &'static str,
+    type_name: &'static str,
+    required: bool,
+}
 
 #[derive(Debug, Default)]
 struct SynthOptions {
@@ -37,10 +51,16 @@ struct ValidationOutput {
     result_output: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SynthValidationInputs {
+    gene: &'static str,
+}
+
 #[derive(Debug)]
 struct AutoSynthCandidate {
     script: String,
     fixture: String,
+    alternate_fixture: String,
     expect: String,
 }
 
@@ -168,31 +188,67 @@ pub(crate) fn auto_synthesize_agent_tool(
     );
     let script_path = synth_script_path(store.root_path(), &name);
     let fixture_path = auto_synth_fixture_path(store.root_path(), &name);
+    let alternate_fixture_path = auto_synth_alternate_fixture_path(store.root_path(), &name);
     if let Some(parent) = script_path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(&script_path, candidate.script.as_bytes())?;
     fs::write(&fixture_path, candidate.fixture.as_bytes())?;
+    fs::write(
+        &alternate_fixture_path,
+        candidate.alternate_fixture.as_bytes(),
+    )?;
     let script_path = fs::canonicalize(&script_path)?;
     let fixture_path = fs::canonicalize(&fixture_path)?;
+    let alternate_fixture_path = fs::canonicalize(&alternate_fixture_path)?;
 
-    let fixture_validation = validate_candidate_script(&script_path, &fixture_path)?;
+    let fixture_validation = validate_candidate_script_with_inputs(
+        &script_path,
+        &fixture_path,
+        SynthValidationInputs {
+            gene: PRIMARY_VALIDATION_GENE,
+        },
+    )?;
     if !auto_synth_validation_passed(&fixture_validation, &candidate.expect) {
-        cleanup_auto_synth_candidate(&script_path, &fixture_path);
+        cleanup_auto_synth_candidate(&script_path, &[&fixture_path, &alternate_fixture_path]);
         return Ok(AutoSynthToolResult::Rejected(auto_synth_rejection_reason(
             "fixture smoke",
             &fixture_validation,
             &candidate.expect,
         )));
     }
-    let runtime_validation = validate_runtime_candidate_script(&script_path)?;
-    if !auto_synth_validation_passed(&runtime_validation, &candidate.expect) {
-        cleanup_auto_synth_candidate(&script_path, &fixture_path);
+    let alternate_validation = validate_candidate_script_with_inputs(
+        &script_path,
+        &alternate_fixture_path,
+        SynthValidationInputs {
+            gene: ALTERNATE_VALIDATION_GENE,
+        },
+    )?;
+    if !auto_synth_validation_passed(&alternate_validation, &candidate.expect) {
+        cleanup_auto_synth_candidate(&script_path, &[&fixture_path, &alternate_fixture_path]);
         return Ok(AutoSynthToolResult::Rejected(auto_synth_rejection_reason(
-            "runtime smoke",
-            &runtime_validation,
+            "alternate fixture smoke",
+            &alternate_validation,
             &candidate.expect,
         )));
+    }
+    if let Err(reason) = validate_input_sensitivity(
+        &fixture_validation,
+        &alternate_validation,
+        &[&fixture_path, &alternate_fixture_path],
+    ) {
+        cleanup_auto_synth_candidate(&script_path, &[&fixture_path, &alternate_fixture_path]);
+        return Ok(AutoSynthToolResult::Rejected(reason));
+    }
+    let runtime_validation = validate_runtime_candidate_script(&script_path)?;
+    if let Err(reason) = validate_no_input_runtime_behavior(
+        &runtime_validation,
+        &fixture_validation,
+        &alternate_validation,
+        &[&fixture_path, &alternate_fixture_path],
+    ) {
+        cleanup_auto_synth_candidate(&script_path, &[&fixture_path, &alternate_fixture_path]);
+        return Ok(AutoSynthToolResult::Rejected(reason));
     }
 
     let spec_yaml = synthesized_agent_tool_yaml(&name, &description, &script_path);
@@ -228,6 +284,9 @@ fn build_synth_prompt(description: &str) -> String {
             "Write a self-contained Python 3 script using only the Python standard library.\n",
             "The script must read the input file path from the SYNTH_INPUT environment variable.\n",
             "The script must write its result to stdout.\n",
+            "The script must compute its output from the real input data it reads.\n",
+            "禁止硬编码、编造、default、sample、demo、placeholder 或 illustrative 数值/结论。\n",
+            "If the required real data is unavailable, exit non-zero with a clear error instead of using fallback values.\n",
             "Task description:\n",
             "{}\n\n",
             "Return only raw Python code. Do not include markdown fences, explanations, or comments outside the code."
@@ -240,18 +299,37 @@ fn build_auto_synth_prompt(hypothesis_statement: &str, capability_need: &str) ->
     format!(
         concat!(
             "You are writing an AgentFlow exploratory analysis tool. Use only Python 3 standard library.\n",
-            "The tool must be self-contained and deterministic for a smoke fixture.\n",
-            "At runtime, write the main Markdown/Text result to the file path in AGENTFLOW_OUTPUT_RESULT.\n",
-            "Also print the same result to stdout so smoke validation can inspect it.\n",
-            "The registered tool will NOT receive SYNTH_INPUT at runtime, so it must still succeed when SYNTH_INPUT is unset.\n",
-            "You may optionally read a smoke fixture from SYNTH_INPUT during validation, but do not require network access.\n\n",
+            "The generated tool spec will declare a required domain parameter named gene, so runtime receives AGENTFLOW_PARAM_GENE.\n",
+            "The tool must support two modes with the same calculation logic:\n",
+            "1. Runtime mode: when SYNTH_INPUT is unset, read domain parameters from AGENTFLOW_PARAM_<UPPER_NAME>, especially AGENTFLOW_PARAM_GENE.\n",
+            "   Fetch real data from public sources such as cBioPortal REST at https://www.cbioportal.org/api (other public sources are allowed).\n",
+            "   Write the main Markdown/Text result to the path in AGENTFLOW_OUTPUT_RESULT and also print it to stdout.\n",
+            "2. Validation mode: when SYNTH_INPUT is set, read that fixture file, run the same deterministic calculation logic offline, write AGENTFLOW_OUTPUT_RESULT, and print stdout.\n",
+            "禁止硬编码或编造 HR、p-value、correlation、effect size、biomarker grade、sample count, or any other numeric/stance result.\n",
+            "Do not use DEFAULT_PANEL, default, demo, sample, placeholder, illustrative, toy, or fallback conclusions.\n",
+            "真实数据不可得时必须 loudly fail: print a clear error to stderr and 非零退出 (exit non-zero).\n",
+            "Never silently succeed with default/illustrative fallback data.\n",
+            "During validation, SYNTH_INPUT will point to two meaningfully different fixtures; AGENTFLOW_PARAM_GENE will be TP53 for the first fixture and EGFR for the second fixture; the normalized output must change when these inputs change.\n",
+            "If neither SYNTH_INPUT fixture data nor runtime real public data is available, exit non-zero instead of inventing data.\n\n",
+            "Few-shot runtime contract from examples/tools/tcga_survival_assoc.py, adapted to AGENTFLOW_OUTPUT_RESULT:\n",
+            "import os, urllib.request, urllib.parse, json\n",
+            "API = \"https://www.cbioportal.org/api\"\n",
+            "gene = os.environ.get(\"AGENTFLOW_PARAM_GENE\")\n",
+            "out = os.environ.get(\"AGENTFLOW_OUTPUT_RESULT\")\n",
+            "if not gene or not out: raise SystemExit(\"AGENTFLOW_PARAM_GENE and AGENTFLOW_OUTPUT_RESULT are required\")\n",
+            "url = API + \"/genes/\" + urllib.parse.quote(gene)\n",
+            "with urllib.request.urlopen(url, timeout=60) as resp:\n",
+            "    gene_info = json.load(resp)\n",
+            "open(out, \"w\").write(\"Gene: %s\\nentrez: %s\\n\" % (gene, gene_info[\"entrezGeneId\"]))\n\n",
             "Research hypothesis:\n{}\n\n",
             "Capability gap:\n{}\n\n",
-            "Return exactly three sections with these markers and no extra text:\n",
+            "Return exactly four sections with these markers and no extra text:\n",
             "===SCRIPT===\n",
             "<raw Python code>\n",
             "===FIXTURE===\n",
             "<small fixture text for SYNTH_INPUT>\n",
+            "===ALT_FIXTURE===\n",
+            "<second fixture with materially different values/entities from FIXTURE>\n",
             "===EXPECT===\n",
             "<one substring that must appear in stdout and AGENTFLOW_OUTPUT_RESULT>\n"
         ),
@@ -263,6 +341,7 @@ fn build_auto_synth_prompt(hypothesis_statement: &str, capability_need: &str) ->
 fn parse_auto_synth_candidate(candidate: &str) -> Result<AutoSynthCandidate, CliError> {
     let script = strip_markdown_fence(&required_section(candidate, "SCRIPT")?);
     let fixture = strip_markdown_fence(&required_section(candidate, "FIXTURE")?);
+    let alternate_fixture = strip_markdown_fence(&required_section(candidate, "ALT_FIXTURE")?);
     let expect = required_section(candidate, "EXPECT")?
         .lines()
         .map(str::trim)
@@ -270,15 +349,28 @@ fn parse_auto_synth_candidate(candidate: &str) -> Result<AutoSynthCandidate, Cli
         .unwrap_or_default()
         .to_string();
 
-    if script.trim().is_empty() || fixture.trim().is_empty() || expect.trim().is_empty() {
+    if script.trim().is_empty()
+        || fixture.trim().is_empty()
+        || alternate_fixture.trim().is_empty()
+        || expect.trim().is_empty()
+    {
         return Err(CliError::Core(
-            "auto-synth candidate is missing script, fixture, or expect section".to_string(),
+            "auto-synth candidate is missing script, fixture, alternate fixture, or expect section"
+                .to_string(),
+        ));
+    }
+    if normalize_fixture_for_comparison(&fixture)
+        == normalize_fixture_for_comparison(&alternate_fixture)
+    {
+        return Err(CliError::Core(
+            "auto-synth candidate fixtures are not meaningfully different".to_string(),
         ));
     }
 
     Ok(AutoSynthCandidate {
         script,
         fixture,
+        alternate_fixture,
         expect,
     })
 }
@@ -473,18 +565,47 @@ fn auto_synth_fixture_path(project_root: &Path, name: &str) -> PathBuf {
         .join(format!("{name}.fixture.txt"))
 }
 
-fn cleanup_auto_synth_candidate(script_path: &Path, fixture_path: &Path) {
+fn auto_synth_alternate_fixture_path(project_root: &Path, name: &str) -> PathBuf {
+    project_root
+        .join(".agentflow")
+        .join("synth")
+        .join(format!("{name}.alt.fixture.txt"))
+}
+
+fn cleanup_auto_synth_candidate(script_path: &Path, fixture_paths: &[&Path]) {
     let _ = fs::remove_file(script_path);
-    let _ = fs::remove_file(fixture_path);
+    for fixture_path in fixture_paths {
+        let _ = fs::remove_file(fixture_path);
+    }
 }
 
 fn validate_candidate_script(
     script_path: &Path,
     fixture: &Path,
 ) -> Result<ValidationOutput, CliError> {
+    validate_candidate_script_with_inputs(
+        script_path,
+        fixture,
+        SynthValidationInputs {
+            gene: PRIMARY_VALIDATION_GENE,
+        },
+    )
+}
+
+fn validate_candidate_script_with_inputs(
+    script_path: &Path,
+    fixture: &Path,
+    inputs: SynthValidationInputs,
+) -> Result<ValidationOutput, CliError> {
     let workdir = isolated_workdir()?;
     fs::create_dir_all(&workdir)?;
-    let result = run_python_script(script_path, Some(fixture), &workdir, VALIDATION_TIMEOUT);
+    let result = run_python_script(
+        script_path,
+        Some(fixture),
+        &workdir,
+        VALIDATION_TIMEOUT,
+        inputs,
+    );
     let _ = fs::remove_dir_all(&workdir);
     result
 }
@@ -492,7 +613,15 @@ fn validate_candidate_script(
 fn validate_runtime_candidate_script(script_path: &Path) -> Result<ValidationOutput, CliError> {
     let workdir = isolated_workdir()?;
     fs::create_dir_all(&workdir)?;
-    let result = run_python_script(script_path, None, &workdir, VALIDATION_TIMEOUT);
+    let result = run_python_script(
+        script_path,
+        None,
+        &workdir,
+        VALIDATION_TIMEOUT,
+        SynthValidationInputs {
+            gene: PRIMARY_VALIDATION_GENE,
+        },
+    );
     let _ = fs::remove_dir_all(&workdir);
     result
 }
@@ -502,6 +631,7 @@ fn run_python_script(
     fixture: Option<&Path>,
     workdir: &Path,
     timeout: Duration,
+    inputs: SynthValidationInputs,
 ) -> Result<ValidationOutput, CliError> {
     let result_path = workdir.join("result.txt");
     let mut command = Command::new("/usr/bin/env");
@@ -515,6 +645,7 @@ fn run_python_script(
         .current_dir(workdir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    set_validation_domain_param_env(&mut command, inputs);
     if let Some(fixture) = fixture {
         command.env("SYNTH_INPUT", fixture);
     }
@@ -557,6 +688,39 @@ fn run_python_script(
     }
 }
 
+fn set_validation_domain_param_env(command: &mut Command, inputs: SynthValidationInputs) {
+    for param in DEFAULT_SYNTH_DOMAIN_PARAMS {
+        let Some(value) = validation_value_for_domain_param(param, inputs) else {
+            continue;
+        };
+        command.env(synth_domain_param_env_name(param.name), value);
+    }
+}
+
+fn validation_value_for_domain_param(
+    param: &SynthDomainParam,
+    inputs: SynthValidationInputs,
+) -> Option<&'static str> {
+    match param.name {
+        "gene" => Some(inputs.gene),
+        _ => None,
+    }
+}
+
+fn synth_domain_param_env_name(name: &str) -> String {
+    let key = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("AGENTFLOW_PARAM_{key}")
+}
+
 fn isolated_workdir() -> Result<PathBuf, CliError> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -568,6 +732,7 @@ fn isolated_workdir() -> Result<PathBuf, CliError> {
 fn synthesized_tool_yaml(name: &str, description: &str, script_path: &Path) -> String {
     let description = yaml_single_line(description);
     let maturity = ToolMaturity::Exploratory.as_str();
+    let params_yaml = synthesized_params_yaml(DEFAULT_SYNTH_DOMAIN_PARAMS);
     format!(
         r#"schema_version: {}
 namespace: synth
@@ -575,11 +740,7 @@ name: {}
 version: {}
 maturity: {}
 description: {}
-params:
-  input:
-    type: string
-    required: true
-outputs:
+{}outputs:
   result:
     type: Text
 runtime:
@@ -594,6 +755,7 @@ runtime:
         SYNTH_VERSION,
         maturity,
         description,
+        params_yaml,
         script_path.display()
     )
 }
@@ -601,6 +763,7 @@ runtime:
 fn synthesized_agent_tool_yaml(name: &str, description: &str, script_path: &Path) -> String {
     let description = yaml_single_line(description);
     let maturity = ToolMaturity::Exploratory.as_str();
+    let params_yaml = synthesized_params_yaml(DEFAULT_SYNTH_DOMAIN_PARAMS);
     format!(
         r#"schema_version: {}
 namespace: synth
@@ -608,7 +771,7 @@ name: {}
 version: {}
 maturity: {}
 description: {}
-outputs:
+{}outputs:
   result:
     type: Markdown
     observer: artifact_summary
@@ -625,8 +788,171 @@ runtime:
         SYNTH_VERSION,
         maturity,
         description,
+        params_yaml,
         script_path.display()
     )
+}
+
+fn synthesized_params_yaml(params: &[SynthDomainParam]) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+
+    let entries = params
+        .iter()
+        .map(|param| {
+            format!(
+                "  {}:\n    type: {}\n    required: {}\n",
+                param.name, param.type_name, param.required
+            )
+        })
+        .collect::<String>();
+    format!("params:\n{entries}")
+}
+
+fn validate_input_sensitivity(
+    primary: &ValidationOutput,
+    alternate: &ValidationOutput,
+    fixture_paths: &[&Path],
+) -> Result<(), String> {
+    let primary_output =
+        normalize_output_for_sensitivity(validation_result_text(primary), fixture_paths);
+    let alternate_output =
+        normalize_output_for_sensitivity(validation_result_text(alternate), fixture_paths);
+    if primary_output == alternate_output {
+        return Err(format!(
+            concat!(
+                "candidate failed input sensitivity: normalized outputs were identical ",
+                "across distinct fixtures; primary={}, alternate={}"
+            ),
+            snippet(validation_result_text(primary)),
+            snippet(validation_result_text(alternate))
+        ));
+    }
+    Ok(())
+}
+
+fn validate_no_input_runtime_behavior(
+    runtime: &ValidationOutput,
+    primary: &ValidationOutput,
+    alternate: &ValidationOutput,
+    fixture_paths: &[&Path],
+) -> Result<(), String> {
+    if runtime.timed_out {
+        return Err(format!(
+            "candidate failed no-input runtime check: timed_out=true, stdout={}, stderr={}",
+            snippet(&runtime.stdout),
+            snippet(&runtime.stderr)
+        ));
+    }
+
+    if runtime.exit_code != Some(0) {
+        return Ok(());
+    }
+
+    if validation_result_text(runtime).trim().is_empty() {
+        return Err("candidate failed no-input runtime check: exited 0 without output".to_string());
+    }
+
+    let runtime_output =
+        normalize_output_for_sensitivity(validation_result_text(runtime), fixture_paths);
+    let primary_output =
+        normalize_output_for_sensitivity(validation_result_text(primary), fixture_paths);
+    let alternate_output =
+        normalize_output_for_sensitivity(validation_result_text(alternate), fixture_paths);
+    if runtime_output == primary_output || runtime_output == alternate_output {
+        return Err(format!(
+            concat!(
+                "candidate failed no-input runtime check: output matched fixture smoke output, ",
+                "suggesting a default fallback; stdout={}, stderr={}"
+            ),
+            snippet(&runtime.stdout),
+            snippet(&runtime.stderr)
+        ));
+    }
+
+    Ok(())
+}
+
+fn validation_result_text(validation: &ValidationOutput) -> &str {
+    validation
+        .result_output
+        .as_deref()
+        .filter(|output| !output.trim().is_empty())
+        .unwrap_or(&validation.stdout)
+}
+
+fn normalize_fixture_for_comparison(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_output_for_sensitivity(value: &str, volatile_paths: &[&Path]) -> String {
+    let mut normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    for path in volatile_paths {
+        normalized = replace_path_variants(&normalized, path);
+    }
+
+    normalized
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .map(mask_volatile_token)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn replace_path_variants(value: &str, path: &Path) -> String {
+    let mut normalized = value.replace(&path.display().to_string(), "<input-path>");
+    if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+        normalized = normalized.replace(file_name, "<input-file>");
+    }
+    normalized
+}
+
+fn mask_volatile_token(token: &str) -> String {
+    if contains_iso_date(token) || contains_clock_time(token) || is_epoch_like(token) {
+        "<volatile>".to_string()
+    } else {
+        token.to_string()
+    }
+}
+
+fn contains_iso_date(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.windows(10).any(|window| {
+        window[0].is_ascii_digit()
+            && window[1].is_ascii_digit()
+            && window[2].is_ascii_digit()
+            && window[3].is_ascii_digit()
+            && window[4] == b'-'
+            && window[5].is_ascii_digit()
+            && window[6].is_ascii_digit()
+            && window[7] == b'-'
+            && window[8].is_ascii_digit()
+            && window[9].is_ascii_digit()
+    })
+}
+
+fn contains_clock_time(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.windows(5).any(|window| {
+        window[0].is_ascii_digit()
+            && window[1].is_ascii_digit()
+            && window[2] == b':'
+            && window[3].is_ascii_digit()
+            && window[4].is_ascii_digit()
+    })
+}
+
+fn is_epoch_like(token: &str) -> bool {
+    let trimmed = token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+    trimmed.len() >= 10 && trimmed.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn auto_synth_validation_passed(validation: &ValidationOutput, expect: &str) -> bool {
@@ -756,6 +1082,8 @@ fn stderr_summary(stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+
+    use agentflow_core::storage::FlowDraft;
 
     use super::*;
 
@@ -947,6 +1275,8 @@ print(Path(os.environ["SYNTH_INPUT"]).read_text(), end="")"#;
 print("wrong output")
 ===FIXTURE===
 fixture,line
+===ALT_FIXTURE===
+fixture,other-line
 ===EXPECT===
 expected-line
 "#;
@@ -976,37 +1306,42 @@ expected-line
     }
 
     #[test]
-    fn auto_synth_rejects_fixture_dependent_runtime_script() {
-        let path = temp_project_path("auto-runtime-rejected");
+    fn auto_synth_rejects_input_invariant_script_without_leaving_script() {
+        let path = temp_project_path("auto-invariant-rejected");
         init_project(&path);
         let store = ProjectStore::open(&path).unwrap();
-        let candidate = r#"===SCRIPT===
+        let candidate = r##"===SCRIPT===
 import os
 from pathlib import Path
 
-result = Path(os.environ["SYNTH_INPUT"]).read_text()
+_ = Path(os.environ["SYNTH_INPUT"]).read_text()
+result = "# Auto synth report\nAUTO_SYNTH_OK\nhardcoded_hr=1.42\n"
 output_path = os.environ.get("AGENTFLOW_OUTPUT_RESULT")
 if output_path:
     Path(output_path).write_text(result, encoding="utf-8")
 print(result, end="")
 ===FIXTURE===
-fixture-runtime-ok
+cohort,hr
+A,1.11
+===ALT_FIXTURE===
+cohort,hr
+B,9.99
 ===EXPECT===
-fixture-runtime-ok
-"#;
-        let stub = write_stub_synthesizer(&path, "stub_auto_fixture_only.sh", candidate);
+AUTO_SYNTH_OK
+"##;
+        let stub = write_stub_synthesizer(&path, "stub_auto_invariant.sh", candidate);
         let synthesizer = format!("/bin/sh {}", stub.display());
 
         let outcome = auto_synthesize_agent_tool(
             &store,
             &synthesizer,
-            "Auto synth runtime parity hypothesis",
-            "Need a custom rejected runtime tool",
+            "Auto synth invariant hypothesis",
+            "Need a custom input-sensitive tool",
         )
         .unwrap();
 
         match outcome {
-            AutoSynthToolResult::Rejected(reason) => assert!(reason.contains("runtime smoke")),
+            AutoSynthToolResult::Rejected(reason) => assert!(reason.contains("input sensitivity")),
             AutoSynthToolResult::Registered(tool_ref) => {
                 panic!("unexpected auto-synth registration: {tool_ref}")
             }
@@ -1017,6 +1352,234 @@ fixture-runtime-ok
         assert_eq!(synth_entries, 0);
 
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_synth_accepts_input_sensitive_script_that_fails_loudly_without_data() {
+        let path = temp_project_path("auto-sensitive-accepted");
+        init_project(&path);
+        let store = ProjectStore::open(&path).unwrap();
+        let candidate = r##"===SCRIPT===
+import os
+from pathlib import Path
+
+input_path = os.environ.get("SYNTH_INPUT")
+if not input_path:
+    raise SystemExit("real data source unavailable")
+lines = Path(input_path).read_text(encoding="utf-8").strip().splitlines()
+value = lines[-1].split(",")[-1]
+result = f"# Auto synth report\nAUTO_SYNTH_OK\nsource_value={value}\n"
+output_path = os.environ.get("AGENTFLOW_OUTPUT_RESULT")
+if output_path:
+    Path(output_path).write_text(result, encoding="utf-8")
+print(result, end="")
+===FIXTURE===
+cohort,value
+A,1.11
+===ALT_FIXTURE===
+cohort,value
+B,9.99
+===EXPECT===
+AUTO_SYNTH_OK
+"##;
+        let stub = write_stub_synthesizer(&path, "stub_auto_sensitive.sh", candidate);
+        let synthesizer = format!("/bin/sh {}", stub.display());
+
+        let outcome = auto_synthesize_agent_tool(
+            &store,
+            &synthesizer,
+            "Auto synth sensitive hypothesis",
+            "Need a custom input-sensitive tool",
+        )
+        .unwrap();
+
+        match outcome {
+            AutoSynthToolResult::Registered(tool_ref) => {
+                assert!(tool_ref.starts_with("synth/auto_synth_"));
+            }
+            AutoSynthToolResult::Rejected(reason) => {
+                panic!("input-sensitive candidate should register: {reason}")
+            }
+        }
+
+        let tools = store.list_tools().unwrap();
+        assert_eq!(tools.len(), 1);
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_synth_accepts_dual_mode_script_requiring_gene_during_fixture_validation() {
+        let path = temp_project_path("auto-gene-fixture-env");
+        init_project(&path);
+        let store = ProjectStore::open(&path).unwrap();
+        let candidate = r##"===SCRIPT===
+import os
+from pathlib import Path
+
+gene = os.environ.get("AGENTFLOW_PARAM_GENE")
+output_path = os.environ.get("AGENTFLOW_OUTPUT_RESULT")
+if not gene or not output_path:
+    raise SystemExit("ERROR: AGENTFLOW_PARAM_GENE and AGENTFLOW_OUTPUT_RESULT must be set")
+
+input_path = os.environ.get("SYNTH_INPUT")
+if not input_path:
+    raise SystemExit("real data source unavailable")
+
+expected_gene, fixture_value = Path(input_path).read_text(encoding="utf-8").strip().split(",", 1)
+if gene != expected_gene:
+    raise SystemExit(f"expected validation gene {expected_gene}, got {gene}")
+result = f"# Auto synth report\nAUTO_SYNTH_OK\ngene={gene}\nfixture={fixture_value}\n"
+Path(output_path).write_text(result, encoding="utf-8")
+print(result, end="")
+===FIXTURE===
+TP53,primary_fixture
+===ALT_FIXTURE===
+EGFR,alternate_fixture
+===EXPECT===
+AUTO_SYNTH_OK
+"##;
+        let stub = write_stub_synthesizer(&path, "stub_auto_gene_fixture_env.sh", candidate);
+        let synthesizer = format!("/bin/sh {}", stub.display());
+
+        let outcome = auto_synthesize_agent_tool(
+            &store,
+            &synthesizer,
+            "TP53 and EGFR fixture-backed biomarker claim",
+            "Need a gene-specific dual-mode tool",
+        )
+        .unwrap();
+
+        match outcome {
+            AutoSynthToolResult::Registered(tool_ref) => {
+                assert!(tool_ref.starts_with("synth/auto_synth_"));
+            }
+            AutoSynthToolResult::Rejected(reason) => {
+                panic!("gene-requiring fixture candidate should register: {reason}")
+            }
+        }
+
+        let tools = store.list_tools().unwrap();
+        assert_eq!(tools.len(), 1);
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_synth_declares_gene_param_and_runtime_uses_agentflow_param_gene() {
+        let path = temp_project_path("auto-gene-runtime");
+        init_project(&path);
+        let store = ProjectStore::open(&path).unwrap();
+        let candidate = r##"===SCRIPT===
+import os
+from pathlib import Path
+
+def emit(gene, source):
+    result = f"# Auto synth report\nAUTO_SYNTH_OK\ngene={gene}\nsource={source}\n"
+    output_path = os.environ.get("AGENTFLOW_OUTPUT_RESULT")
+    if not output_path:
+        raise SystemExit("AGENTFLOW_OUTPUT_RESULT is required")
+    Path(output_path).write_text(result, encoding="utf-8")
+    print(result, end="")
+
+input_path = os.environ.get("SYNTH_INPUT")
+if input_path:
+    lines = Path(input_path).read_text(encoding="utf-8").strip().splitlines()
+    gene = lines[-1].split(",")[0]
+    emit(gene, "fixture")
+else:
+    gene = os.environ.get("AGENTFLOW_PARAM_GENE")
+    if not gene:
+        raise SystemExit("AGENTFLOW_PARAM_GENE is required")
+    emit(gene, "runtime")
+===FIXTURE===
+gene,value
+MID1IP1,1.11
+===ALT_FIXTURE===
+gene,value
+KRAS,9.99
+===EXPECT===
+AUTO_SYNTH_OK
+"##;
+        let stub = write_stub_synthesizer(&path, "stub_auto_gene_runtime.sh", candidate);
+        let synthesizer = format!("/bin/sh {}", stub.display());
+
+        let tool_ref = match auto_synthesize_agent_tool(
+            &store,
+            &synthesizer,
+            "MID1IP1 immunotherapy biomarker claim",
+            "Need a gene-specific public-data association tool",
+        )
+        .unwrap()
+        {
+            AutoSynthToolResult::Registered(tool_ref) => tool_ref,
+            AutoSynthToolResult::Rejected(reason) => {
+                panic!("dual-mode candidate should register: {reason}")
+            }
+        };
+
+        let inspection = store.inspect_tool(&tool_ref).unwrap();
+        assert!(inspection
+            .spec_json
+            .contains("\"param_types\":{\"gene\":\"string\"}"));
+        assert!(inspection
+            .spec_json
+            .contains("\"required_params\":[\"gene\"]"));
+        assert!(inspection.spec_json.contains("\"gene\""));
+        assert!(!inspection.spec_json.contains("\"input\""));
+
+        let flow = FlowDraft::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.flow.v0
+id: auto_gene_runtime
+name: Auto gene runtime
+steps:
+  - id: run_gene
+    tool: {tool_ref}
+    needs: []
+    params:
+      gene: MID1IP1
+    outputs:
+      result: runtime_result
+"#
+        ))
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+        let summary = store.run_flow("auto_gene_runtime").unwrap();
+        assert_eq!(summary.completed_steps, 1);
+        assert_eq!(summary.failed_steps, 0);
+
+        let computed = store
+            .list_artifacts()
+            .unwrap()
+            .into_iter()
+            .filter(|artifact| artifact.kind == "computed")
+            .collect::<Vec<_>>();
+        assert_eq!(computed.len(), 1);
+        let output = fs::read_to_string(&computed[0].path).unwrap();
+        assert!(output.contains("gene=MID1IP1"));
+        assert!(output.contains("source=runtime"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_synth_prompt_forbids_default_or_illustrative_fallbacks() {
+        let prompt = build_auto_synth_prompt(
+            "MID1IP1 immunotherapy biomarker claim",
+            "Need survival and immune-correlation evidence",
+        );
+
+        assert!(prompt.contains("禁止硬编码"));
+        assert!(prompt.contains("真实数据不可得"));
+        assert!(prompt.contains("非零退出"));
+        assert!(prompt.contains("default"));
+        assert!(prompt.contains("illustrative"));
+        assert!(prompt.contains("===ALT_FIXTURE==="));
+        assert!(prompt.contains("AGENTFLOW_PARAM_GENE"));
+        assert!(prompt.contains("https://www.cbioportal.org/api"));
+        assert!(prompt.contains("SYNTH_INPUT"));
+        assert!(prompt.contains("tcga_survival_assoc.py"));
     }
 
     #[test]

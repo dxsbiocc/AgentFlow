@@ -673,13 +673,20 @@ impl ProjectStore {
         &self,
         request: &EvidenceLinkRequest,
     ) -> Result<EvidenceGrade, StorageError> {
-        if request.grade != EvidenceGrade::Observed {
-            return Ok(request.grade);
-        }
-
         let Some(observation_id) = request.observation_id.as_deref() else {
             return Ok(request.grade);
         };
+        if self
+            .source_auto_synth_tool_for_observation(observation_id)?
+            .is_some()
+            && request.grade.weight() > 0
+        {
+            return Ok(EvidenceGrade::Hypothesis);
+        }
+
+        if request.grade != EvidenceGrade::Observed {
+            return Ok(request.grade);
+        }
         if !self
             .source_inferred_params_for_observation(observation_id)?
             .is_empty()
@@ -693,6 +700,26 @@ impl ProjectStore {
         }
 
         Ok(request.grade)
+    }
+
+    fn source_auto_synth_tool_for_observation(
+        &self,
+        observation_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let observation_id = observation_id.trim();
+        if observation_id.is_empty() {
+            return Ok(None);
+        }
+
+        let observation = match self.inspect_observation(observation_id) {
+            Ok(observation) => observation,
+            Err(StorageError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        self.auto_synthesized_tool_for_observation(
+            observation.flow_id.as_deref(),
+            observation.step_id.as_deref(),
+        )
     }
 
     fn source_inferred_params_for_observation(

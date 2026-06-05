@@ -494,7 +494,7 @@ impl ProjectStore {
                             raised_decisions.push(point);
                         }
                     }
-                    let should_apply_step = config.apply || auto_synth_tool_ref.is_some();
+                    let should_apply_step = config.apply;
                     if should_apply_step {
                         if let Some(step) = proposal.drafted_step.as_ref() {
                             let flow_id = config.flow.clone().unwrap_or_else(|| {
@@ -567,8 +567,7 @@ impl ProjectStore {
                                                             .as_deref(),
                                                         capability_need:
                                                             synthesized_capability_need.as_deref(),
-                                                        auto_run: config.auto_run
-                                                            || auto_synth_tool_ref.is_some(),
+                                                        auto_run: config.auto_run,
                                                     },
                                                     ApplyCycleOutputs {
                                                         applied: &mut applied,
@@ -786,11 +785,17 @@ impl ProjectStore {
     ) -> Result<(ProposedStep, Vec<String>), StorageError> {
         let executable = self.executable_tool(tool_ref)?;
         let mut drafted_step = self.draft_step_for(tool_ref, available)?;
-        let inferred_param_names = infer_replace_params(
+        let mut inferred_param_names = infer_replace_params(
             &mut drafted_step,
             &decision.candidate.statement,
             inferer,
             &executable.params,
+        );
+        infer_synthesized_domain_params(
+            &mut drafted_step,
+            &decision.candidate.statement,
+            &executable.params,
+            &mut inferred_param_names,
         );
         let needs = self.infer_step_needs(&drafted_step)?;
         Ok((
@@ -1037,20 +1042,27 @@ impl ProjectStore {
             observation.flow_id.as_deref(),
             observation.step_id.as_deref(),
         )?;
-        let mut digest = stance_assessment_digest(
-            step_id,
-            observation_id,
-            &observation.summary,
-            hypothesis_id,
-            &hypothesis.statement,
-        );
+        let mut digest = if let Some(tool_ref) = auto_synth_tool_ref.as_deref() {
+            auto_synth_stance_assessment_digest(
+                step_id,
+                observation_id,
+                &observation.summary,
+                hypothesis_id,
+                &hypothesis.statement,
+                tool_ref,
+            )
+        } else {
+            stance_assessment_digest(
+                step_id,
+                observation_id,
+                &observation.summary,
+                hypothesis_id,
+                &hypothesis.statement,
+            )
+        };
         if !inferred_params.is_empty() {
             digest.push('\n');
             digest.push_str(&inferred_param_warning(&inferred_params));
-        }
-        if let Some(tool_ref) = auto_synth_tool_ref {
-            digest.push('\n');
-            digest.push_str(&auto_synth_warning(&tool_ref));
         }
         let point = self.raise_decision_point(
             DecisionKind::StanceAssessment,
@@ -1128,7 +1140,7 @@ impl ProjectStore {
         Ok(params)
     }
 
-    fn auto_synthesized_tool_for_observation(
+    pub(crate) fn auto_synthesized_tool_for_observation(
         &self,
         flow_id: Option<&str>,
         step_id: Option<&str>,
@@ -1278,7 +1290,7 @@ fn inferred_param_warning(params: &[(String, String)]) -> String {
 
 fn auto_synth_warning(tool_ref: &str) -> String {
     format!(
-        "⚠ 该结果来自自动合成工具 {tool_ref}（冒烟验证、exploratory 封顶）；请人工确认工具是否真答了问题。"
+        "使用【自动合成的未验证工具 {tool_ref}】产出结果。该工具由 LLM 生成、仅过冒烟+输入敏感性检测，可能仍含编造/硬编码。请先核验工具逻辑与数据来源，再判定立场。"
     )
 }
 
@@ -1379,6 +1391,86 @@ fn infer_replace_params(
         }
     }
     inferred_param_names
+}
+
+fn infer_synthesized_domain_params(
+    step: &mut ProposedStep,
+    hypothesis_statement: &str,
+    param_specs: &BTreeMap<String, ToolParamSpec>,
+    inferred_param_names: &mut Vec<String>,
+) {
+    for (param_name, param_value) in &mut step.params {
+        let placeholder = format!("REPLACE_{param_name}");
+        if param_value != &placeholder {
+            continue;
+        }
+
+        let inferred = match param_name.as_str() {
+            "gene" => infer_gene_symbol(hypothesis_statement),
+            _ => None,
+        };
+        let Some(inferred) = inferred else {
+            continue;
+        };
+        if let Some(spec) = param_specs.get(param_name) {
+            if validate_param_value(spec, &inferred).is_err() {
+                continue;
+            }
+        }
+
+        *param_value = inferred;
+        if !inferred_param_names.contains(param_name) {
+            inferred_param_names.push(param_name.clone());
+        }
+    }
+}
+
+fn infer_gene_symbol(hypothesis_statement: &str) -> Option<String> {
+    hypothesis_statement
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+        .map(|token| token.trim_matches('-'))
+        .find(|token| is_gene_symbol_candidate(token))
+        .map(ToOwned::to_owned)
+}
+
+fn is_gene_symbol_candidate(token: &str) -> bool {
+    let token = token.trim();
+    if !(2..=20).contains(&token.len()) {
+        return false;
+    }
+    if token
+        .chars()
+        .any(|ch| !ch.is_ascii_alphanumeric() && ch != '-')
+    {
+        return false;
+    }
+    if !token.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+        return false;
+    }
+
+    let uppercase = token.to_ascii_uppercase();
+    if token != uppercase {
+        return false;
+    }
+
+    !matches!(
+        uppercase.as_str(),
+        "AUTO"
+            | "SYNTH"
+            | "TCGA"
+            | "RNA"
+            | "DNA"
+            | "API"
+            | "REST"
+            | "LLM"
+            | "AS1"
+            | "AS2"
+            | "AS3"
+            | "L1"
+            | "L2"
+            | "L3"
+            | "L4"
+    )
 }
 
 fn auto_synth_gap(proposal: &EnrichedProposal) -> bool {
@@ -1584,6 +1676,24 @@ fn stance_assessment_digest(
     )
 }
 
+fn auto_synth_stance_assessment_digest(
+    step_id: &str,
+    observation_id: &str,
+    observation_summary: &str,
+    hypothesis_id: &str,
+    hypothesis_statement: &str,
+    tool_ref: &str,
+) -> String {
+    format!(
+        "{} 摘要：{observation_summary}。{STANCE_ASSESSMENT_OBSERVATION_MARKER}{observation_id}；请判定它对假设「{hypothesis_statement}」的立场。若仍要记录立场，运行：evidence link --hypothesis {hypothesis_id} --observation {observation_id} --stance supports|contradicts --grade hypothesis。只有人工核验工具逻辑与数据来源后，才可另行升级证据。",
+        auto_synth_warning_with_step(step_id, tool_ref)
+    )
+}
+
+fn auto_synth_warning_with_step(step_id: &str, tool_ref: &str) -> String {
+    format!("⚠ 步骤 {step_id} {}", auto_synth_warning(tool_ref))
+}
+
 fn stance_assessment_options(hypothesis_id: &str, observation_id: &str) -> Vec<HandoffOption> {
     vec![
         HandoffOption {
@@ -1734,7 +1844,10 @@ mod tests {
 
     use rusqlite::params;
 
-    use crate::argument::{EvidenceGrade, EvidenceLinkRequest, Stance, VerdictTag};
+    use crate::argument::{
+        ArgumentEngine, EvidenceGrade, EvidenceLinkRequest, InconclusiveKind, RuleBasedEngine,
+        Stance, Verdict, VerdictTag,
+    };
     use crate::branch::{
         BranchAction, BranchCandidate, BranchDecision, CandidateKind, ProposedStep, SelectionMode,
     };
@@ -2274,7 +2387,7 @@ runtime:
             let script_path = root.join(format!("{tool_name}.sh"));
             std::fs::write(
                 &script_path,
-                "printf '# Auto synth report\nstatus: ok\n' > \"$AGENTFLOW_OUTPUT_RESULT\"\n",
+                "printf '# Auto synth report\ngene: %s\nstatus: ok\n' \"$AGENTFLOW_PARAM_GENE\" > \"$AGENTFLOW_OUTPUT_RESULT\"\n",
             )
             .unwrap();
             Self {
@@ -2322,6 +2435,10 @@ name: {}
 version: 0.1.0
 maturity: exploratory
 description: Auto synth THRSP pathway validation report for custom validation
+params:
+  gene:
+    type: string
+    required: true
 outputs:
   result:
     type: Markdown
@@ -3503,8 +3620,8 @@ steps:
         let report = store
             .run_cycle_with_synth(
                 ApplyConfig {
-                    apply: false,
-                    auto_run: false,
+                    apply: true,
+                    auto_run: true,
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
@@ -3530,6 +3647,8 @@ steps:
             .as_deref()
             .unwrap()
             .contains("auto_synth"));
+        let step = proposal.drafted_step.as_ref().unwrap();
+        assert_eq!(step.params, vec![("gene".to_string(), "THRSP".to_string())]);
         let auto_flow_id = format!("auto_{hypothesis_id}");
         assert!(report.applied.iter().any(|action| matches!(
             action,
@@ -3546,6 +3665,12 @@ steps:
                 _ => None,
             })
             .unwrap();
+        assert_eq!(
+            store
+                .inferred_params_for_step(&auto_flow_id, "step_auto_synth_thrsp_validation")
+                .unwrap(),
+            vec![("gene".to_string(), "THRSP".to_string())]
+        );
         assert_eq!(event_count(&store, "agent.tool_synthesized"), 1);
 
         let point = report
@@ -3553,14 +3678,15 @@ steps:
             .iter()
             .find(|point| point.kind == DecisionKind::StanceAssessment)
             .unwrap();
-        assert!(point.digest.contains("自动合成工具"));
-        assert!(point.digest.contains("冒烟验证"));
-        assert!(point.digest.contains("exploratory 封顶"));
-        assert!(point.digest.contains("请人工确认工具是否真答了问题"));
+        assert!(!point.digest.contains("产出真实发现"));
+        assert!(point.digest.contains("自动合成的未验证工具"));
+        assert!(point.digest.contains("冒烟+输入敏感性检测"));
+        assert!(point.digest.contains("可能仍含编造/硬编码"));
+        assert!(point.digest.contains("请先核验工具逻辑与数据来源"));
 
         let linked = store
             .link_evidence(EvidenceLinkRequest {
-                hypothesis_id,
+                hypothesis_id: hypothesis_id.clone(),
                 observation_id: Some(observation_id),
                 source: None,
                 grade: EvidenceGrade::Observed,
@@ -3568,7 +3694,13 @@ steps:
                 note: "Human accepted auto synth output for this fixture.".to_string(),
             })
             .unwrap();
-        assert_eq!(linked.grade, EvidenceGrade::Inferred);
+        assert_eq!(linked.grade, EvidenceGrade::Hypothesis);
+        let verdict =
+            RuleBasedEngine.render(&hypothesis_id, &store.evidence_for(&hypothesis_id).unwrap());
+        assert!(matches!(
+            verdict.verdict,
+            Verdict::Inconclusive(InconclusiveKind::Provisional { .. })
+        ));
 
         let _ = std::fs::remove_dir_all(path);
     }

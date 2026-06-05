@@ -16,6 +16,7 @@ use crate::{last_value, CliError};
 pub(crate) const DEFAULT_SYNTHESIZER: &str = "claude -p";
 const SYNTH_VERSION: &str = "0.1.0";
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_AUTO_SYNTH_ATTEMPTS: usize = 3;
 const VALIDATION_PATH: &str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
 const PRIMARY_VALIDATION_GENE: &str = "TP53";
 const ALTERNATE_VALIDATION_GENE: &str = "EGFR";
@@ -52,8 +53,8 @@ struct ValidationOutput {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SynthValidationInputs {
-    gene: &'static str,
+struct SynthValidationInputs<'a> {
+    gene: &'a str,
 }
 
 #[derive(Debug)]
@@ -174,14 +175,13 @@ pub(crate) fn auto_synthesize_agent_tool(
     synthesizer: &str,
     hypothesis_statement: &str,
     capability_need: &str,
+    representative_gene: Option<&str>,
 ) -> Result<AutoSynthToolResult, CliError> {
-    let prompt = build_auto_synth_prompt(hypothesis_statement, capability_need);
-    let raw_candidate = run_project_synthesizer(store.root_path(), synthesizer, &prompt)?;
-    let candidate = match parse_auto_synth_candidate(&raw_candidate) {
-        Ok(candidate) => candidate,
-        Err(error) => return Ok(AutoSynthToolResult::Rejected(error.message())),
-    };
-
+    let base_prompt = build_auto_synth_prompt(hypothesis_statement, capability_need);
+    let runtime_gene = representative_gene
+        .map(str::trim)
+        .filter(|gene| !gene.is_empty())
+        .unwrap_or(PRIMARY_VALIDATION_GENE);
     let name = auto_synth_tool_name(hypothesis_statement, capability_need)?;
     let description = format!(
         "Auto-synthesized tool for hypothesis {hypothesis_statement}. Capability need {capability_need}"
@@ -192,69 +192,121 @@ pub(crate) fn auto_synthesize_agent_tool(
     if let Some(parent) = script_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&script_path, candidate.script.as_bytes())?;
-    fs::write(&fixture_path, candidate.fixture.as_bytes())?;
-    fs::write(
-        &alternate_fixture_path,
-        candidate.alternate_fixture.as_bytes(),
-    )?;
-    let script_path = fs::canonicalize(&script_path)?;
-    let fixture_path = fs::canonicalize(&fixture_path)?;
-    let alternate_fixture_path = fs::canonicalize(&alternate_fixture_path)?;
 
+    let mut prompt = base_prompt.clone();
+    let mut last_rejection = "auto-synth did not produce a validated candidate".to_string();
+    for _attempt in 1..=MAX_AUTO_SYNTH_ATTEMPTS {
+        let raw_candidate = run_project_synthesizer(store.root_path(), synthesizer, &prompt)?;
+        let candidate = match parse_auto_synth_candidate(&raw_candidate) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                last_rejection = error.message();
+                prompt =
+                    build_auto_synth_repair_prompt(&base_prompt, &last_rejection, &raw_candidate);
+                continue;
+            }
+        };
+
+        fs::write(&script_path, candidate.script.as_bytes())?;
+        fs::write(&fixture_path, candidate.fixture.as_bytes())?;
+        fs::write(
+            &alternate_fixture_path,
+            candidate.alternate_fixture.as_bytes(),
+        )?;
+        let canonical_script_path = fs::canonicalize(&script_path)?;
+        let canonical_fixture_path = fs::canonicalize(&fixture_path)?;
+        let canonical_alternate_fixture_path = fs::canonicalize(&alternate_fixture_path)?;
+
+        match validate_auto_synth_candidate(
+            &canonical_script_path,
+            &canonical_fixture_path,
+            &canonical_alternate_fixture_path,
+            &candidate,
+            runtime_gene,
+        )? {
+            Ok(()) => {
+                let spec_yaml =
+                    synthesized_agent_tool_yaml(&name, &description, &canonical_script_path);
+                let spec = ToolSpec::from_simple_yaml(&spec_yaml)?;
+                let registration = store.register_tool(spec)?;
+                return Ok(AutoSynthToolResult::Registered(registration.tool_ref));
+            }
+            Err(reason) => {
+                cleanup_auto_synth_candidate(
+                    &canonical_script_path,
+                    &[&canonical_fixture_path, &canonical_alternate_fixture_path],
+                );
+                last_rejection = reason;
+                prompt = build_auto_synth_repair_prompt(
+                    &base_prompt,
+                    &last_rejection,
+                    &candidate.script,
+                );
+            }
+        }
+    }
+
+    Ok(AutoSynthToolResult::Rejected(last_rejection))
+}
+
+fn validate_auto_synth_candidate(
+    script_path: &Path,
+    fixture_path: &Path,
+    alternate_fixture_path: &Path,
+    candidate: &AutoSynthCandidate,
+    runtime_gene: &str,
+) -> Result<Result<(), String>, CliError> {
     let fixture_validation = validate_candidate_script_with_inputs(
-        &script_path,
-        &fixture_path,
+        script_path,
+        fixture_path,
         SynthValidationInputs {
             gene: PRIMARY_VALIDATION_GENE,
         },
     )?;
     if !auto_synth_validation_passed(&fixture_validation, &candidate.expect) {
-        cleanup_auto_synth_candidate(&script_path, &[&fixture_path, &alternate_fixture_path]);
-        return Ok(AutoSynthToolResult::Rejected(auto_synth_rejection_reason(
+        return Ok(Err(auto_synth_rejection_reason(
             "fixture smoke",
             &fixture_validation,
             &candidate.expect,
         )));
     }
     let alternate_validation = validate_candidate_script_with_inputs(
-        &script_path,
-        &alternate_fixture_path,
+        script_path,
+        alternate_fixture_path,
         SynthValidationInputs {
             gene: ALTERNATE_VALIDATION_GENE,
         },
     )?;
     if !auto_synth_validation_passed(&alternate_validation, &candidate.expect) {
-        cleanup_auto_synth_candidate(&script_path, &[&fixture_path, &alternate_fixture_path]);
-        return Ok(AutoSynthToolResult::Rejected(auto_synth_rejection_reason(
+        return Ok(Err(auto_synth_rejection_reason(
             "alternate fixture smoke",
             &alternate_validation,
             &candidate.expect,
         )));
     }
-    if let Err(reason) = validate_input_sensitivity(
-        &fixture_validation,
-        &alternate_validation,
-        &[&fixture_path, &alternate_fixture_path],
-    ) {
-        cleanup_auto_synth_candidate(&script_path, &[&fixture_path, &alternate_fixture_path]);
-        return Ok(AutoSynthToolResult::Rejected(reason));
+    let fixture_paths = &[fixture_path, alternate_fixture_path];
+    if let Err(reason) =
+        validate_input_sensitivity(&fixture_validation, &alternate_validation, fixture_paths)
+    {
+        return Ok(Err(reason));
     }
-    let runtime_validation = validate_runtime_candidate_script(&script_path)?;
-    if let Err(reason) = validate_no_input_runtime_behavior(
+    let runtime_validation = validate_runtime_candidate_script(script_path, runtime_gene)?;
+    if !auto_synth_validation_passed(&runtime_validation, &candidate.expect) {
+        return Ok(Err(auto_synth_rejection_reason(
+            "runtime gate",
+            &runtime_validation,
+            &candidate.expect,
+        )));
+    }
+    if let Err(reason) = validate_runtime_gate_behavior(
         &runtime_validation,
         &fixture_validation,
         &alternate_validation,
-        &[&fixture_path, &alternate_fixture_path],
+        fixture_paths,
     ) {
-        cleanup_auto_synth_candidate(&script_path, &[&fixture_path, &alternate_fixture_path]);
-        return Ok(AutoSynthToolResult::Rejected(reason));
+        return Ok(Err(reason));
     }
-
-    let spec_yaml = synthesized_agent_tool_yaml(&name, &description, &script_path);
-    let spec = ToolSpec::from_simple_yaml(&spec_yaml)?;
-    let registration = store.register_tool(spec)?;
-    Ok(AutoSynthToolResult::Registered(registration.tool_ref))
+    Ok(Ok(()))
 }
 
 fn require_option<T>(value: Option<T>, flag: &str) -> Result<T, CliError> {
@@ -335,6 +387,24 @@ fn build_auto_synth_prompt(hypothesis_statement: &str, capability_need: &str) ->
         ),
         hypothesis_statement,
         capability_need
+    )
+}
+
+fn build_auto_synth_repair_prompt(base_prompt: &str, error: &str, candidate_code: &str) -> String {
+    format!(
+        concat!(
+            "{}\n\n",
+            "你的工具运行失败,错误如下:\n{}\n\n",
+            "这是代码:\n{}\n\n",
+            "修正它,仍遵守 no-fabrication 与双模契约: ",
+            "SYNTH_INPUT fixture validation must stay deterministic and input-sensitive; ",
+            "runtime mode must read AGENTFLOW_PARAM_GENE, fetch/use real data, write AGENTFLOW_OUTPUT_RESULT, ",
+            "print non-empty output, and loudly exit non-zero instead of fabricating fallback/default data. ",
+            "Return exactly the same four sections: ===SCRIPT===, ===FIXTURE===, ===ALT_FIXTURE===, ===EXPECT===."
+        ),
+        base_prompt,
+        error,
+        candidate_code
     )
 }
 
@@ -595,7 +665,7 @@ fn validate_candidate_script(
 fn validate_candidate_script_with_inputs(
     script_path: &Path,
     fixture: &Path,
-    inputs: SynthValidationInputs,
+    inputs: SynthValidationInputs<'_>,
 ) -> Result<ValidationOutput, CliError> {
     let workdir = isolated_workdir()?;
     fs::create_dir_all(&workdir)?;
@@ -610,7 +680,10 @@ fn validate_candidate_script_with_inputs(
     result
 }
 
-fn validate_runtime_candidate_script(script_path: &Path) -> Result<ValidationOutput, CliError> {
+fn validate_runtime_candidate_script(
+    script_path: &Path,
+    runtime_gene: &str,
+) -> Result<ValidationOutput, CliError> {
     let workdir = isolated_workdir()?;
     fs::create_dir_all(&workdir)?;
     let result = run_python_script(
@@ -618,9 +691,7 @@ fn validate_runtime_candidate_script(script_path: &Path) -> Result<ValidationOut
         None,
         &workdir,
         VALIDATION_TIMEOUT,
-        SynthValidationInputs {
-            gene: PRIMARY_VALIDATION_GENE,
-        },
+        SynthValidationInputs { gene: runtime_gene },
     );
     let _ = fs::remove_dir_all(&workdir);
     result
@@ -631,7 +702,7 @@ fn run_python_script(
     fixture: Option<&Path>,
     workdir: &Path,
     timeout: Duration,
-    inputs: SynthValidationInputs,
+    inputs: SynthValidationInputs<'_>,
 ) -> Result<ValidationOutput, CliError> {
     let result_path = workdir.join("result.txt");
     let mut command = Command::new("/usr/bin/env");
@@ -688,7 +759,7 @@ fn run_python_script(
     }
 }
 
-fn set_validation_domain_param_env(command: &mut Command, inputs: SynthValidationInputs) {
+fn set_validation_domain_param_env(command: &mut Command, inputs: SynthValidationInputs<'_>) {
     for param in DEFAULT_SYNTH_DOMAIN_PARAMS {
         let Some(value) = validation_value_for_domain_param(param, inputs) else {
             continue;
@@ -697,10 +768,10 @@ fn set_validation_domain_param_env(command: &mut Command, inputs: SynthValidatio
     }
 }
 
-fn validation_value_for_domain_param(
+fn validation_value_for_domain_param<'a>(
     param: &SynthDomainParam,
-    inputs: SynthValidationInputs,
-) -> Option<&'static str> {
+    inputs: SynthValidationInputs<'a>,
+) -> Option<&'a str> {
     match param.name {
         "gene" => Some(inputs.gene),
         _ => None,
@@ -832,7 +903,7 @@ fn validate_input_sensitivity(
     Ok(())
 }
 
-fn validate_no_input_runtime_behavior(
+fn validate_runtime_gate_behavior(
     runtime: &ValidationOutput,
     primary: &ValidationOutput,
     alternate: &ValidationOutput,
@@ -840,18 +911,26 @@ fn validate_no_input_runtime_behavior(
 ) -> Result<(), String> {
     if runtime.timed_out {
         return Err(format!(
-            "candidate failed no-input runtime check: timed_out=true, stdout={}, stderr={}",
+            "candidate failed runtime gate: timed_out=true, stdout={}, stderr={}",
             snippet(&runtime.stdout),
             snippet(&runtime.stderr)
         ));
     }
 
     if runtime.exit_code != Some(0) {
-        return Ok(());
+        return Err(format!(
+            "candidate failed runtime gate: exit_code={}, stdout={}, stderr={}",
+            runtime
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            snippet(&runtime.stdout),
+            snippet(&runtime.stderr)
+        ));
     }
 
     if validation_result_text(runtime).trim().is_empty() {
-        return Err("candidate failed no-input runtime check: exited 0 without output".to_string());
+        return Err("candidate failed runtime gate: exited 0 without output".to_string());
     }
 
     let runtime_output =
@@ -863,7 +942,7 @@ fn validate_no_input_runtime_behavior(
     if runtime_output == primary_output || runtime_output == alternate_output {
         return Err(format!(
             concat!(
-                "candidate failed no-input runtime check: output matched fixture smoke output, ",
+                "candidate failed runtime gate: output matched fixture smoke output, ",
                 "suggesting a default fallback; stdout={}, stderr={}"
             ),
             snippet(&runtime.stdout),
@@ -1136,6 +1215,37 @@ PY
         stub
     }
 
+    fn write_retrying_auto_synthesizer(
+        path: &Path,
+        name: &str,
+        first_candidate: &str,
+        repaired_candidate: &str,
+        prompt_log: &Path,
+    ) -> PathBuf {
+        let stub = path.join(name);
+        fs::write(
+            &stub,
+            format!(
+                r#"import pathlib
+import sys
+
+prompt = sys.argv[1] if len(sys.argv) > 1 else ""
+with open(r"{prompt_log}", "a", encoding="utf-8") as handle:
+    handle.write("\n---PROMPT---\n")
+    handle.write(prompt)
+
+if "study not found: lihc_tcga" in prompt and "修正它" in prompt:
+    print(r'''{repaired_candidate}''')
+else:
+    print(r'''{first_candidate}''')
+"#,
+                prompt_log = prompt_log.display()
+            ),
+        )
+        .unwrap();
+        stub
+    }
+
     fn synth_args(
         path: &Path,
         fixture: &Path,
@@ -1288,6 +1398,7 @@ expected-line
             &synthesizer,
             "Auto synth cleanup hypothesis",
             "Need a custom rejected tool",
+            None,
         )
         .unwrap();
 
@@ -1337,6 +1448,7 @@ AUTO_SYNTH_OK
             &synthesizer,
             "Auto synth invariant hypothesis",
             "Need a custom input-sensitive tool",
+            None,
         )
         .unwrap();
 
@@ -1355,8 +1467,8 @@ AUTO_SYNTH_OK
     }
 
     #[test]
-    fn auto_synth_accepts_input_sensitive_script_that_fails_loudly_without_data() {
-        let path = temp_project_path("auto-sensitive-accepted");
+    fn auto_synth_rejects_input_sensitive_script_that_fails_runtime_gate() {
+        let path = temp_project_path("auto-sensitive-runtime-rejected");
         init_project(&path);
         let store = ProjectStore::open(&path).unwrap();
         let candidate = r##"===SCRIPT===
@@ -1390,20 +1502,172 @@ AUTO_SYNTH_OK
             &synthesizer,
             "Auto synth sensitive hypothesis",
             "Need a custom input-sensitive tool",
+            Some("MID1IP1"),
         )
         .unwrap();
 
         match outcome {
-            AutoSynthToolResult::Registered(tool_ref) => {
-                assert!(tool_ref.starts_with("synth/auto_synth_"));
-            }
             AutoSynthToolResult::Rejected(reason) => {
-                panic!("input-sensitive candidate should register: {reason}")
+                assert!(reason.contains("runtime gate"));
+                assert!(reason.contains("real data source unavailable"));
+            }
+            AutoSynthToolResult::Registered(tool_ref) => {
+                panic!("runtime-failing candidate should not register: {tool_ref}")
             }
         }
 
         let tools = store.list_tools().unwrap();
-        assert_eq!(tools.len(), 1);
+        assert_eq!(tools.len(), 0);
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_synth_runtime_gate_failure_feeds_error_back_and_registers_repair() {
+        let path = temp_project_path("auto-runtime-retry");
+        init_project(&path);
+        let store = ProjectStore::open(&path).unwrap();
+        let first_candidate = r##"===SCRIPT===
+import os
+from pathlib import Path
+
+def emit(result):
+    output_path = os.environ.get("AGENTFLOW_OUTPUT_RESULT")
+    if not output_path:
+        raise SystemExit("AGENTFLOW_OUTPUT_RESULT is required")
+    Path(output_path).write_text(result, encoding="utf-8")
+    print(result, end="")
+
+input_path = os.environ.get("SYNTH_INPUT")
+if input_path:
+    value = Path(input_path).read_text(encoding="utf-8").strip().splitlines()[-1]
+    emit(f"# Auto synth report\nAUTO_SYNTH_OK\nfixture={value}\n")
+else:
+    raise SystemExit("study not found: lihc_tcga")
+===FIXTURE===
+primary,1.11
+===ALT_FIXTURE===
+alternate,9.99
+===EXPECT===
+AUTO_SYNTH_OK
+"##;
+        let repaired_candidate = r##"===SCRIPT===
+import os
+from pathlib import Path
+
+def emit(result):
+    output_path = os.environ.get("AGENTFLOW_OUTPUT_RESULT")
+    if not output_path:
+        raise SystemExit("AGENTFLOW_OUTPUT_RESULT is required")
+    Path(output_path).write_text(result, encoding="utf-8")
+    print(result, end="")
+
+input_path = os.environ.get("SYNTH_INPUT")
+if input_path:
+    value = Path(input_path).read_text(encoding="utf-8").strip().splitlines()[-1]
+    emit(f"# Auto synth report\nAUTO_SYNTH_OK\nfixture={value}\n")
+else:
+    gene = os.environ.get("AGENTFLOW_PARAM_GENE")
+    if gene != "MID1IP1":
+        raise SystemExit(f"unexpected runtime gene {gene}")
+    emit(f"# Auto synth report\nAUTO_SYNTH_OK\ngene={gene}\nsource=runtime\n")
+===FIXTURE===
+primary,1.11
+===ALT_FIXTURE===
+alternate,9.99
+===EXPECT===
+AUTO_SYNTH_OK
+"##;
+        let prompt_log = path.join("auto-synth-prompts.log");
+        let stub = write_retrying_auto_synthesizer(
+            &path,
+            "stub_auto_retry.py",
+            first_candidate,
+            repaired_candidate,
+            &prompt_log,
+        );
+        let synthesizer = format!("/usr/bin/env python3 {}", stub.display());
+
+        let outcome = auto_synthesize_agent_tool(
+            &store,
+            &synthesizer,
+            "MID1IP1 immunotherapy biomarker claim",
+            "Need a gene-specific public-data association tool",
+            Some("MID1IP1"),
+        )
+        .unwrap();
+
+        let tool_ref = match outcome {
+            AutoSynthToolResult::Registered(tool_ref) => tool_ref,
+            AutoSynthToolResult::Rejected(reason) => {
+                panic!("repaired candidate should register: {reason}")
+            }
+        };
+        assert!(tool_ref.starts_with("synth/auto_synth_"));
+        assert_eq!(store.list_tools().unwrap().len(), 1);
+
+        let prompts = fs::read_to_string(&prompt_log).unwrap();
+        assert_eq!(prompts.matches("---PROMPT---").count(), 2);
+        assert!(prompts.contains("study not found: lihc_tcga"));
+        assert!(prompts.contains("修正它"));
+        assert!(prompts.contains("raise SystemExit(\"study not found: lihc_tcga\")"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_synth_rejects_after_three_runtime_gate_failures_without_registering() {
+        let path = temp_project_path("auto-runtime-all-fail");
+        init_project(&path);
+        let store = ProjectStore::open(&path).unwrap();
+        let candidate = r##"===SCRIPT===
+import os
+from pathlib import Path
+
+input_path = os.environ.get("SYNTH_INPUT")
+output_path = os.environ.get("AGENTFLOW_OUTPUT_RESULT")
+if not output_path:
+    raise SystemExit("AGENTFLOW_OUTPUT_RESULT is required")
+if input_path:
+    value = Path(input_path).read_text(encoding="utf-8").strip().splitlines()[-1]
+    result = f"# Auto synth report\nAUTO_SYNTH_OK\nfixture={value}\n"
+    Path(output_path).write_text(result, encoding="utf-8")
+    print(result, end="")
+else:
+    raise SystemExit("permanent runtime error")
+===FIXTURE===
+primary,1.11
+===ALT_FIXTURE===
+alternate,9.99
+===EXPECT===
+AUTO_SYNTH_OK
+"##;
+        let stub = write_stub_synthesizer(&path, "stub_auto_all_fail.sh", candidate);
+        let synthesizer = format!("/bin/sh {}", stub.display());
+
+        let outcome = auto_synthesize_agent_tool(
+            &store,
+            &synthesizer,
+            "MID1IP1 immunotherapy biomarker claim",
+            "Need a gene-specific public-data association tool",
+            Some("MID1IP1"),
+        )
+        .unwrap();
+
+        match outcome {
+            AutoSynthToolResult::Rejected(reason) => {
+                assert!(reason.contains("runtime gate"));
+                assert!(reason.contains("permanent runtime error"));
+            }
+            AutoSynthToolResult::Registered(tool_ref) => {
+                panic!("all-failing candidate should not register: {tool_ref}")
+            }
+        }
+        assert!(store.list_tools().unwrap().is_empty());
+        let synth_entries = fs::read_dir(path.join(".agentflow/synth"))
+            .map(|entries| entries.count())
+            .unwrap_or_default();
+        assert_eq!(synth_entries, 0);
 
         let _ = fs::remove_dir_all(path);
     }
@@ -1422,16 +1686,21 @@ output_path = os.environ.get("AGENTFLOW_OUTPUT_RESULT")
 if not gene or not output_path:
     raise SystemExit("ERROR: AGENTFLOW_PARAM_GENE and AGENTFLOW_OUTPUT_RESULT must be set")
 
+def emit(gene, source):
+    result = f"# Auto synth report\nAUTO_SYNTH_OK\ngene={gene}\nsource={source}\n"
+    Path(output_path).write_text(result, encoding="utf-8")
+    print(result, end="")
+
 input_path = os.environ.get("SYNTH_INPUT")
 if not input_path:
-    raise SystemExit("real data source unavailable")
-
-expected_gene, fixture_value = Path(input_path).read_text(encoding="utf-8").strip().split(",", 1)
-if gene != expected_gene:
-    raise SystemExit(f"expected validation gene {expected_gene}, got {gene}")
-result = f"# Auto synth report\nAUTO_SYNTH_OK\ngene={gene}\nfixture={fixture_value}\n"
-Path(output_path).write_text(result, encoding="utf-8")
-print(result, end="")
+    emit(gene, "runtime")
+else:
+    expected_gene, fixture_value = Path(input_path).read_text(encoding="utf-8").strip().split(",", 1)
+    if gene != expected_gene:
+        raise SystemExit(f"expected validation gene {expected_gene}, got {gene}")
+    result = f"# Auto synth report\nAUTO_SYNTH_OK\ngene={gene}\nfixture={fixture_value}\n"
+    Path(output_path).write_text(result, encoding="utf-8")
+    print(result, end="")
 ===FIXTURE===
 TP53,primary_fixture
 ===ALT_FIXTURE===
@@ -1447,6 +1716,7 @@ AUTO_SYNTH_OK
             &synthesizer,
             "TP53 and EGFR fixture-backed biomarker claim",
             "Need a gene-specific dual-mode tool",
+            Some("TP53"),
         )
         .unwrap();
 
@@ -1509,6 +1779,7 @@ AUTO_SYNTH_OK
             &synthesizer,
             "MID1IP1 immunotherapy biomarker claim",
             "Need a gene-specific public-data association tool",
+            Some("MID1IP1"),
         )
         .unwrap()
         {

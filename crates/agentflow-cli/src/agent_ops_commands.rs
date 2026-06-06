@@ -612,12 +612,14 @@ impl ToolSynthesizer for LlmToolSynthesizer<'_> {
         &self,
         hypothesis_statement: &str,
         capability_need: &str,
+        representative_gene: Option<&str>,
     ) -> ToolSynthesisOutcome {
         match synth_commands::auto_synthesize_agent_tool(
             self.store,
             self.synthesizer,
             hypothesis_statement,
             capability_need,
+            representative_gene,
         ) {
             Ok(synth_commands::AutoSynthToolResult::Registered(tool_ref)) => {
                 ToolSynthesisOutcome::registered(tool_ref)

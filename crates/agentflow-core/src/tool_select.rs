@@ -256,7 +256,10 @@ fn sanitize_step_id_part(value: &str) -> String {
     }
 }
 
-fn extract_stored_string_field(source: &str, field: &str) -> Result<String, StorageError> {
+pub(crate) fn extract_stored_string_field(
+    source: &str,
+    field: &str,
+) -> Result<String, StorageError> {
     let needle = format!("\"{field}\":\"");
     let start = source.find(&needle).ok_or_else(|| {
         StorageError::InvalidInput(format!("stored tool spec is missing {field}"))

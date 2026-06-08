@@ -19,6 +19,7 @@ use crate::tool_select::{extract_stored_string_field, CapabilityQuery, Fit, Tool
 
 const AGENT_CYCLE_COMPLETED_EVENT: &str = "agent.cycle_completed";
 const PARAMS_INFERRED_EVENT: &str = "agent.params_inferred";
+const SOURCE_DISCOVERY_EVENT: &str = "agent.source_discovery";
 const TOOL_SYNTHESIZED_EVENT: &str = "agent.tool_synthesized";
 const TOOL_GAP_HYPOTHESIS_MARKER: &str = "hypothesis_id = ";
 const STANCE_ASSESSMENT_OBSERVATION_MARKER: &str = "observation_id = ";
@@ -224,6 +225,20 @@ impl ApplyFailure {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceDiscoveryOutput {
+    pub hypothesis_id: String,
+    pub capability_need: String,
+    pub trace: String,
+    pub research_gap: bool,
+}
+
+impl SourceDiscoveryOutput {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("source discovery output serializes to JSON")
+    }
+}
+
 struct AppliedStepFinalization<'a> {
     action: AppliedAction,
     hypothesis_id: &'a str,
@@ -254,6 +269,8 @@ pub struct CycleReport {
     pub applied: Vec<AppliedAction>,
     #[serde(default)]
     pub apply_failures: Vec<ApplyFailure>,
+    #[serde(default)]
+    pub source_discoveries: Vec<SourceDiscoveryOutput>,
     pub outcome: CycleOutcome,
 }
 
@@ -270,7 +287,8 @@ impl Serialize for CycleReport {
     {
         let field_count = 7
             + usize::from(!self.applied.is_empty())
-            + usize::from(!self.apply_failures.is_empty());
+            + usize::from(!self.apply_failures.is_empty())
+            + usize::from(!self.source_discoveries.is_empty());
         let mut state = serializer.serialize_struct("CycleReport", field_count)?;
         state.serialize_field("schema_version", "agentflow.agent_cycle.v0")?;
         state.serialize_field("checkpoint_id", &self.checkpoint_id)?;
@@ -283,6 +301,9 @@ impl Serialize for CycleReport {
         }
         if !self.apply_failures.is_empty() {
             state.serialize_field("apply_failures", &self.apply_failures)?;
+        }
+        if !self.source_discoveries.is_empty() {
+            state.serialize_field("source_discoveries", &self.source_discoveries)?;
         }
         state.serialize_field("outcome", &self.outcome)?;
         state.end()
@@ -345,6 +366,7 @@ impl ProjectStore {
         let mut branch_proposals = Vec::new();
         let mut applied = Vec::new();
         let mut apply_failures = Vec::new();
+        let mut source_discoveries = Vec::new();
 
         for hypothesis in self.list_hypotheses()? {
             let evidence = self.evidence_for(&hypothesis.id)?;
@@ -495,6 +517,16 @@ impl ProjectStore {
                                         tool_ref,
                                         source_trace,
                                     } => {
+                                        if let Some(trace) = source_trace.as_deref() {
+                                            let output = source_discovery_output(
+                                                &proposal.decision.candidate.hypothesis_id,
+                                                &capability_need,
+                                                trace,
+                                                false,
+                                            );
+                                            self.emit_source_discovery(&output)?;
+                                            source_discoveries.push(output);
+                                        }
                                         match self.draft_synthesized_step(
                                             &tool_ref,
                                             &proposal.decision,
@@ -536,6 +568,16 @@ impl ProjectStore {
                                         source_trace,
                                         research_gap,
                                     } => {
+                                        if let Some(trace) = source_trace.as_deref() {
+                                            let output = source_discovery_output(
+                                                &proposal.decision.candidate.hypothesis_id,
+                                                &capability_need,
+                                                trace,
+                                                research_gap,
+                                            );
+                                            self.emit_source_discovery(&output)?;
+                                            source_discoveries.push(output);
+                                        }
                                         proposal.drafted_step = None;
                                         let failure_reason = auto_synth_failure_reason(
                                             &reason,
@@ -555,7 +597,7 @@ impl ProjectStore {
                                             )?
                                         {
                                             let point = self.raise_decision_point(
-                                                DecisionKind::DeepenOrStop,
+                                                DecisionKind::FundamentalGap,
                                                 &auto_synth_research_gap_digest(
                                                     &proposal.decision.candidate.hypothesis_id,
                                                     &proposal.decision.candidate.statement,
@@ -711,6 +753,7 @@ impl ProjectStore {
             branch_proposals,
             applied,
             apply_failures,
+            source_discoveries,
             outcome,
         };
         self.append_event(EventRecord {
@@ -805,7 +848,10 @@ impl ProjectStore {
         Ok(self
             .pending_decision_points()?
             .into_iter()
-            .filter(|point| point.kind == DecisionKind::DeepenOrStop)
+            .filter(|point| {
+                point.kind == DecisionKind::FundamentalGap
+                    || point.kind == DecisionKind::DeepenOrStop
+            })
             .filter_map(|point| source_discovery_gap_hypothesis_id(&point.digest))
             .any(|pending| pending == hypothesis_id))
     }
@@ -1073,6 +1119,18 @@ impl ProjectStore {
                 capability_need,
                 source_trace,
             ),
+        })?;
+        self.touch_project()?;
+        Ok(())
+    }
+
+    fn emit_source_discovery(&self, output: &SourceDiscoveryOutput) -> Result<(), StorageError> {
+        self.append_event(EventRecord {
+            flow_id: None,
+            step_id: None,
+            run_id: None,
+            event_type: SOURCE_DISCOVERY_EVENT.to_string(),
+            payload_json: output.to_json(),
         })?;
         self.touch_project()?;
         Ok(())
@@ -1417,6 +1475,20 @@ fn tool_synthesized_payload_json(
         source_trace: source_trace.map(ToOwned::to_owned),
     })
     .expect("tool synthesized payload serializes to JSON")
+}
+
+fn source_discovery_output(
+    hypothesis_id: &str,
+    capability_need: &str,
+    trace: &str,
+    research_gap: bool,
+) -> SourceDiscoveryOutput {
+    SourceDiscoveryOutput {
+        hypothesis_id: hypothesis_id.to_string(),
+        capability_need: capability_need.to_string(),
+        trace: trace.to_string(),
+        research_gap,
+    }
 }
 
 fn tool_synthesized_payload_from_json(
@@ -1894,7 +1966,7 @@ fn auto_synth_research_gap_digest(
     source_trace: Option<&str>,
 ) -> String {
     let mut digest = format!(
-        "§15 决策痕迹：{SOURCE_DISCOVERY_GAP_HYPOTHESIS_MARKER}{hypothesis_id}；未找到可访问公开数据源能为该假设提供数据，可能是真实研究空白。假设「{hypothesis_statement}」。原因：{reason}。请人类判断是否接受研究空白、提供额外数据源或改写假设。"
+        "§15 决策痕迹：{SOURCE_DISCOVERY_GAP_HYPOTHESIS_MARKER}{hypothesis_id}；未找到可访问公开数据源能直接提供回答该假设所需数据，可能是 Fundamental 研究空白（通常需前瞻 ICB 队列/响应标签/表达数据），请人类确认。假设「{hypothesis_statement}」。原因：{reason}。判决保持 inconclusive，系统未自动落 Fundamental；请人类判断是否接受研究空白、提供额外数据源或改写假设。"
     );
     if let Some(trace) = source_trace
         .map(str::trim)
@@ -1909,9 +1981,9 @@ fn auto_synth_research_gap_digest(
 fn auto_synth_research_gap_options(hypothesis_id: &str) -> Vec<HandoffOption> {
     vec![
         HandoffOption {
-            label: "接受研究空白".to_string(),
+            label: "确认 Fundamental 研究空白".to_string(),
             direction: format!(
-                "将假设 {hypothesis_id} 暂按公开数据源不可得处理，后续可在 AS8 落 Fundamental"
+                "人工确认假设 {hypothesis_id} 是 Fundamental 研究空白；如需落判决，走既有 render_verdict + self-deception gate"
             ),
             cost: Cost::Cheap,
             risk: Risk::Low,
@@ -2235,6 +2307,7 @@ mod tests {
             branch_proposals: vec![proposal.clone()],
             applied: vec![step_run_without_observation.clone()],
             apply_failures: vec![failure.clone()],
+            source_discoveries: Vec::new(),
             outcome: CycleOutcome::Advanced,
         };
         assert_eq!(
@@ -2255,6 +2328,7 @@ mod tests {
             branch_proposals: Vec::new(),
             applied: Vec::new(),
             apply_failures: Vec::new(),
+            source_discoveries: Vec::new(),
             outcome: CycleOutcome::Idle,
         };
         assert_eq!(
@@ -4179,7 +4253,7 @@ steps:
         );
         let synthesizer = StubToolSynthesizer::research_gap(
             &store,
-            "SOURCE DISCOVERY TRACE\n- blocked mirror: skipped, not allowlisted\n- NCBI GEO: probed, empty",
+            "QUESTION DATA REQUIREMENTS\nrequired_data: ICB treatment cohort + response labels + gene expression\nSOURCE DISCOVERY TRACE\n- cBioPortal: related-but-insufficient; has_required_data=no; reason=related expression/survival data but no ICB response labels\n- NCBI GEO: probed, empty\n代理分析但不直接回答本问题",
         );
 
         let report = store
@@ -4206,13 +4280,36 @@ steps:
         let point = report
             .raised_decisions
             .iter()
-            .find(|point| point.kind == DecisionKind::DeepenOrStop)
+            .find(|point| point.kind == DecisionKind::FundamentalGap)
             .unwrap();
         assert!(point.digest.contains("未找到可访问公开数据源"));
         assert!(point.digest.contains("可能是真实研究空白"));
+        assert!(point.digest.contains("ICB treatment cohort"));
         assert!(point.digest.contains("SOURCE DISCOVERY TRACE"));
-        assert!(point.digest.contains("blocked mirror"));
+        assert!(point.digest.contains("cBioPortal"));
+        assert!(point.digest.contains("no ICB response labels"));
+        assert!(point.digest.contains("需前瞻 ICB 队列"));
+        assert!(point.digest.contains("判决保持 inconclusive"));
         assert_eq!(point.recommendation, 0);
+        assert_eq!(report.source_discoveries.len(), 1);
+        assert_eq!(report.source_discoveries[0].hypothesis_id, hypothesis_id);
+        assert!(report.source_discoveries[0]
+            .trace
+            .contains("QUESTION DATA REQUIREMENTS"));
+        assert!(report.source_discoveries[0]
+            .trace
+            .contains("related-but-insufficient"));
+        assert_eq!(event_count(&store, "agent.source_discovery"), 1);
+        let payload: String = store
+            .connection()
+            .query_row(
+                "SELECT payload_json FROM events WHERE event_type = ?1",
+                params!["agent.source_discovery"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(payload.contains("ICB treatment cohort"));
+        assert!(payload.contains("related-but-insufficient"));
         assert!(report.applied.is_empty());
         assert_eq!(event_count(&store, "tool_registered"), 0);
 

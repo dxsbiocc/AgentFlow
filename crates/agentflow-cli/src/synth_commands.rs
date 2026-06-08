@@ -116,6 +116,9 @@ struct PublicSourceCandidate {
     base_url: String,
     probe_url: String,
     access_note: String,
+    required_data: String,
+    has_required_data: String,
+    required_data_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +131,7 @@ struct ViablePublicSource {
 struct SourceDiscoveryReport {
     candidates: Vec<PublicSourceCandidate>,
     viable: Vec<ViablePublicSource>,
+    data_requirements: String,
     trace: String,
     proposal_was_json: bool,
 }
@@ -296,7 +300,7 @@ where
         .should_enforce_research_gap()
     {
         let Some(viable) = discovery.first_viable() else {
-            let reason = no_viable_public_source_reason();
+            let reason = no_viable_public_source_reason_for(&discovery.data_requirements);
             return Ok(AutoSynthToolResult::RejectedWithSource {
                 reason,
                 source_trace: discovery.trace,
@@ -450,7 +454,18 @@ fn auto_synth_rejected_result(
 }
 
 fn no_viable_public_source_reason() -> String {
-    "未找到可访问公开数据源能为该假设提供数据，可能是真实研究空白".to_string()
+    no_viable_public_source_reason_for("")
+}
+
+fn no_viable_public_source_reason_for(data_requirements: &str) -> String {
+    let trimmed = data_requirements.trim();
+    if trimmed.is_empty() {
+        "未找到可访问公开数据源能直接提供回答该假设所需数据，可能是真实研究空白".to_string()
+    } else {
+        format!(
+            "未找到可访问公开数据源能直接提供回答该假设所需数据（{trimmed}），可能是真实研究空白"
+        )
+    }
 }
 
 fn validate_auto_synth_candidate(
@@ -568,8 +583,13 @@ fn build_source_discovery_prompt(hypothesis_statement: &str, capability_need: &s
             "AgentFlow has a capability/data gap and needs autonomous public-source discovery before tool synthesis.\n",
             "Research hypothesis:\n{}\n\n",
             "Capability gap:\n{}\n\n",
+            "First identify 回答该假设需要什么数据, for example: ICB/immunotherapy-treated cohort + response labels + gene expression/biomarker measurements.\n",
+            "Use that required-data statement as the screening standard for every candidate.\n",
             "Propose candidate public scientific data sources that may contain real data for the hypothesis entity and endpoint need.\n",
-            "Return ONLY a JSON array. Each object must contain string fields exactly: \"name\", \"base_url\", \"probe_url\", \"access_note\".\n",
+            "Return ONLY a JSON array. Each object must contain string fields exactly: \"name\", \"base_url\", \"probe_url\", \"access_note\", \"required_data\", \"has_required_data\", \"required_data_reason\".\n",
+            "\"required_data\" repeats the data needed to directly answer the hypothesis.\n",
+            "\"has_required_data\" must be \"yes\" only when the source can directly answer the hypothesis with the required data; otherwise use \"no\".\n",
+            "\"required_data_reason\" must explain the yes/no decision. If a source has related gene expression or survival data but lacks the endpoint needed by the question, mark \"has_required_data\":\"no\" and say related-but-insufficient.\n",
             "\"probe_url\" must be a read-only GET discovery/query endpoint that can verify data availability for the hypothesis entity.\n",
             "Allowed domains only: {}.\n",
             "Use only http(s) URLs. Do not propose localhost, private IP, file://, credentialed URLs, write endpoints, or non-public sources.\n",
@@ -612,9 +632,13 @@ where
     let proposal_was_json = looks_like_json_array(raw_candidates);
     let candidates = parse_public_source_candidates(raw_candidates);
     let relevance_terms = source_relevance_terms(hypothesis_statement, capability_need);
+    let data_requirements =
+        source_data_requirements(hypothesis_statement, capability_need, &candidates);
     let mut viable = Vec::new();
     let mut trace_lines = vec![
         "SOURCE DISCOVERY TRACE".to_string(),
+        "QUESTION DATA REQUIREMENTS".to_string(),
+        format!("required_data: {data_requirements}"),
         format!("candidate proposals parsed: {}", candidates.len()),
         format!("allowlist: {}", PUBLIC_SOURCE_ALLOWLIST.join(", ")),
     ];
@@ -625,12 +649,13 @@ where
         } else {
             candidate.name.trim()
         };
+        let candidate_data_context = candidate_required_data_context(candidate);
         let base_host = match source_probe_safety(&candidate.base_url) {
             Ok(host) => host,
             Err(reason) => {
                 trace_lines.push(format!(
-                    "- {label}: skipped base_url {}; {reason}",
-                    candidate.base_url
+                    "- {label}: skipped base_url {}; {reason}; {candidate_data_context}",
+                    candidate.base_url,
                 ));
                 continue;
             }
@@ -639,8 +664,8 @@ where
             Ok(host) => host,
             Err(reason) => {
                 trace_lines.push(format!(
-                    "- {label}: skipped probe_url {}; {reason}",
-                    candidate.probe_url
+                    "- {label}: skipped probe_url {}; {reason}; {candidate_data_context}",
+                    candidate.probe_url,
                 ));
                 continue;
             }
@@ -648,20 +673,39 @@ where
 
         let Some(body) = fetch_probe(&candidate.probe_url, SOURCE_DISCOVERY_TIMEOUT) else {
             trace_lines.push(format!(
-                "- {label}: probed {probe_host}; failed or timed out"
+                "- {label}: probed {probe_host}; failed or timed out; {candidate_data_context}"
             ));
             continue;
         };
         let trimmed = body.trim();
         if trimmed.is_empty() {
-            trace_lines.push(format!("- {label}: probed {probe_host}; empty response"));
+            trace_lines.push(format!(
+                "- {label}: probed {probe_host}; empty response; {candidate_data_context}"
+            ));
             continue;
         }
 
         match plausible_probe_summary(trimmed, &relevance_terms) {
             Some(summary) => {
+                let required_data = assess_candidate_required_data(
+                    candidate,
+                    trimmed,
+                    &data_requirements,
+                    hypothesis_statement,
+                    capability_need,
+                );
+                if !required_data.has_required_data {
+                    let proxy_note = proxy_analysis_note(candidate, trimmed, &data_requirements);
+                    trace_lines.push(format!(
+                        "- {label}: related-but-insufficient; base_host={base_host}; probe_host={probe_host}; {summary}; {candidate_data_context}; has_required_data=no; reason={}; {}",
+                        required_data.reason,
+                        proxy_note
+                    ));
+                    continue;
+                }
                 trace_lines.push(format!(
-                    "- {label}: viable; base_host={base_host}; probe_host={probe_host}; {summary}"
+                    "- {label}: viable; base_host={base_host}; probe_host={probe_host}; {summary}; {candidate_data_context}; has_required_data=yes; reason={}",
+                    required_data.reason
                 ));
                 viable.push(ViablePublicSource {
                     candidate: candidate.clone(),
@@ -670,8 +714,8 @@ where
             }
             None => {
                 trace_lines.push(format!(
-                    "- {label}: probed {probe_host}; non-empty but did not mention hypothesis terms; snippet={}",
-                    snippet(trimmed)
+                    "- {label}: probed {probe_host}; non-empty but did not mention hypothesis terms; {candidate_data_context}; snippet={}",
+                    snippet(trimmed),
                 ));
             }
         }
@@ -680,6 +724,7 @@ where
     SourceDiscoveryReport {
         candidates,
         viable,
+        data_requirements,
         trace: trace_lines.join("\n"),
         proposal_was_json,
     }
@@ -696,11 +741,27 @@ fn parse_public_source_candidates(raw: &str) -> Vec<PublicSourceCandidate> {
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            let required_data = json_field(&object, "required_data")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let has_required_data = json_field(&object, "has_required_data")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let required_data_reason = json_field(&object, "required_data_reason")
+                .or_else(|| json_field(&object, "reason"))
+                .unwrap_or("")
+                .trim()
+                .to_string();
             Some(PublicSourceCandidate {
                 name,
                 base_url,
                 probe_url,
                 access_note,
+                required_data,
+                has_required_data,
+                required_data_reason,
             })
         })
         .collect()
@@ -812,6 +873,253 @@ fn source_relevance_terms(hypothesis_statement: &str, capability_need: &str) -> 
         }
     }
     terms
+}
+
+fn source_data_requirements(
+    hypothesis_statement: &str,
+    capability_need: &str,
+    candidates: &[PublicSourceCandidate],
+) -> String {
+    candidates
+        .iter()
+        .find_map(|candidate| {
+            let required_data = candidate.required_data.trim();
+            (!required_data.is_empty()).then(|| required_data.to_string())
+        })
+        .unwrap_or_else(|| question_data_requirements(hypothesis_statement, capability_need))
+}
+
+fn question_data_requirements(hypothesis_statement: &str, capability_need: &str) -> String {
+    let lower = format!("{hypothesis_statement} {capability_need}").to_ascii_lowercase();
+    if needs_immunotherapy_response(&lower) {
+        return "ICB/immunotherapy-treated cohort + response labels + gene expression/biomarker measurements".to_string();
+    }
+    if contains_any(
+        &lower,
+        &["survival", "overall survival", "progression-free"],
+    ) {
+        return "cohort with gene expression/biomarker measurements + survival or outcome labels"
+            .to_string();
+    }
+    if contains_any(&lower, &["expression", "rna", "mrna", "transcript"]) {
+        return "cohort with gene expression measurements for the hypothesis entity".to_string();
+    }
+    "public cohort data containing the hypothesis entity and the endpoint measurements needed to answer the question".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequiredDataAssessment {
+    has_required_data: bool,
+    reason: String,
+}
+
+fn assess_candidate_required_data(
+    candidate: &PublicSourceCandidate,
+    probe_body: &str,
+    data_requirements: &str,
+    hypothesis_statement: &str,
+    capability_need: &str,
+) -> RequiredDataAssessment {
+    let proposed = parse_required_data_assessment(&candidate.has_required_data);
+    if proposed == Some(false) {
+        return RequiredDataAssessment {
+            has_required_data: false,
+            reason: candidate_required_data_reason(candidate)
+                .unwrap_or_else(|| "candidate was marked related-but-insufficient".to_string()),
+        };
+    }
+
+    if let Some(missing) = missing_required_data_reason(
+        probe_body,
+        data_requirements,
+        hypothesis_statement,
+        capability_need,
+    ) {
+        return RequiredDataAssessment {
+            has_required_data: false,
+            reason: missing,
+        };
+    }
+
+    RequiredDataAssessment {
+        has_required_data: true,
+        reason: candidate_required_data_reason(candidate).unwrap_or_else(|| {
+            if proposed == Some(true) {
+                "candidate marked has_required_data=yes and probe verified the required data"
+                    .to_string()
+            } else {
+                "probe verified the required data for this question".to_string()
+            }
+        }),
+    }
+}
+
+fn missing_required_data_reason(
+    probe_body: &str,
+    data_requirements: &str,
+    hypothesis_statement: &str,
+    capability_need: &str,
+) -> Option<String> {
+    let lower_question = format!("{hypothesis_statement} {capability_need} {data_requirements}")
+        .to_ascii_lowercase();
+    let lower_probe = probe_body.to_ascii_lowercase();
+
+    if needs_immunotherapy_response(&lower_question) {
+        let mut missing = Vec::new();
+        if !contains_any(
+            &lower_probe,
+            &[
+                "icb",
+                "immunotherapy",
+                "immune checkpoint",
+                "checkpoint blockade",
+                "anti-pd",
+                "anti pd",
+                "pd-1",
+                "pd1",
+                "pd-l1",
+                "pdl1",
+                "ctla-4",
+                "ctla4",
+            ],
+        ) {
+            missing.push("ICB/immunotherapy-treated cohort");
+        }
+        if !contains_any(
+            &lower_probe,
+            &[
+                "response",
+                "responder",
+                "non-responder",
+                "nonresponder",
+                "recist",
+                "objective response",
+                "orr",
+                "clinical benefit",
+            ],
+        ) {
+            missing.push("response labels");
+        }
+        if contains_any(
+            &lower_question,
+            &["expression", "gene expression", "biomarker", "rna", "mrna"],
+        ) && !contains_any(
+            &lower_probe,
+            &[
+                "expression",
+                "gene expression",
+                "rna",
+                "mrna",
+                "transcript",
+                "biomarker",
+                "mutation",
+            ],
+        ) {
+            missing.push("gene expression/biomarker measurements");
+        }
+        if !missing.is_empty() {
+            return Some(format!(
+                "probe did not verify required data: {}",
+                missing.join(" + ")
+            ));
+        }
+    }
+
+    None
+}
+
+fn needs_immunotherapy_response(lower_text: &str) -> bool {
+    contains_any(
+        lower_text,
+        &[
+            "icb",
+            "immunotherapy",
+            "immune checkpoint",
+            "checkpoint blockade",
+            "anti-pd",
+            "pd-1",
+            "pd-l1",
+            "ctla-4",
+        ],
+    ) && contains_any(
+        lower_text,
+        &[
+            "response",
+            "responder",
+            "non-responder",
+            "nonresponder",
+            "clinical benefit",
+            "benefit",
+            "orr",
+            "recist",
+        ],
+    )
+}
+
+fn candidate_required_data_context(candidate: &PublicSourceCandidate) -> String {
+    format!(
+        "required_data={}; proposed_has_required_data={}; required_data_reason={}",
+        nonempty_or(&candidate.required_data, "unspecified"),
+        nonempty_or(&candidate.has_required_data, "unspecified"),
+        nonempty_or(&candidate.required_data_reason, "unspecified")
+    )
+}
+
+fn candidate_required_data_reason(candidate: &PublicSourceCandidate) -> Option<String> {
+    let reason = candidate.required_data_reason.trim();
+    (!reason.is_empty()).then(|| reason.to_string())
+}
+
+fn parse_required_data_assessment(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "yes" | "true" | "y" | "has_required_data" | "是" => Some(true),
+        "no" | "false" | "n" | "related-but-insufficient" | "insufficient" | "否" => Some(false),
+        _ => None,
+    }
+}
+
+fn proxy_analysis_note(
+    candidate: &PublicSourceCandidate,
+    probe_body: &str,
+    data_requirements: &str,
+) -> String {
+    let lower = format!(
+        "{} {} {} {}",
+        candidate.name, candidate.access_note, candidate.required_data_reason, probe_body
+    )
+    .to_ascii_lowercase();
+    if contains_any(
+        &lower,
+        &[
+            "cbioportal",
+            "expression",
+            "gene expression",
+            "survival",
+            "overall survival",
+            "rna",
+            "mrna",
+        ],
+    ) {
+        format!(
+            "存在代理分析但不直接回答本问题：相关表达/生存数据不能替代 {}",
+            data_requirements
+        )
+    } else {
+        "proxy_analysis_note=none".to_string()
+    }
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn nonempty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback
+    } else {
+        trimmed
+    }
 }
 
 fn is_source_gene_symbol_candidate(token: &str) -> bool {
@@ -3281,6 +3589,10 @@ steps:
         assert!(prompt.contains("\"base_url\""));
         assert!(prompt.contains("\"probe_url\""));
         assert!(prompt.contains("\"access_note\""));
+        assert!(prompt.contains("\"required_data\""));
+        assert!(prompt.contains("\"has_required_data\""));
+        assert!(prompt.contains("\"required_data_reason\""));
+        assert!(prompt.contains("回答该假设需要什么数据"));
         assert!(prompt.contains("read-only GET"));
         assert!(prompt.contains("https://www.ncbi.nlm.nih.gov"));
         assert!(prompt.contains("https://www.ebi.ac.uk"));
@@ -3333,7 +3645,10 @@ steps:
             raw_candidates,
             |url, _timeout| {
                 assert!(url.contains("ncbi.nlm.nih.gov"));
-                Some("GEO record mentions MID1IP1 and immunotherapy response cohort".to_string())
+                Some(
+                    "GEO record mentions MID1IP1 gene expression in an immunotherapy response cohort"
+                        .to_string(),
+                )
             },
         );
 
@@ -3355,6 +3670,44 @@ steps:
         assert!(prompt.contains("read-only GET"));
         assert!(prompt.contains("If the public source lacks usable real data, exit non-zero"));
         assert!(!prompt.contains("import agentflow_cbioportal as cbio"));
+    }
+
+    #[test]
+    fn question_aware_source_discovery_marks_gene_only_source_insufficient() {
+        let raw_candidates = r#"[
+          {
+            "name": "cBioPortal",
+            "base_url": "https://www.cbioportal.org",
+            "probe_url": "https://www.cbioportal.org/api/studies?projection=SUMMARY",
+            "access_note": "public cBioPortal API with expression and survival studies",
+            "required_data": "ICB-treated cohort with response labels and gene expression",
+            "has_required_data": "no",
+            "required_data_reason": "related expression/survival data, but no ICB treatment response labels"
+          }
+        ]"#;
+
+        let discovery = discover_sources_from_candidate_json(
+            "MID1IP1 immunotherapy response biomarker",
+            "Need public ICB cohort response data with expression",
+            raw_candidates,
+            |_url, _timeout| {
+                Some(
+                    "cBioPortal TCGA melanoma studies include MID1IP1 mRNA expression and overall survival"
+                        .to_string(),
+                )
+            },
+        );
+
+        assert!(discovery.first_viable().is_none());
+        assert!(discovery.trace.contains("QUESTION DATA REQUIREMENTS"));
+        assert!(discovery
+            .trace
+            .contains("ICB-treated cohort with response labels and gene expression"));
+        assert!(discovery.trace.contains("cBioPortal"));
+        assert!(discovery.trace.contains("related-but-insufficient"));
+        assert!(discovery.trace.contains("has_required_data=no"));
+        assert!(discovery.trace.contains("no ICB treatment response labels"));
+        assert!(discovery.trace.contains("代理分析但不直接回答本问题"));
     }
 
     #[test]

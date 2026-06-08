@@ -83,6 +83,7 @@ pub enum DecisionKind {
     GoalMutation,
     ToolGap,
     StanceAssessment,
+    FundamentalGap,
 }
 
 impl DecisionKind {
@@ -94,6 +95,7 @@ impl DecisionKind {
             Self::GoalMutation => "goal_mutation",
             Self::ToolGap => "tool_gap",
             Self::StanceAssessment => "stance_assessment",
+            Self::FundamentalGap => "fundamental_gap",
         }
     }
 
@@ -105,6 +107,7 @@ impl DecisionKind {
             "goal_mutation" => Some(Self::GoalMutation),
             "tool_gap" => Some(Self::ToolGap),
             "stance_assessment" => Some(Self::StanceAssessment),
+            "fundamental_gap" => Some(Self::FundamentalGap),
             _ => None,
         }
     }
@@ -865,6 +868,15 @@ mod tests {
         assert_eq!(
             super::resolution_payload_json("event_1", 0, "note\nwith tab\t"),
             "{\"decision_point_id\":\"event_1\",\"chosen_index\":0,\"note\":\"note\\nwith tab\\t\"}"
+        );
+    }
+
+    #[test]
+    fn decision_kind_round_trips_fundamental_gap() {
+        assert_eq!(DecisionKind::FundamentalGap.as_str(), "fundamental_gap");
+        assert_eq!(
+            DecisionKind::parse("fundamental_gap"),
+            Some(DecisionKind::FundamentalGap)
         );
     }
 

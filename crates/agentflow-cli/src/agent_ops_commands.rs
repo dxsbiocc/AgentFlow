@@ -624,8 +624,27 @@ impl ToolSynthesizer for LlmToolSynthesizer<'_> {
             Ok(synth_commands::AutoSynthToolResult::Registered(tool_ref)) => {
                 ToolSynthesisOutcome::registered(tool_ref)
             }
+            Ok(synth_commands::AutoSynthToolResult::RegisteredWithSource {
+                tool_ref,
+                source_trace,
+            }) => ToolSynthesisOutcome::registered_with_source_trace(tool_ref, source_trace),
             Ok(synth_commands::AutoSynthToolResult::Rejected(reason)) => {
                 ToolSynthesisOutcome::rejected(reason)
+            }
+            Ok(synth_commands::AutoSynthToolResult::RejectedWithSource {
+                reason,
+                source_trace,
+                research_gap,
+            }) => {
+                if research_gap {
+                    ToolSynthesisOutcome::rejected_research_gap(reason, Some(source_trace))
+                } else {
+                    ToolSynthesisOutcome::Rejected {
+                        reason,
+                        source_trace: Some(source_trace),
+                        research_gap: false,
+                    }
+                }
             }
             Err(error) => ToolSynthesisOutcome::rejected(format!(
                 "auto-synth backend or registration failed: {}",

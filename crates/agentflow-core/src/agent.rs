@@ -22,6 +22,7 @@ const PARAMS_INFERRED_EVENT: &str = "agent.params_inferred";
 const TOOL_SYNTHESIZED_EVENT: &str = "agent.tool_synthesized";
 const TOOL_GAP_HYPOTHESIS_MARKER: &str = "hypothesis_id = ";
 const STANCE_ASSESSMENT_OBSERVATION_MARKER: &str = "observation_id = ";
+const SOURCE_DISCOVERY_GAP_HYPOTHESIS_MARKER: &str = "source_gap_hypothesis_id = ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,20 +119,48 @@ pub struct NoopToolSynthesizer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolSynthesisOutcome {
-    Registered { tool_ref: String },
-    Rejected { reason: String },
+    Registered {
+        tool_ref: String,
+        source_trace: Option<String>,
+    },
+    Rejected {
+        reason: String,
+        source_trace: Option<String>,
+        research_gap: bool,
+    },
 }
 
 impl ToolSynthesisOutcome {
     pub fn registered(tool_ref: impl Into<String>) -> Self {
         Self::Registered {
             tool_ref: tool_ref.into(),
+            source_trace: None,
+        }
+    }
+
+    pub fn registered_with_source_trace(
+        tool_ref: impl Into<String>,
+        source_trace: impl Into<String>,
+    ) -> Self {
+        Self::Registered {
+            tool_ref: tool_ref.into(),
+            source_trace: Some(source_trace.into()),
         }
     }
 
     pub fn rejected(reason: impl Into<String>) -> Self {
         Self::Rejected {
             reason: reason.into(),
+            source_trace: None,
+            research_gap: false,
+        }
+    }
+
+    pub fn rejected_research_gap(reason: impl Into<String>, source_trace: Option<String>) -> Self {
+        Self::Rejected {
+            reason: reason.into(),
+            source_trace,
+            research_gap: true,
         }
     }
 }
@@ -204,6 +233,7 @@ struct AppliedStepFinalization<'a> {
     inferred_param_names: &'a [String],
     auto_synth_tool_ref: Option<&'a str>,
     capability_need: Option<&'a str>,
+    auto_synth_source_trace: Option<&'a str>,
     auto_run: bool,
 }
 
@@ -406,6 +436,7 @@ impl ProjectStore {
                     )?;
                     let mut auto_synth_tool_ref = None;
                     let mut synthesized_capability_need = None;
+                    let mut auto_synth_source_trace = None;
                     if auto_synth && auto_synth_gap(&proposal) {
                         let flow_id = config.flow.clone().unwrap_or_else(|| {
                             auto_flow_id(&proposal.decision.candidate.hypothesis_id)
@@ -460,7 +491,10 @@ impl ProjectStore {
                                     &capability_need,
                                     representative_gene.as_deref(),
                                 ) {
-                                    ToolSynthesisOutcome::Registered { tool_ref } => {
+                                    ToolSynthesisOutcome::Registered {
+                                        tool_ref,
+                                        source_trace,
+                                    } => {
                                         match self.draft_synthesized_step(
                                             &tool_ref,
                                             &proposal.decision,
@@ -471,14 +505,16 @@ impl ProjectStore {
                                                 proposal.matched_tool = Some(tool_ref.clone());
                                                 proposal.matched_fit =
                                                     Some("synthesized".to_string());
-                                                proposal.match_reason = Some(
-                                                    "auto_synth: runtime-gated exploratory tool"
-                                                        .to_string(),
-                                                );
+                                                proposal.match_reason =
+                                                    Some(auto_synth_match_reason(
+                                                        "auto_synth: runtime-gated exploratory tool",
+                                                        source_trace.as_deref(),
+                                                    ));
                                                 proposal.drafted_step = Some(step);
                                                 inferred_param_names = synthesized_inferred_params;
                                                 auto_synth_tool_ref = Some(tool_ref);
                                                 synthesized_capability_need = Some(capability_need);
+                                                auto_synth_source_trace = source_trace;
                                             }
                                             Err(error) => {
                                                 proposal.drafted_step = None;
@@ -495,16 +531,44 @@ impl ProjectStore {
                                             }
                                         }
                                     }
-                                    ToolSynthesisOutcome::Rejected { reason } => {
+                                    ToolSynthesisOutcome::Rejected {
+                                        reason,
+                                        source_trace,
+                                        research_gap,
+                                    } => {
                                         proposal.drafted_step = None;
+                                        let failure_reason = auto_synth_failure_reason(
+                                            &reason,
+                                            source_trace.as_deref(),
+                                        );
                                         apply_failures.push(ApplyFailure {
                                             hypothesis_id: proposal
                                                 .decision
                                                 .candidate
                                                 .hypothesis_id
                                                 .clone(),
-                                            reason: format!("auto-synth skipped: {reason}"),
+                                            reason: failure_reason,
                                         });
+                                        if research_gap
+                                            && !self.has_pending_source_discovery_gap(
+                                                &proposal.decision.candidate.hypothesis_id,
+                                            )?
+                                        {
+                                            let point = self.raise_decision_point(
+                                                DecisionKind::DeepenOrStop,
+                                                &auto_synth_research_gap_digest(
+                                                    &proposal.decision.candidate.hypothesis_id,
+                                                    &proposal.decision.candidate.statement,
+                                                    &reason,
+                                                    source_trace.as_deref(),
+                                                ),
+                                                auto_synth_research_gap_options(
+                                                    &proposal.decision.candidate.hypothesis_id,
+                                                ),
+                                                0,
+                                            )?;
+                                            raised_decisions.push(point);
+                                        }
                                     }
                                 }
                             }
@@ -595,6 +659,8 @@ impl ProjectStore {
                                                             .as_deref(),
                                                         capability_need:
                                                             synthesized_capability_need.as_deref(),
+                                                        auto_synth_source_trace:
+                                                            auto_synth_source_trace.as_deref(),
                                                         auto_run: config.auto_run,
                                                     },
                                                     ApplyCycleOutputs {
@@ -733,6 +799,15 @@ impl ProjectStore {
             .filter(|point| point.kind == DecisionKind::ToolGap)
             .filter_map(|point| tool_gap_hypothesis_id(&point.digest))
             .collect())
+    }
+
+    fn has_pending_source_discovery_gap(&self, hypothesis_id: &str) -> Result<bool, StorageError> {
+        Ok(self
+            .pending_decision_points()?
+            .into_iter()
+            .filter(|point| point.kind == DecisionKind::DeepenOrStop)
+            .filter_map(|point| source_discovery_gap_hypothesis_id(&point.digest))
+            .any(|pending| pending == hypothesis_id))
     }
 
     fn pending_stance_assessment_observation_ids(&self) -> Result<BTreeSet<String>, StorageError> {
@@ -959,6 +1034,7 @@ impl ProjectStore {
                 finalization.hypothesis_id,
                 tool_ref,
                 finalization.capability_need.unwrap_or(""),
+                finalization.auto_synth_source_trace,
             )?;
         }
         outputs.applied.push(finalization.action);
@@ -982,6 +1058,7 @@ impl ProjectStore {
         hypothesis_id: &str,
         tool_ref: &str,
         capability_need: &str,
+        source_trace: Option<&str>,
     ) -> Result<(), StorageError> {
         self.append_event(EventRecord {
             flow_id: Some(flow_id.to_string()),
@@ -994,6 +1071,7 @@ impl ProjectStore {
                 hypothesis_id,
                 tool_ref,
                 capability_need,
+                source_trace,
             ),
         })?;
         self.touch_project()?;
@@ -1105,18 +1183,19 @@ impl ProjectStore {
             observation.flow_id.as_deref(),
             observation.step_id.as_deref(),
         )?;
-        let auto_synth_tool_ref = self.auto_synthesized_tool_for_observation(
+        let auto_synth_provenance = self.auto_synthesized_tool_for_observation(
             observation.flow_id.as_deref(),
             observation.step_id.as_deref(),
         )?;
-        let mut digest = if let Some(tool_ref) = auto_synth_tool_ref.as_deref() {
+        let mut digest = if let Some(provenance) = auto_synth_provenance.as_ref() {
             auto_synth_stance_assessment_digest(
                 step_id,
                 observation_id,
                 &observation.summary,
                 hypothesis_id,
                 &hypothesis.statement,
-                tool_ref,
+                &provenance.tool_ref,
+                provenance.source_trace.as_deref(),
             )
         } else {
             stance_assessment_digest(
@@ -1211,7 +1290,7 @@ impl ProjectStore {
         &self,
         flow_id: Option<&str>,
         step_id: Option<&str>,
-    ) -> Result<Option<String>, StorageError> {
+    ) -> Result<Option<AutoSynthProvenance>, StorageError> {
         let (Some(flow_id), Some(step_id)) = (flow_id, step_id) else {
             return Ok(None);
         };
@@ -1236,7 +1315,10 @@ impl ProjectStore {
             let candidate_step_id = event_step_id.unwrap_or(payload.step_id);
             if candidate_flow_id == flow_id && step_ids_match(flow_id, step_id, &candidate_step_id)
             {
-                return Ok(Some(payload.tool_ref));
+                return Ok(Some(AutoSynthProvenance {
+                    tool_ref: payload.tool_ref,
+                    source_trace: payload.source_trace,
+                }));
             }
         }
         Ok(None)
@@ -1264,6 +1346,14 @@ struct ToolSynthesizedPayload {
     hypothesis_id: String,
     tool_ref: String,
     capability_need: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_trace: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AutoSynthProvenance {
+    pub tool_ref: String,
+    pub source_trace: Option<String>,
 }
 
 fn inferred_param_payloads(
@@ -1316,6 +1406,7 @@ fn tool_synthesized_payload_json(
     hypothesis_id: &str,
     tool_ref: &str,
     capability_need: &str,
+    source_trace: Option<&str>,
 ) -> String {
     serde_json::to_string(&ToolSynthesizedPayload {
         flow_id: flow_id.to_string(),
@@ -1323,6 +1414,7 @@ fn tool_synthesized_payload_json(
         hypothesis_id: hypothesis_id.to_string(),
         tool_ref: tool_ref.to_string(),
         capability_need: capability_need.to_string(),
+        source_trace: source_trace.map(ToOwned::to_owned),
     })
     .expect("tool synthesized payload serializes to JSON")
 }
@@ -1754,15 +1846,107 @@ fn auto_synth_stance_assessment_digest(
     hypothesis_id: &str,
     hypothesis_statement: &str,
     tool_ref: &str,
+    source_trace: Option<&str>,
 ) -> String {
-    format!(
+    let mut digest = format!(
         "{} 摘要：{observation_summary}。{STANCE_ASSESSMENT_OBSERVATION_MARKER}{observation_id}；请判定它对假设「{hypothesis_statement}」的立场。若仍要记录立场，运行：evidence link --hypothesis {hypothesis_id} --observation {observation_id} --stance supports|contradicts --grade hypothesis。只有人工核验工具逻辑与数据来源后，才可另行升级证据。",
         auto_synth_warning_with_step(step_id, tool_ref)
-    )
+    );
+    if let Some(trace) = source_trace
+        .map(str::trim)
+        .filter(|trace| !trace.is_empty())
+    {
+        digest.push('\n');
+        digest.push_str(trace);
+    }
+    digest
 }
 
 fn auto_synth_warning_with_step(step_id: &str, tool_ref: &str) -> String {
     format!("⚠ 步骤 {step_id} {}", auto_synth_warning(tool_ref))
+}
+
+fn auto_synth_match_reason(base: &str, source_trace: Option<&str>) -> String {
+    match source_trace
+        .map(str::trim)
+        .filter(|trace| !trace.is_empty())
+    {
+        Some(trace) => format!("{base}; source discovery trace: {}", one_line(trace)),
+        None => base.to_string(),
+    }
+}
+
+fn auto_synth_failure_reason(reason: &str, source_trace: Option<&str>) -> String {
+    let base = format!("auto-synth skipped: {reason}");
+    match source_trace
+        .map(str::trim)
+        .filter(|trace| !trace.is_empty())
+    {
+        Some(trace) => format!("{base}\n{trace}"),
+        None => base,
+    }
+}
+
+fn auto_synth_research_gap_digest(
+    hypothesis_id: &str,
+    hypothesis_statement: &str,
+    reason: &str,
+    source_trace: Option<&str>,
+) -> String {
+    let mut digest = format!(
+        "§15 决策痕迹：{SOURCE_DISCOVERY_GAP_HYPOTHESIS_MARKER}{hypothesis_id}；未找到可访问公开数据源能为该假设提供数据，可能是真实研究空白。假设「{hypothesis_statement}」。原因：{reason}。请人类判断是否接受研究空白、提供额外数据源或改写假设。"
+    );
+    if let Some(trace) = source_trace
+        .map(str::trim)
+        .filter(|trace| !trace.is_empty())
+    {
+        digest.push('\n');
+        digest.push_str(trace);
+    }
+    digest
+}
+
+fn auto_synth_research_gap_options(hypothesis_id: &str) -> Vec<HandoffOption> {
+    vec![
+        HandoffOption {
+            label: "接受研究空白".to_string(),
+            direction: format!(
+                "将假设 {hypothesis_id} 暂按公开数据源不可得处理，后续可在 AS8 落 Fundamental"
+            ),
+            cost: Cost::Cheap,
+            risk: Risk::Low,
+            reversible: true,
+        },
+        HandoffOption {
+            label: "提供数据源".to_string(),
+            direction: format!("为假设 {hypothesis_id} 提供可访问公开源或本地数据后重跑"),
+            cost: Cost::Moderate,
+            risk: Risk::Low,
+            reversible: true,
+        },
+        HandoffOption {
+            label: "改写假设".to_string(),
+            direction: format!("收窄或改写假设 {hypothesis_id} 以匹配可访问数据"),
+            cost: Cost::Moderate,
+            risk: Risk::Medium,
+            reversible: true,
+        },
+    ]
+}
+
+fn source_discovery_gap_hypothesis_id(digest: &str) -> Option<String> {
+    let rest = digest.split_once(SOURCE_DISCOVERY_GAP_HYPOTHESIS_MARKER)?.1;
+    rest.split('；').next().map(str::trim).and_then(|id| {
+        if id.is_empty() {
+            None
+        } else {
+            Some(id.to_string())
+        }
+    })
+}
+
+fn one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn stance_assessment_options(hypothesis_id: &str, observation_id: &str) -> Vec<HandoffOption> {
@@ -2447,6 +2631,8 @@ runtime:
         tool_name: &'static str,
         calls: RefCell<Vec<(String, String, Option<String>)>>,
         should_register: bool,
+        source_trace: Option<&'static str>,
+        research_gap: bool,
     }
 
     impl<'a> StubToolSynthesizer<'a> {
@@ -2467,6 +2653,8 @@ runtime:
                 tool_name,
                 calls: RefCell::new(Vec::new()),
                 should_register: true,
+                source_trace: None,
+                research_gap: false,
             }
         }
 
@@ -2477,7 +2665,26 @@ runtime:
                 tool_name: "unused",
                 calls: RefCell::new(Vec::new()),
                 should_register: false,
+                source_trace: None,
+                research_gap: false,
             }
+        }
+
+        fn research_gap(store: &'a ProjectStore, source_trace: &'static str) -> Self {
+            Self {
+                store,
+                script_path: PathBuf::new(),
+                tool_name: "unused",
+                calls: RefCell::new(Vec::new()),
+                should_register: false,
+                source_trace: Some(source_trace),
+                research_gap: true,
+            }
+        }
+
+        fn with_source_trace(mut self, source_trace: &'static str) -> Self {
+            self.source_trace = Some(source_trace);
+            self
         }
 
         fn calls(&self) -> Vec<(String, String, Option<String>)> {
@@ -2498,6 +2705,12 @@ runtime:
                 representative_gene.map(ToOwned::to_owned),
             ));
             if !self.should_register {
+                if self.research_gap {
+                    return ToolSynthesisOutcome::rejected_research_gap(
+                        "未找到可访问公开数据源能为该假设提供数据，可能是真实研究空白",
+                        self.source_trace.map(str::to_string),
+                    );
+                }
                 return ToolSynthesisOutcome::rejected("stub synthesizer returned no candidate");
             }
             let command = self.script_path.display();
@@ -2525,7 +2738,11 @@ runtime:
                 self.tool_name
             ))
             .unwrap();
-            ToolSynthesisOutcome::registered(self.store.register_tool(spec).unwrap().tool_ref)
+            let tool_ref = self.store.register_tool(spec).unwrap().tool_ref;
+            match self.source_trace {
+                Some(trace) => ToolSynthesisOutcome::registered_with_source_trace(tool_ref, trace),
+                None => ToolSynthesisOutcome::registered(tool_ref),
+            }
         }
     }
 
@@ -3780,6 +3997,57 @@ steps:
     }
 
     #[test]
+    fn auto_synth_source_trace_is_visible_in_l4_digest() {
+        let (path, store) = init_project("auto-synth-source-trace-l4");
+        let statement = "MID1IP1 immunotherapy response needs public ICB data";
+        let hypothesis_id = record_hypothesis(&store, statement);
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+        let synthesizer = StubToolSynthesizer::registering(
+            &store,
+            &path,
+            "auto_synth_mid1ip1_source",
+        )
+        .with_source_trace(
+            "SOURCE DISCOVERY TRACE\n- NCBI GEO: viable; probe returned MID1IP1 immunotherapy response cohort",
+        );
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: true,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &NoopRelevanceScorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        let point = report
+            .raised_decisions
+            .iter()
+            .find(|point| point.kind == DecisionKind::StanceAssessment)
+            .unwrap();
+        assert!(point.digest.contains("SOURCE DISCOVERY TRACE"));
+        assert!(point.digest.contains("NCBI GEO"));
+        assert!(point
+            .digest
+            .contains("MID1IP1 immunotherapy response cohort"));
+        assert!(point.digest.contains("自动合成的未验证工具"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn auto_synth_reuses_registered_synth_tool_for_same_hypothesis_without_resynthesis() {
         let (path, store) = init_project("auto-synth-reuse-dedup");
         let statement = "Auto synth THRSP pathway validation needs custom validation";
@@ -3891,6 +4159,62 @@ steps:
         assert_eq!(event_count(&store, "tool_registered"), 0);
         assert_eq!(event_count(&store, "agent.tool_synthesized"), 0);
         assert!(store.list_observations().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_synth_research_gap_raises_honest_handoff_digest() {
+        let (path, store) = init_project("auto-synth-research-gap");
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "MID1IP1 immunotherapy response needs public ICB data",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+        let synthesizer = StubToolSynthesizer::research_gap(
+            &store,
+            "SOURCE DISCOVERY TRACE\n- blocked mirror: skipped, not allowlisted\n- NCBI GEO: probed, empty",
+        );
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: false,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &NoopRelevanceScorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        assert_eq!(synthesizer.calls().len(), 1);
+        assert!(report.branch_proposals[0].matched_tool.is_none());
+        assert!(report
+            .apply_failures
+            .iter()
+            .any(|failure| failure.reason.contains("研究空白")));
+        let point = report
+            .raised_decisions
+            .iter()
+            .find(|point| point.kind == DecisionKind::DeepenOrStop)
+            .unwrap();
+        assert!(point.digest.contains("未找到可访问公开数据源"));
+        assert!(point.digest.contains("可能是真实研究空白"));
+        assert!(point.digest.contains("SOURCE DISCOVERY TRACE"));
+        assert!(point.digest.contains("blocked mirror"));
+        assert_eq!(point.recommendation, 0);
+        assert!(report.applied.is_empty());
+        assert_eq!(event_count(&store, "tool_registered"), 0);
 
         let _ = std::fs::remove_dir_all(path);
     }

@@ -720,6 +720,7 @@ impl ProjectStore {
             observation.flow_id.as_deref(),
             observation.step_id.as_deref(),
         )
+        .map(|provenance| provenance.map(|provenance| provenance.tool_ref))
     }
 
     fn source_inferred_params_for_observation(

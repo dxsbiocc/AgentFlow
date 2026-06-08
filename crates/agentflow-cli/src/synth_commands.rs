@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::str::FromStr;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,12 +20,22 @@ pub(crate) const DEFAULT_SYNTHESIZER: &str = "claude -p";
 const SYNTH_VERSION: &str = "0.1.0";
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(60);
 const CBIOPORTAL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+const SOURCE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 const CBIOPORTAL_API_BASE: &str = "https://www.cbioportal.org/api";
 const CBIOPORTAL_CLIENT_RELATIVE_DIR: &str = "examples/tools";
 const MAX_AUTO_SYNTH_ATTEMPTS: usize = 3;
 const VALIDATION_PATH: &str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
 const PRIMARY_VALIDATION_GENE: &str = "TP53";
 const ALTERNATE_VALIDATION_GENE: &str = "EGFR";
+const MAX_SOURCE_PROBE_BYTES: usize = 65_536;
+const PUBLIC_SOURCE_ALLOWLIST: &[&str] = &[
+    "www.cbioportal.org",
+    "eutils.ncbi.nlm.nih.gov",
+    "www.ncbi.nlm.nih.gov",
+    "www.ebi.ac.uk",
+    "rest.ensembl.org",
+    "api.gdc.cancer.gov",
+];
 const CBIOPORTAL_DISCOVERY_FETCH_PY: &str = r#"import json
 import sys
 import urllib.request
@@ -35,6 +47,21 @@ with urllib.request.urlopen(request, timeout=timeout) as response:
     body = response.read().decode("utf-8")
 json.loads(body)
 print(body, end="" if body.endswith("\n") else "\n")
+"#;
+const SOURCE_PROBE_FETCH_PY: &str = r#"import sys
+import urllib.request
+
+url = sys.argv[1]
+timeout = float(sys.argv[2])
+limit = int(sys.argv[3])
+request = urllib.request.Request(
+    url,
+    headers={"Accept": "application/json, text/plain, text/html, */*"},
+)
+with urllib.request.urlopen(request, timeout=timeout) as response:
+    body = response.read(limit)
+text = body.decode("utf-8", errors="replace")
+print(text, end="" if text.endswith("\n") else "\n")
 "#;
 const DEFAULT_SYNTH_DOMAIN_PARAMS: &[SynthDomainParam] = &[SynthDomainParam {
     name: "gene",
@@ -83,9 +110,51 @@ struct AutoSynthCandidate {
     expect: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicSourceCandidate {
+    name: String,
+    base_url: String,
+    probe_url: String,
+    access_note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ViablePublicSource {
+    candidate: PublicSourceCandidate,
+    probe_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceDiscoveryReport {
+    candidates: Vec<PublicSourceCandidate>,
+    viable: Vec<ViablePublicSource>,
+    trace: String,
+    proposal_was_json: bool,
+}
+
+impl SourceDiscoveryReport {
+    fn first_viable(&self) -> Option<&ViablePublicSource> {
+        self.viable.first()
+    }
+
+    fn should_enforce_research_gap(&self) -> bool {
+        self.proposal_was_json || !self.candidates.is_empty()
+    }
+}
+
+#[derive(Debug)]
 pub(crate) enum AutoSynthToolResult {
     Registered(String),
     Rejected(String),
+    RegisteredWithSource {
+        tool_ref: String,
+        source_trace: String,
+    },
+    RejectedWithSource {
+        reason: String,
+        source_trace: String,
+        research_gap: bool,
+    },
 }
 
 pub(crate) fn synth_command(args: SynthArgs) -> Result<String, CliError> {
@@ -195,9 +264,70 @@ pub(crate) fn auto_synthesize_agent_tool(
     capability_need: &str,
     representative_gene: Option<&str>,
 ) -> Result<AutoSynthToolResult, CliError> {
-    let grounding = discover_cbioportal_grounding(hypothesis_statement);
-    let base_prompt =
-        build_auto_synth_prompt(hypothesis_statement, capability_need, grounding.as_deref());
+    auto_synthesize_agent_tool_with_fetcher(
+        store,
+        synthesizer,
+        hypothesis_statement,
+        capability_need,
+        representative_gene,
+        fetch_public_source_probe_with_python,
+    )
+}
+
+fn auto_synthesize_agent_tool_with_fetcher<F>(
+    store: &ProjectStore,
+    synthesizer: &str,
+    hypothesis_statement: &str,
+    capability_need: &str,
+    representative_gene: Option<&str>,
+    fetch_probe: F,
+) -> Result<AutoSynthToolResult, CliError>
+where
+    F: FnMut(&str, Duration) -> Option<String>,
+{
+    let discovery = discover_public_sources_with_fetcher(
+        store.root_path(),
+        synthesizer,
+        hypothesis_statement,
+        capability_need,
+        fetch_probe,
+    )?;
+    let (base_prompt, source_trace, research_gap_on_failure) = if discovery
+        .should_enforce_research_gap()
+    {
+        let Some(viable) = discovery.first_viable() else {
+            let reason = no_viable_public_source_reason();
+            return Ok(AutoSynthToolResult::RejectedWithSource {
+                reason,
+                source_trace: discovery.trace,
+                research_gap: true,
+            });
+        };
+        let trace = discovery.trace.clone();
+        let cbioportal_grounding = if is_cbioportal_source(viable) {
+            discover_cbioportal_grounding(hypothesis_statement)
+        } else {
+            None
+        };
+        (
+            build_prompt_for_viable_source(
+                hypothesis_statement,
+                capability_need,
+                viable,
+                &trace,
+                cbioportal_grounding.as_deref(),
+            ),
+            Some(trace),
+            true,
+        )
+    } else {
+        let grounding = discover_cbioportal_grounding(hypothesis_statement);
+        (
+            build_auto_synth_prompt(hypothesis_statement, capability_need, grounding.as_deref()),
+            None,
+            false,
+        )
+    };
     let runtime_gene = representative_gene
         .map(str::trim)
         .filter(|gene| !gene.is_empty())
@@ -249,7 +379,10 @@ pub(crate) fn auto_synthesize_agent_tool(
                     synthesized_agent_tool_yaml(&name, &description, &canonical_script_path);
                 let spec = ToolSpec::from_simple_yaml(&spec_yaml)?;
                 let registration = store.register_tool(spec)?;
-                return Ok(AutoSynthToolResult::Registered(registration.tool_ref));
+                return Ok(auto_synth_registered_result(
+                    registration.tool_ref,
+                    source_trace.as_deref(),
+                ));
             }
             Err(reason) => {
                 cleanup_auto_synth_candidate(
@@ -266,7 +399,58 @@ pub(crate) fn auto_synthesize_agent_tool(
         }
     }
 
-    Ok(AutoSynthToolResult::Rejected(last_rejection))
+    let reason = if research_gap_on_failure {
+        format!(
+            "{}；合成候选未能通过真实数据运行时门，不编造结果，可能是真实研究空白。最后失败：{}",
+            no_viable_public_source_reason(),
+            last_rejection
+        )
+    } else {
+        last_rejection
+    };
+    Ok(auto_synth_rejected_result(
+        reason,
+        source_trace.as_deref(),
+        research_gap_on_failure,
+    ))
+}
+
+fn auto_synth_registered_result(
+    tool_ref: String,
+    source_trace: Option<&str>,
+) -> AutoSynthToolResult {
+    match source_trace
+        .map(str::trim)
+        .filter(|trace| !trace.is_empty())
+    {
+        Some(trace) => AutoSynthToolResult::RegisteredWithSource {
+            tool_ref,
+            source_trace: trace.to_string(),
+        },
+        None => AutoSynthToolResult::Registered(tool_ref),
+    }
+}
+
+fn auto_synth_rejected_result(
+    reason: String,
+    source_trace: Option<&str>,
+    research_gap: bool,
+) -> AutoSynthToolResult {
+    match source_trace
+        .map(str::trim)
+        .filter(|trace| !trace.is_empty())
+    {
+        Some(trace) => AutoSynthToolResult::RejectedWithSource {
+            reason,
+            source_trace: trace.to_string(),
+            research_gap,
+        },
+        None => AutoSynthToolResult::Rejected(reason),
+    }
+}
+
+fn no_viable_public_source_reason() -> String {
+    "未找到可访问公开数据源能为该假设提供数据，可能是真实研究空白".to_string()
 }
 
 fn validate_auto_synth_candidate(
@@ -371,6 +555,310 @@ pub(crate) fn discover_cbioportal_grounding(hypothesis_statement: &str) -> Optio
     discover_cbioportal_grounding_with_fetcher(hypothesis_statement, CBIOPORTAL_API_BASE, |url| {
         fetch_cbioportal_json_with_python(url, CBIOPORTAL_DISCOVERY_TIMEOUT)
     })
+}
+
+fn build_source_discovery_prompt(hypothesis_statement: &str, capability_need: &str) -> String {
+    let allowlist = PUBLIC_SOURCE_ALLOWLIST
+        .iter()
+        .map(|host| format!("https://{host}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        concat!(
+            "AgentFlow has a capability/data gap and needs autonomous public-source discovery before tool synthesis.\n",
+            "Research hypothesis:\n{}\n\n",
+            "Capability gap:\n{}\n\n",
+            "Propose candidate public scientific data sources that may contain real data for the hypothesis entity and endpoint need.\n",
+            "Return ONLY a JSON array. Each object must contain string fields exactly: \"name\", \"base_url\", \"probe_url\", \"access_note\".\n",
+            "\"probe_url\" must be a read-only GET discovery/query endpoint that can verify data availability for the hypothesis entity.\n",
+            "Allowed domains only: {}.\n",
+            "Use only http(s) URLs. Do not propose localhost, private IP, file://, credentialed URLs, write endpoints, or non-public sources.\n",
+            "If no suitable public source exists, return []."
+        ),
+        hypothesis_statement, capability_need, allowlist
+    )
+}
+
+fn discover_public_sources_with_fetcher<F>(
+    project_root: &Path,
+    synthesizer: &str,
+    hypothesis_statement: &str,
+    capability_need: &str,
+    fetch_probe: F,
+) -> Result<SourceDiscoveryReport, CliError>
+where
+    F: FnMut(&str, Duration) -> Option<String>,
+{
+    let prompt = build_source_discovery_prompt(hypothesis_statement, capability_need);
+    let raw = run_project_synthesizer(project_root, synthesizer, &prompt)?;
+    let candidate_json = strip_markdown_fence(&raw);
+    Ok(discover_sources_from_candidate_json(
+        hypothesis_statement,
+        capability_need,
+        &candidate_json,
+        fetch_probe,
+    ))
+}
+
+fn discover_sources_from_candidate_json<F>(
+    hypothesis_statement: &str,
+    capability_need: &str,
+    raw_candidates: &str,
+    mut fetch_probe: F,
+) -> SourceDiscoveryReport
+where
+    F: FnMut(&str, Duration) -> Option<String>,
+{
+    let proposal_was_json = looks_like_json_array(raw_candidates);
+    let candidates = parse_public_source_candidates(raw_candidates);
+    let relevance_terms = source_relevance_terms(hypothesis_statement, capability_need);
+    let mut viable = Vec::new();
+    let mut trace_lines = vec![
+        "SOURCE DISCOVERY TRACE".to_string(),
+        format!("candidate proposals parsed: {}", candidates.len()),
+        format!("allowlist: {}", PUBLIC_SOURCE_ALLOWLIST.join(", ")),
+    ];
+
+    for candidate in &candidates {
+        let label = if candidate.name.trim().is_empty() {
+            "<unnamed>"
+        } else {
+            candidate.name.trim()
+        };
+        let base_host = match source_probe_safety(&candidate.base_url) {
+            Ok(host) => host,
+            Err(reason) => {
+                trace_lines.push(format!(
+                    "- {label}: skipped base_url {}; {reason}",
+                    candidate.base_url
+                ));
+                continue;
+            }
+        };
+        let probe_host = match source_probe_safety(&candidate.probe_url) {
+            Ok(host) => host,
+            Err(reason) => {
+                trace_lines.push(format!(
+                    "- {label}: skipped probe_url {}; {reason}",
+                    candidate.probe_url
+                ));
+                continue;
+            }
+        };
+
+        let Some(body) = fetch_probe(&candidate.probe_url, SOURCE_DISCOVERY_TIMEOUT) else {
+            trace_lines.push(format!(
+                "- {label}: probed {probe_host}; failed or timed out"
+            ));
+            continue;
+        };
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            trace_lines.push(format!("- {label}: probed {probe_host}; empty response"));
+            continue;
+        }
+
+        match plausible_probe_summary(trimmed, &relevance_terms) {
+            Some(summary) => {
+                trace_lines.push(format!(
+                    "- {label}: viable; base_host={base_host}; probe_host={probe_host}; {summary}"
+                ));
+                viable.push(ViablePublicSource {
+                    candidate: candidate.clone(),
+                    probe_summary: summary,
+                });
+            }
+            None => {
+                trace_lines.push(format!(
+                    "- {label}: probed {probe_host}; non-empty but did not mention hypothesis terms; snippet={}",
+                    snippet(trimmed)
+                ));
+            }
+        }
+    }
+
+    SourceDiscoveryReport {
+        candidates,
+        viable,
+        trace: trace_lines.join("\n"),
+        proposal_was_json,
+    }
+}
+
+fn parse_public_source_candidates(raw: &str) -> Vec<PublicSourceCandidate> {
+    parse_json_string_objects(raw)
+        .into_iter()
+        .filter_map(|object| {
+            let name = json_field(&object, "name")?.trim().to_string();
+            let base_url = json_field(&object, "base_url")?.trim().to_string();
+            let probe_url = json_field(&object, "probe_url")?.trim().to_string();
+            let access_note = json_field(&object, "access_note")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            Some(PublicSourceCandidate {
+                name,
+                base_url,
+                probe_url,
+                access_note,
+            })
+        })
+        .collect()
+}
+
+fn looks_like_json_array(raw: &str) -> bool {
+    raw.trim_start().starts_with('[')
+}
+
+fn source_probe_safety(url: &str) -> Result<String, String> {
+    let host = http_url_host(url)?;
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err(format!("localhost host {host} is not allowed"));
+    }
+    if let Ok(ip) = IpAddr::from_str(&host) {
+        if is_private_or_local_ip(ip) {
+            return Err(format!("private or local IP {host} is not allowed"));
+        }
+        return Err(format!("host {host} is not allowlisted"));
+    }
+    if !PUBLIC_SOURCE_ALLOWLIST.contains(&host.as_str()) {
+        return Err(format!("host {host} is not allowlisted"));
+    }
+    Ok(host)
+}
+
+fn http_url_host(url: &str) -> Result<String, String> {
+    let trimmed = url.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return Err("URL must include an http(s) scheme".to_string());
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return Err("probe_url must use http(s)".to_string());
+    }
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if authority.is_empty() {
+        return Err("URL host must not be empty".to_string());
+    }
+    if authority.contains('@') {
+        return Err("credentialed URLs are not allowed".to_string());
+    }
+    let host = if let Some(after_bracket) = authority.strip_prefix('[') {
+        let Some((host, _rest)) = after_bracket.split_once(']') else {
+            return Err("invalid IPv6 URL host".to_string());
+        };
+        host
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        Err("URL host must not be empty".to_string())
+    } else {
+        Ok(host)
+    }
+}
+
+fn is_private_or_local_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            ipv4.is_private()
+                || ipv4.is_loopback()
+                || ipv4.is_link_local()
+                || ipv4.is_unspecified()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        }
+        IpAddr::V6(ipv6) => {
+            let first = ipv6.segments()[0];
+            ipv6.is_loopback()
+                || ipv6.is_unspecified()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn source_relevance_terms(hypothesis_statement: &str, capability_need: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for token in hypothesis_statement
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+        .chain(capability_need.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-'))
+        .map(|token| token.trim_matches('-'))
+        .filter(|token| token.len() >= 4)
+    {
+        let keep = is_source_gene_symbol_candidate(token)
+            || matches!(
+                token.to_ascii_lowercase().as_str(),
+                "immunotherapy"
+                    | "immune"
+                    | "response"
+                    | "checkpoint"
+                    | "melanoma"
+                    | "hepatocellular"
+                    | "carcinoma"
+                    | "survival"
+                    | "expression"
+            );
+        if keep {
+            let normalized = token.to_ascii_lowercase();
+            if !terms.iter().any(|existing| existing == &normalized) {
+                terms.push(normalized);
+            }
+        }
+    }
+    terms
+}
+
+fn is_source_gene_symbol_candidate(token: &str) -> bool {
+    let token = token.trim();
+    if !(2..=20).contains(&token.len()) {
+        return false;
+    }
+    if token
+        .chars()
+        .any(|ch| !ch.is_ascii_alphanumeric() && ch != '-')
+    {
+        return false;
+    }
+    if !token.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+        return false;
+    }
+    let uppercase = token.to_ascii_uppercase();
+    if token != uppercase {
+        return false;
+    }
+    !matches!(
+        uppercase.as_str(),
+        "AUTO" | "SYNTH" | "TCGA" | "RNA" | "DNA" | "API" | "REST" | "LLM" | "ICB"
+    )
+}
+
+fn plausible_probe_summary(body: &str, relevance_terms: &[String]) -> Option<String> {
+    let lower = body.to_ascii_lowercase();
+    let matched = relevance_terms
+        .iter()
+        .filter(|term| lower.contains(term.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !relevance_terms.is_empty() && matched.is_empty() {
+        return None;
+    }
+    let matched_text = if matched.is_empty() {
+        "matched_terms=none-required".to_string()
+    } else {
+        format!("matched_terms={}", matched.join(","))
+    };
+    Some(format!(
+        "non_empty_response_bytes={}; {}; snippet={}",
+        body.len(),
+        matched_text,
+        snippet(body)
+    ))
 }
 
 fn discover_cbioportal_grounding_with_fetcher<F>(
@@ -651,6 +1139,41 @@ fn fetch_cbioportal_json_with_python(url: &str, timeout: Duration) -> Option<Str
     }
 }
 
+fn fetch_public_source_probe_with_python(url: &str, timeout: Duration) -> Option<String> {
+    let mut command = Command::new("/usr/bin/env");
+    command
+        .arg("python3")
+        .arg("-c")
+        .arg(SOURCE_PROBE_FETCH_PY)
+        .arg(url)
+        .arg(timeout.as_secs_f64().to_string())
+        .arg(MAX_SOURCE_PROBE_BYTES.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_child_process_group(&mut command);
+    let mut child = command.spawn().ok()?;
+    let started = SystemTime::now();
+
+    loop {
+        if child.try_wait().ok()?.is_some() {
+            let output = child.wait_with_output().ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            return (!stdout.trim().is_empty()).then_some(stdout);
+        }
+
+        if started.elapsed().unwrap_or_default() >= timeout {
+            kill_child_process_group(&mut child);
+            let _ = child.wait();
+            return None;
+        }
+
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn parse_json_string_objects(json: &str) -> Vec<JsonObject> {
     let mut objects = Vec::new();
     let mut in_string = false;
@@ -815,6 +1338,90 @@ fn url_path_component(value: &str) -> String {
     encoded
 }
 
+fn build_prompt_for_viable_source(
+    hypothesis_statement: &str,
+    capability_need: &str,
+    viable: &ViablePublicSource,
+    source_trace: &str,
+    cbioportal_grounding: Option<&str>,
+) -> String {
+    if is_cbioportal_source(viable) {
+        let mut grounding = String::new();
+        if let Some(cbioportal_grounding) = cbioportal_grounding
+            .map(str::trim)
+            .filter(|grounding| !grounding.is_empty())
+        {
+            grounding.push_str(cbioportal_grounding);
+            grounding.push('\n');
+        }
+        grounding.push_str("SOURCE DISCOVERY TRACE:\n");
+        grounding.push_str(source_trace);
+        build_auto_synth_prompt(hypothesis_statement, capability_need, Some(&grounding))
+    } else {
+        build_public_source_auto_synth_prompt(
+            hypothesis_statement,
+            capability_need,
+            viable,
+            source_trace,
+        )
+    }
+}
+
+fn is_cbioportal_source(viable: &ViablePublicSource) -> bool {
+    source_probe_safety(&viable.candidate.base_url).as_deref() == Ok("www.cbioportal.org")
+        || source_probe_safety(&viable.candidate.probe_url).as_deref() == Ok("www.cbioportal.org")
+}
+
+fn build_public_source_auto_synth_prompt(
+    hypothesis_statement: &str,
+    capability_need: &str,
+    viable: &ViablePublicSource,
+    source_trace: &str,
+) -> String {
+    format!(
+        concat!(
+            "You are writing an AgentFlow exploratory analysis tool grounded on a system-probed public scientific source.\n",
+            "Use Python 3 standard library only. urllib.request is allowed only for read-only GET requests to the grounded source below.\n",
+            "Do not access non-allowlisted domains, localhost, private IPs, file:// URLs, credentialed URLs, write endpoints, or arbitrary web searches.\n",
+            "Grounded public source selected by the system:\n",
+            "name: {}\n",
+            "base_url: {}\n",
+            "probe_url: {}\n",
+            "access_note: {}\n",
+            "probe_summary: {}\n\n",
+            "SOURCE DISCOVERY TRACE:\n{}\n\n",
+            "The generated tool spec will declare a required domain parameter named gene, so runtime receives AGENTFLOW_PARAM_GENE.\n",
+            "The tool must support two modes with the same calculation logic:\n",
+            "1. Runtime mode: when SYNTH_INPUT is unset, read domain parameters from AGENTFLOW_PARAM_<UPPER_NAME>, especially AGENTFLOW_PARAM_GENE.\n",
+            "   Fetch real public data from the grounded source using read-only GET and compute an honest result. Write AGENTFLOW_OUTPUT_RESULT and print stdout.\n",
+            "2. Validation mode: when SYNTH_INPUT is set, read that fixture file, run the same deterministic calculation logic offline, write AGENTFLOW_OUTPUT_RESULT, and print stdout.\n",
+            "禁止硬编码或编造 HR、p-value、correlation、effect size、biomarker grade、sample count, response rate, or any other numeric/stance result.\n",
+            "Do not use DEFAULT_PANEL, default, demo, sample, placeholder, illustrative, toy, or fallback conclusions.\n",
+            "If the public source lacks usable real data, exit non-zero with a clear stderr error. If the public source lacks usable real data, exit non-zero instead of inventing data.\n",
+            "During validation, SYNTH_INPUT will point to two meaningfully different fixtures; AGENTFLOW_PARAM_GENE will be TP53 for the first fixture and EGFR for the second fixture; normalized output must change when these inputs change.\n\n",
+            "Research hypothesis:\n{}\n\n",
+            "Capability gap:\n{}\n\n",
+            "Return exactly four sections with these markers and no extra text:\n",
+            "===SCRIPT===\n",
+            "<raw Python code>\n",
+            "===FIXTURE===\n",
+            "<small fixture text for SYNTH_INPUT>\n",
+            "===ALT_FIXTURE===\n",
+            "<second fixture with materially different values/entities from FIXTURE>\n",
+            "===EXPECT===\n",
+            "<one substring that must appear in stdout and AGENTFLOW_OUTPUT_RESULT>\n"
+        ),
+        viable.candidate.name,
+        viable.candidate.base_url,
+        viable.candidate.probe_url,
+        viable.candidate.access_note,
+        viable.probe_summary,
+        source_trace,
+        hypothesis_statement,
+        capability_need
+    )
+}
+
 fn build_auto_synth_prompt(
     hypothesis_statement: &str,
     capability_need: &str,
@@ -902,7 +1509,8 @@ fn build_auto_synth_repair_prompt(base_prompt: &str, error: &str, candidate_code
             "这是代码:\n{}\n\n",
             "修正它,仍遵守 no-fabrication 与双模契约: ",
             "SYNTH_INPUT fixture validation must stay deterministic and input-sensitive; ",
-            "runtime mode must read AGENTFLOW_PARAM_GENE, import/use agentflow_cbioportal for cBioPortal data instead of writing HTTP/API calls, write AGENTFLOW_OUTPUT_RESULT, ",
+            "runtime mode must read AGENTFLOW_PARAM_GENE, use the grounded public source instructions in the base prompt, write AGENTFLOW_OUTPUT_RESULT, ",
+            "for cBioPortal specifically import/use agentflow_cbioportal instead of writing HTTP/API calls; for non-cBioPortal sources use only standard-library read-only GET to the grounded allowlisted source, ",
             "print non-empty output, and loudly exit non-zero instead of fabricating fallback/default data. ",
             "Return exactly the same four sections: ===SCRIPT===, ===FIXTURE===, ===ALT_FIXTURE===, ===EXPECT===."
         ),
@@ -1957,6 +2565,7 @@ expected-line
             AutoSynthToolResult::Registered(tool_ref) => {
                 panic!("unexpected auto-synth registration: {tool_ref}")
             }
+            other => panic!("unexpected sourced auto-synth result: {other:?}"),
         }
         let synth_entries = fs::read_dir(path.join(".agentflow/synth"))
             .map(|entries| entries.count())
@@ -2007,6 +2616,7 @@ AUTO_SYNTH_OK
             AutoSynthToolResult::Registered(tool_ref) => {
                 panic!("unexpected auto-synth registration: {tool_ref}")
             }
+            other => panic!("unexpected sourced auto-synth result: {other:?}"),
         }
         let synth_entries = fs::read_dir(path.join(".agentflow/synth"))
             .map(|entries| entries.count())
@@ -2064,6 +2674,7 @@ AUTO_SYNTH_OK
             AutoSynthToolResult::Registered(tool_ref) => {
                 panic!("runtime-failing candidate should not register: {tool_ref}")
             }
+            other => panic!("unexpected sourced auto-synth result: {other:?}"),
         }
 
         let tools = store.list_tools().unwrap();
@@ -2152,12 +2763,15 @@ AUTO_SYNTH_OK
             AutoSynthToolResult::Rejected(reason) => {
                 panic!("repaired candidate should register: {reason}")
             }
+            other => panic!("unexpected sourced auto-synth result: {other:?}"),
         };
         assert!(tool_ref.starts_with("synth/auto_synth_"));
         assert_eq!(store.list_tools().unwrap().len(), 1);
 
         let prompts = fs::read_to_string(&prompt_log).unwrap();
-        assert_eq!(prompts.matches("---PROMPT---").count(), 2);
+        assert_eq!(prompts.matches("---PROMPT---").count(), 3);
+        assert!(prompts.contains("Return ONLY a JSON array"));
+        assert!(prompts.contains("probe_url"));
         assert!(prompts.contains("study not found: lihc_tcga"));
         assert!(prompts.contains("修正它"));
         assert!(prompts.contains("raise SystemExit(\"study not found: lihc_tcga\")"));
@@ -2212,6 +2826,7 @@ AUTO_SYNTH_OK
             AutoSynthToolResult::Registered(tool_ref) => {
                 panic!("all-failing candidate should not register: {tool_ref}")
             }
+            other => panic!("unexpected sourced auto-synth result: {other:?}"),
         }
         assert!(store.list_tools().unwrap().is_empty());
         let synth_entries = fs::read_dir(path.join(".agentflow/synth"))
@@ -2277,6 +2892,7 @@ AUTO_SYNTH_OK
             AutoSynthToolResult::Rejected(reason) => {
                 panic!("gene-requiring fixture candidate should register: {reason}")
             }
+            other => panic!("unexpected sourced auto-synth result: {other:?}"),
         }
 
         let tools = store.list_tools().unwrap();
@@ -2337,6 +2953,7 @@ AUTO_SYNTH_OK
             AutoSynthToolResult::Rejected(reason) => {
                 panic!("dual-mode candidate should register: {reason}")
             }
+            other => panic!("unexpected sourced auto-synth result: {other:?}"),
         };
 
         let inspection = store.inspect_tool(&tool_ref).unwrap();
@@ -2456,6 +3073,7 @@ CBIO_STUB_OK
             AutoSynthToolResult::Rejected(reason) => {
                 panic!("client-importing candidate should register: {reason}")
             }
+            other => panic!("unexpected sourced auto-synth result: {other:?}"),
         };
 
         let inspection = store.inspect_tool(&tool_ref).unwrap();
@@ -2649,6 +3267,175 @@ steps:
             "studyId=lihc_tcga_pan_can_atlas_2018, mrnaMolecularProfileId=lihc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna, sampleListId=lihc_tcga_pan_can_atlas_2018_all"
         ));
         assert!(prompt.contains("Use these EXACT identifiers; do not guess."));
+    }
+
+    #[test]
+    fn autonomous_source_prompt_requests_allowlisted_json_candidates() {
+        let prompt = build_source_discovery_prompt(
+            "MID1IP1 immunotherapy response biomarker in melanoma",
+            "Need public ICB cohort response data",
+        );
+
+        assert!(prompt.contains("JSON array"));
+        assert!(prompt.contains("\"name\""));
+        assert!(prompt.contains("\"base_url\""));
+        assert!(prompt.contains("\"probe_url\""));
+        assert!(prompt.contains("\"access_note\""));
+        assert!(prompt.contains("read-only GET"));
+        assert!(prompt.contains("https://www.ncbi.nlm.nih.gov"));
+        assert!(prompt.contains("https://www.ebi.ac.uk"));
+        assert!(prompt.contains("https://www.cbioportal.org"));
+        assert!(prompt.contains("localhost"));
+        assert!(prompt.contains("private IP"));
+    }
+
+    #[test]
+    fn source_probe_safety_blocks_illegal_domains_schemes_and_private_hosts() {
+        assert!(
+            source_probe_safety("https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE1").is_ok()
+        );
+        assert!(source_probe_safety("https://www.cbioportal.org/api/studies").is_ok());
+
+        let illegal_domain =
+            source_probe_safety("https://evil.example.org/data?gene=MID1IP1").unwrap_err();
+        assert!(illegal_domain.contains("not allowlisted"));
+
+        let localhost = source_probe_safety("http://localhost:8000/probe").unwrap_err();
+        assert!(localhost.contains("localhost"));
+
+        let private_ip = source_probe_safety("http://10.0.0.2/probe").unwrap_err();
+        assert!(private_ip.contains("private or local"));
+
+        let file_scheme = source_probe_safety("file:///tmp/data.json").unwrap_err();
+        assert!(file_scheme.contains("http(s)"));
+    }
+
+    #[test]
+    fn autonomous_source_discovery_selects_viable_source_and_injects_probe_summary() {
+        let raw_candidates = r#"[
+          {
+            "name": "blocked mirror",
+            "base_url": "https://evil.example.org",
+            "probe_url": "https://evil.example.org/search?q=MID1IP1",
+            "access_note": "not public science allowlist"
+          },
+          {
+            "name": "NCBI GEO",
+            "base_url": "https://www.ncbi.nlm.nih.gov",
+            "probe_url": "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?term=MID1IP1+immunotherapy",
+            "access_note": "public GEO discovery page"
+          }
+        ]"#;
+
+        let discovery = discover_sources_from_candidate_json(
+            "MID1IP1 immunotherapy response biomarker",
+            "Need public ICB cohort response data",
+            raw_candidates,
+            |url, _timeout| {
+                assert!(url.contains("ncbi.nlm.nih.gov"));
+                Some("GEO record mentions MID1IP1 and immunotherapy response cohort".to_string())
+            },
+        );
+
+        let viable = discovery.first_viable().expect("NCBI should be viable");
+        assert_eq!(viable.candidate.name, "NCBI GEO");
+        assert!(discovery.trace.contains("blocked mirror"));
+        assert!(discovery.trace.contains("skipped"));
+        assert!(discovery.trace.contains("viable"));
+
+        let prompt = build_public_source_auto_synth_prompt(
+            "MID1IP1 immunotherapy response biomarker",
+            "Need public ICB cohort response data",
+            viable,
+            &discovery.trace,
+        );
+        assert!(prompt.contains("NCBI GEO"));
+        assert!(prompt.contains("https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi"));
+        assert!(prompt.contains("GEO record mentions MID1IP1"));
+        assert!(prompt.contains("read-only GET"));
+        assert!(prompt.contains("If the public source lacks usable real data, exit non-zero"));
+        assert!(!prompt.contains("import agentflow_cbioportal as cbio"));
+    }
+
+    #[test]
+    fn autonomous_source_discovery_has_honest_research_gap_when_no_viable_source() {
+        let path = temp_project_path("source-discovery-no-viable");
+        init_project(&path);
+        let store = ProjectStore::open(&path).unwrap();
+        let source_response = r#"[
+          {
+            "name": "Non allowlisted source",
+            "base_url": "https://example.org",
+            "probe_url": "https://example.org/probe?gene=MID1IP1",
+            "access_note": "blocked"
+          }
+        ]"#;
+        let stub = write_stub_synthesizer(&path, "stub_source_no_viable.sh", source_response);
+        let synthesizer = format!("/bin/sh {}", stub.display());
+
+        let outcome = auto_synthesize_agent_tool_with_fetcher(
+            &store,
+            &synthesizer,
+            "MID1IP1 immunotherapy response biomarker",
+            "Need public ICB cohort response data",
+            Some("MID1IP1"),
+            |_url, _timeout| panic!("blocked source must not be probed"),
+        )
+        .unwrap();
+
+        match outcome {
+            AutoSynthToolResult::RejectedWithSource {
+                reason,
+                source_trace,
+                research_gap,
+            } => {
+                assert!(research_gap);
+                assert!(reason.contains("未找到可访问公开数据源"));
+                assert!(reason.contains("研究空白"));
+                assert!(source_trace.contains("Non allowlisted source"));
+            }
+            AutoSynthToolResult::RegisteredWithSource { tool_ref, .. }
+            | AutoSynthToolResult::Registered(tool_ref) => {
+                panic!("no viable source should not register: {tool_ref}")
+            }
+            AutoSynthToolResult::Rejected(reason) => panic!("expected sourced rejection: {reason}"),
+        }
+        assert!(store.list_tools().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn cbioportal_viable_source_uses_verified_client_prompt() {
+        let raw_candidates = r#"[
+          {
+            "name": "cBioPortal",
+            "base_url": "https://www.cbioportal.org",
+            "probe_url": "https://www.cbioportal.org/api/studies?projection=SUMMARY",
+            "access_note": "public cBioPortal API"
+          }
+        ]"#;
+        let discovery = discover_sources_from_candidate_json(
+            "MID1IP1 expression survival association in hepatocellular carcinoma",
+            "Need expression-survival association evidence",
+            raw_candidates,
+            |_url, _timeout| Some("LIHC study mentions MID1IP1 expression data".to_string()),
+        );
+        let viable = discovery.first_viable().unwrap();
+
+        let prompt = build_prompt_for_viable_source(
+            "MID1IP1 expression survival association in hepatocellular carcinoma",
+            "Need expression-survival association evidence",
+            viable,
+            &discovery.trace,
+            Some("Discovered real cBioPortal identifiers: studyId=lihc_tcga_pan_can_atlas_2018, mrnaMolecularProfileId=lihc_tcga_pan_can_atlas_2018_rna_seq_v2_mrna, sampleListId=lihc_tcga_pan_can_atlas_2018_all, api_base=https://www.cbioportal.org/api. Use these EXACT identifiers; do not guess."),
+        );
+
+        assert!(prompt.contains("import agentflow_cbioportal as cbio"));
+        assert!(prompt.contains("Discovered real cBioPortal identifiers"));
+        assert!(prompt.contains("SOURCE DISCOVERY TRACE"));
+        assert!(prompt.contains("cBioPortal"));
+        assert!(prompt.contains("do not write HTTP/API calls"));
     }
 
     #[test]

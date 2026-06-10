@@ -471,6 +471,7 @@ impl ProjectStore {
                             equivalent_branches: self.has_equivalent_tool_branches(
                                 &proposal.decision,
                                 &available_input_types,
+                                scorer,
                             )?,
                             conflicts_user_premise: false,
                             mutates_goal: false,
@@ -642,6 +643,7 @@ impl ProjectStore {
                                 equivalent_branches: self.has_equivalent_tool_branches(
                                     &proposal.decision,
                                     &available_input_types,
+                                    scorer,
                                 )?,
                                 conflicts_user_premise: false,
                                 mutates_goal: false,
@@ -1015,14 +1017,21 @@ impl ProjectStore {
         &self,
         decision: &BranchDecision,
         available_input_types: &[String],
+        scorer: &dyn RelevanceScorer,
     ) -> Result<bool, StorageError> {
         let query = CapabilityQuery {
             desired_output_type: None,
             available_input_types: available_input_types.to_vec(),
             keywords: proposal_keywords(&decision.candidate.statement),
         };
-        let candidate_count = self
-            .match_tools(&query)?
+        let mut candidates = self.match_tools(&query)?;
+        apply_semantic_relevance_to_candidates(
+            self,
+            &mut candidates,
+            &decision.candidate.statement,
+            scorer,
+        )?;
+        let candidate_count = candidates
             .into_iter()
             .filter(|candidate| matches!(candidate.fit, Fit::High | Fit::Medium))
             .take(2)
@@ -2192,7 +2201,8 @@ mod tests {
         Stance, Verdict, VerdictTag,
     };
     use crate::branch::{
-        BranchAction, BranchCandidate, BranchDecision, CandidateKind, ProposedStep, SelectionMode,
+        BranchAction, BranchCandidate, BranchDecision, BranchPolicy, CandidateKind, ProposedStep,
+        RuleBasedSelector, SelectionMode,
     };
     use crate::handoff::DecisionKind;
     use crate::hypothesis::{Confidence, HypothesisRequest, HypothesisStatus};
@@ -2935,6 +2945,31 @@ runtime:
             "Literature support alone is below the decision margin.",
         );
         (path, store)
+    }
+
+    fn setup_equivalent_keyword_relevance_project(test_name: &str) -> (PathBuf, ProjectStore) {
+        let (path, store) = setup_keyword_relevance_project(test_name);
+        register_semantic_tool(
+            &store,
+            "thrsp_axis_assoc",
+            "verified",
+            "THRSP survival mechanism axis association proxy for related cohort analysis",
+            &[],
+        );
+        (path, store)
+    }
+
+    fn selected_branch_decision(store: &ProjectStore) -> BranchDecision {
+        let mut decisions = store
+            .select_branches(
+                &RuleBasedSelector,
+                &BranchPolicy {
+                    explore_enabled: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        decisions.remove(0)
     }
 
     fn import_expression_artifact(store: &ProjectStore, root: &std::path::Path) -> String {
@@ -4794,7 +4829,10 @@ steps:
             .contains("relevance:demoted_question_mismatch"));
         assert_eq!(
             scorer.calls(),
-            vec!["analysis/thrsp_survival_proxy".to_string()]
+            vec![
+                "analysis/thrsp_survival_proxy".to_string(),
+                "analysis/thrsp_survival_proxy".to_string()
+            ]
         );
         assert_eq!(synthesizer.calls().len(), 1);
         assert!(synthesizer.calls()[0].1.contains("fit=low"));
@@ -4802,6 +4840,151 @@ steps:
             .apply_failures
             .iter()
             .any(|failure| failure.reason.contains("auto-synth skipped")));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn question_mismatch_demotion_prevents_equivalent_branch_brake_and_allows_auto_synth() {
+        let (path, store) =
+            setup_equivalent_keyword_relevance_project("semantic-equivalent-demote-auto-synth");
+        let scorer = StubRelevanceScorer::always(Some(false));
+        let synthesizer = StubToolSynthesizer::none(&store);
+        let decision = selected_branch_decision(&store);
+
+        assert!(!store
+            .has_equivalent_tool_branches(&decision, &[], &scorer)
+            .unwrap());
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: false,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &scorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        let proposal = &report.branch_proposals[0];
+        assert_eq!(
+            proposal.matched_tool.as_deref(),
+            Some("analysis/thrsp_survival_proxy")
+        );
+        assert_eq!(proposal.matched_fit.as_deref(), Some("low"));
+        assert!(proposal
+            .match_reason
+            .as_deref()
+            .unwrap()
+            .contains("relevance:demoted_question_mismatch"));
+        assert_eq!(synthesizer.calls().len(), 1);
+        assert!(report
+            .apply_failures
+            .iter()
+            .any(|failure| failure.reason.contains("auto-synth skipped")));
+        assert!(!report
+            .raised_decisions
+            .iter()
+            .any(|point| point.kind == DecisionKind::DeepenOrStop));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn question_confirmed_equivalent_branches_still_trigger_deepen_or_stop() {
+        let (path, store) =
+            setup_equivalent_keyword_relevance_project("semantic-equivalent-true-brake");
+        let scorer = StubRelevanceScorer::always(Some(true));
+        let synthesizer = StubToolSynthesizer::none(&store);
+        let decision = selected_branch_decision(&store);
+
+        assert!(store
+            .has_equivalent_tool_branches(&decision, &[], &scorer)
+            .unwrap());
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &scorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        let proposal = &report.branch_proposals[0];
+        assert_eq!(
+            proposal.matched_tool.as_deref(),
+            Some("analysis/thrsp_survival_proxy")
+        );
+        assert_eq!(proposal.matched_fit.as_deref(), Some("medium"));
+        assert!(proposal
+            .match_reason
+            .as_deref()
+            .unwrap()
+            .contains("relevance:keyword"));
+        assert!(report
+            .raised_decisions
+            .iter()
+            .any(|point| point.kind == DecisionKind::DeepenOrStop));
+        assert!(!report.applied.iter().any(|action| matches!(
+            action,
+            AppliedAction::GraphPatchApplied { .. }
+                | AppliedAction::FlowAutoCreated { .. }
+                | AppliedAction::StepRun { .. }
+        )));
+        assert!(synthesizer.calls().is_empty());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn single_question_relevant_keyword_candidate_does_not_trigger_equivalent_branch_brake() {
+        let (path, store) = setup_keyword_relevance_project("semantic-single-keyword-no-brake");
+        let scorer = StubRelevanceScorer::always(Some(true));
+        let synthesizer = StubToolSynthesizer::none(&store);
+        let decision = selected_branch_decision(&store);
+
+        assert!(!store
+            .has_equivalent_tool_branches(&decision, &[], &scorer)
+            .unwrap());
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &scorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        let proposal = &report.branch_proposals[0];
+        assert_eq!(
+            proposal.matched_tool.as_deref(),
+            Some("analysis/thrsp_survival_proxy")
+        );
+        assert_eq!(proposal.matched_fit.as_deref(), Some("medium"));
+        assert!(!report
+            .raised_decisions
+            .iter()
+            .any(|point| point.kind == DecisionKind::DeepenOrStop));
+        assert!(synthesizer.calls().is_empty());
 
         let _ = std::fs::remove_dir_all(path);
     }

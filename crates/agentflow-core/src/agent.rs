@@ -93,6 +93,8 @@ impl ParamInferer for NoopParamInferer {
 }
 
 pub trait RelevanceScorer {
+    /// Returns whether a tool's output can directly test the hypothesis conclusion,
+    /// not merely whether the tool is topically related.
     fn is_relevant(
         &self,
         hypothesis_statement: &str,
@@ -771,6 +773,8 @@ impl ProjectStore {
 
 const SEMANTIC_RELEVANCE_TOP_K: usize = 3;
 const SEMANTIC_RELEVANCE_REASON: &str = "relevance:semantic";
+const KEYWORD_RELEVANCE_REASON: &str = "relevance:keyword";
+const QUESTION_MISMATCH_DEMOTION_REASON: &str = "relevance:demoted_question_mismatch";
 
 fn apply_semantic_relevance_to_candidates(
     store: &ProjectStore,
@@ -778,22 +782,34 @@ fn apply_semantic_relevance_to_candidates(
     hypothesis_statement: &str,
     scorer: &dyn RelevanceScorer,
 ) -> Result<bool, StorageError> {
-    let mut promoted = false;
+    let mut changed = false;
     for candidate in candidates.iter_mut().take(SEMANTIC_RELEVANCE_TOP_K) {
-        if candidate.fit != Fit::Low {
+        let is_low_candidate = candidate.fit == Fit::Low;
+        let is_keyword_medium_candidate =
+            candidate.fit == Fit::Medium && candidate.reason.contains(KEYWORD_RELEVANCE_REASON);
+        if !is_low_candidate && !is_keyword_medium_candidate {
             continue;
         }
+
         let tool_description = tool_description(store, &candidate.tool_ref)?;
-        if scorer.is_relevant(hypothesis_statement, &candidate.tool_ref, &tool_description)
-            == Some(true)
-        {
-            candidate.fit = Fit::Medium;
-            candidate.reason = append_match_reason(&candidate.reason, SEMANTIC_RELEVANCE_REASON);
-            promoted = true;
+        match scorer.is_relevant(hypothesis_statement, &candidate.tool_ref, &tool_description) {
+            Some(true) if is_low_candidate => {
+                candidate.fit = Fit::Medium;
+                candidate.reason =
+                    append_match_reason(&candidate.reason, SEMANTIC_RELEVANCE_REASON);
+                changed = true;
+            }
+            Some(false) if is_keyword_medium_candidate => {
+                candidate.fit = Fit::Low;
+                candidate.reason =
+                    append_match_reason(&candidate.reason, QUESTION_MISMATCH_DEMOTION_REASON);
+                changed = true;
+            }
+            _ => {}
         }
     }
 
-    if promoted {
+    if changed {
         candidates.sort_by(|left, right| {
             fit_rank(right.fit)
                 .cmp(&fit_rank(left.fit))
@@ -802,7 +818,7 @@ fn apply_semantic_relevance_to_candidates(
         });
     }
 
-    Ok(promoted)
+    Ok(changed)
 }
 
 fn tool_description(store: &ProjectStore, tool_ref: &str) -> Result<String, StorageError> {
@@ -2901,6 +2917,26 @@ runtime:
         (path, store)
     }
 
+    fn setup_keyword_relevance_project(test_name: &str) -> (PathBuf, ProjectStore) {
+        let (path, store) = init_project(test_name);
+        register_semantic_tool(
+            &store,
+            "thrsp_survival_proxy",
+            "verified",
+            "THRSP survival association proxy for related cohort analysis",
+            &[],
+        );
+        let hypothesis_id = record_hypothesis(&store, "THRSP survival mechanism needs validation");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is below the decision margin.",
+        );
+        (path, store)
+    }
+
     fn import_expression_artifact(store: &ProjectStore, root: &std::path::Path) -> String {
         let source_path = root.join("expression.tsv");
         std::fs::write(&source_path, "gene\tvalue\nKRAS\t1\n").unwrap();
@@ -4660,6 +4696,154 @@ steps:
             .as_deref()
             .unwrap()
             .contains("relevance:semantic"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn semantic_relevance_false_demotes_keyword_medium_candidate_and_reranks() {
+        let (path, store) = init_project("semantic-keyword-demote-direct");
+        register_semantic_tool(
+            &store,
+            "thrsp_survival_proxy",
+            "verified",
+            "THRSP survival association proxy for related cohort analysis",
+            &[],
+        );
+        register_semantic_tool(
+            &store,
+            "fallback_low",
+            "verified",
+            "fallback validation helper",
+            &[],
+        );
+        let scorer = StubRelevanceScorer::always(Some(false));
+        let mut candidates = vec![
+            ToolCandidate {
+                tool_ref: "analysis/thrsp_survival_proxy".to_string(),
+                fit: Fit::Medium,
+                score: 8,
+                reason: "keyword:name:thrsp, relevance:keyword".to_string(),
+            },
+            ToolCandidate {
+                tool_ref: "analysis/fallback_low".to_string(),
+                fit: Fit::Low,
+                score: 20,
+                reason: "maturity:verified".to_string(),
+            },
+        ];
+
+        let changed = super::apply_semantic_relevance_to_candidates(
+            &store,
+            &mut candidates,
+            "THRSP survival mechanism needs validation",
+            &scorer,
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(
+            scorer.calls(),
+            vec![
+                "analysis/thrsp_survival_proxy".to_string(),
+                "analysis/fallback_low".to_string()
+            ]
+        );
+        assert_eq!(candidates[0].tool_ref, "analysis/fallback_low");
+        assert_eq!(candidates[0].fit, Fit::Low);
+        assert_eq!(candidates[1].tool_ref, "analysis/thrsp_survival_proxy");
+        assert_eq!(candidates[1].fit, Fit::Low);
+        assert!(candidates[1]
+            .reason
+            .contains("relevance:demoted_question_mismatch"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn keyword_medium_demoted_to_low_triggers_auto_synth_gap() {
+        let (path, store) = setup_keyword_relevance_project("semantic-keyword-demote-auto-synth");
+        let scorer = StubRelevanceScorer::always(Some(false));
+        let synthesizer = StubToolSynthesizer::none(&store);
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: false,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &scorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        let proposal = &report.branch_proposals[0];
+        assert_eq!(
+            proposal.matched_tool.as_deref(),
+            Some("analysis/thrsp_survival_proxy")
+        );
+        assert_eq!(proposal.matched_fit.as_deref(), Some("low"));
+        assert!(proposal
+            .match_reason
+            .as_deref()
+            .unwrap()
+            .contains("relevance:demoted_question_mismatch"));
+        assert_eq!(
+            scorer.calls(),
+            vec!["analysis/thrsp_survival_proxy".to_string()]
+        );
+        assert_eq!(synthesizer.calls().len(), 1);
+        assert!(synthesizer.calls()[0].1.contains("fit=low"));
+        assert!(report
+            .apply_failures
+            .iter()
+            .any(|failure| failure.reason.contains("auto-synth skipped")));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn keyword_medium_confirmed_relevant_preserves_existing_auto_synth_behavior() {
+        let (path, store) = setup_keyword_relevance_project("semantic-keyword-true-preserve");
+        let scorer = StubRelevanceScorer::always(Some(true));
+        let synthesizer = StubToolSynthesizer::none(&store);
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: false,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &scorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        let proposal = &report.branch_proposals[0];
+        assert_eq!(
+            proposal.matched_tool.as_deref(),
+            Some("analysis/thrsp_survival_proxy")
+        );
+        assert_eq!(proposal.matched_fit.as_deref(), Some("medium"));
+        assert!(proposal
+            .match_reason
+            .as_deref()
+            .unwrap()
+            .contains("relevance:keyword"));
+        assert_eq!(
+            scorer.calls(),
+            vec!["analysis/thrsp_survival_proxy".to_string()]
+        );
+        assert!(synthesizer.calls().is_empty());
+        assert!(report.apply_failures.is_empty());
 
         let _ = std::fs::remove_dir_all(path);
     }

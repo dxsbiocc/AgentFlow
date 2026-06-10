@@ -661,7 +661,9 @@ fn param_inference_prompt(statement: &str, param_name: &str) -> String {
 }
 
 fn relevance_prompt(statement: &str, tool_ref: &str, tool_description: &str) -> String {
-    format!("假设「{statement}」与工具 <{tool_ref}>（描述：{tool_description}）是否研究相关？只答 yes/no。")
+    format!(
+        "工具 <{tool_ref}>（描述：{tool_description}）的输出能否直接作为证据检验假设「{statement}」中陈述的具体结论，而不只是主题、疾病或基因相关？只答 yes/no。"
+    )
 }
 
 fn first_non_empty_line(value: &str) -> Option<&str> {

@@ -49,6 +49,7 @@ const CBIOPORTAL_DISCOVERY_FETCH_PY: &str = r#"import ipaddress
 import json
 import socket
 import sys
+from urllib.parse import urlsplit
 import urllib.request
 
 url = sys.argv[1]
@@ -67,8 +68,25 @@ def _is_blocked_ip(ip_str):
         return True
     return False
 
+def _configured_proxy_hosts():
+    hosts = set()
+    for scheme, value in urllib.request.getproxies().items():
+        if scheme == "no" or not value:
+            continue
+        target = value if "://" in value else "//" + value
+        hostname = urlsplit(target).hostname
+        if hostname:
+            hosts.add(hostname)
+    return hosts
+
+_PROXY_HOSTS = _configured_proxy_hosts()
+
 def _validating_getaddrinfo(host, *args, **kwargs):
     results = _real_getaddrinfo(host, *args, **kwargs)
+    # In proxy mode the proxy resolves the target host. Validate direct targets,
+    # but do not block the configured proxy itself for using loopback/private IPs.
+    if host in _PROXY_HOSTS:
+        return results
     for res in results:
         ip_str = res[4][0]
         if _is_blocked_ip(ip_str):
@@ -92,6 +110,7 @@ print(body, end="" if body.endswith("\n") else "\n")
 const SOURCE_PROBE_FETCH_PY: &str = r#"import ipaddress
 import socket
 import sys
+from urllib.parse import urlsplit
 import urllib.request
 
 url = sys.argv[1]
@@ -114,8 +133,25 @@ def _is_blocked_ip(ip_str):
         return True
     return False
 
+def _configured_proxy_hosts():
+    hosts = set()
+    for scheme, value in urllib.request.getproxies().items():
+        if scheme == "no" or not value:
+            continue
+        target = value if "://" in value else "//" + value
+        hostname = urlsplit(target).hostname
+        if hostname:
+            hosts.add(hostname)
+    return hosts
+
+_PROXY_HOSTS = _configured_proxy_hosts()
+
 def _validating_getaddrinfo(host, *args, **kwargs):
     results = _real_getaddrinfo(host, *args, **kwargs)
+    # In proxy mode the proxy resolves the target host. Validate direct targets,
+    # but do not block the configured proxy itself for using loopback/private IPs.
+    if host in _PROXY_HOSTS:
+        return results
     for res in results:
         ip_str = res[4][0]
         if _is_blocked_ip(ip_str):
@@ -3776,6 +3812,20 @@ steps:
             assert!(script.contains("is_link_local"));
             assert!(script.contains("100.64.0.0/10"));
             assert!(script.contains("raise RuntimeError"));
+        }
+    }
+
+    #[test]
+    fn python_probe_scripts_skip_dns_pin_for_configured_proxy_hosts_only() {
+        for script in [CBIOPORTAL_DISCOVERY_FETCH_PY, SOURCE_PROBE_FETCH_PY] {
+            assert!(script.contains("getproxies"));
+            assert!(script.contains("urlsplit"));
+            assert!(script.contains("_configured_proxy_hosts"));
+            assert!(script.contains("_PROXY_HOSTS"));
+            assert!(script.contains("if host in _PROXY_HOSTS"));
+            assert!(script.contains("_is_blocked_ip"));
+            assert!(script.contains("_validating_getaddrinfo"));
+            assert!(script.contains("build_opener(_NoRedirect)"));
         }
     }
 

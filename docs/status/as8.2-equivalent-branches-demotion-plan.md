@@ -85,3 +85,20 @@ fn has_equivalent_tool_branches(
 ## 不在本里程碑
 
 - 不改 `argument.rs` 判决逻辑、不改 `DecisionKind`/事件结构；不引入新的 LLM trait；不改 AS7 安全 allowlist；不改 AS8.1 的降级算法本身；不做通用搜索引擎集成。
+
+## 验收结果（已通过 / 2026-06-10）
+
+全部门禁与 live 验收已通过，AS8.2 达到发布标准：
+
+- [x] fmt / clippy 全绿；core **282** passed / cli **92** passed；`scripts/acceptance-v1.sh` 通过。
+- [x] 单测：`question_mismatch_demotion_prevents_equivalent_branch_brake_and_allows_auto_synth`（全 demote → `equivalent_branches=false` → 不触发 `DeepenOrStop` → auto_synth 继续）。
+- [x] 单测：`question_confirmed_equivalent_branches_still_trigger_deepen_or_stop`（全 relevant → 仍触发刹车，防回归）。
+- [x] 单测：`single_question_relevant_keyword_candidate_does_not_trigger_equivalent_branch_brake`（单候选不触发，防回归）。
+- [x] `argument.rs` 仍 0 处 LLM/网络调用。
+- [x] **live（真 DeepSeek + 真网络，纯 `agent run`，编排者全程不解决任何 decision）**：
+  - 免疫治疗假设 `event_1780637981901936000`：`matched_fit=low` + `relevance:demoted_question_mismatch`（AS8.1 降级），**`DeepenOrStop` 刹车不再触发**；改为进入 AS7 源发现（`source_discoveries` 1 条）→ 真实探测 cBioPortal/GEO/GDC（安全 allowlist 生效，`portal.gdc.cancer.gov` 非白名单被正确跳过）→ 无 viable 源 → AS8 raise `FundamentalGap`，digest 诚实呈现"未找到可访问公开数据源…可能是真实研究空白，请人类确认"。
+  - 轴假设 `event_1780637981891360000`：scorer 判其确实能回答 → 保持 `medium`（不降级）→ 无 false 刹车 →（步骤此前已落地，幂等提示 duplicate step，benign）。
+  - 第二轮 `agent run`：`raised_decisions=[]`，`has_pending_source_discovery_gap` 去重生效，FundamentalGap 不重复触发，无 flapping。
+- [x] core 测试数 282（≥281）；无新依赖。
+
+证据文件（临时，未提交）：`/tmp/as8.2_live_run1.json`、`/tmp/as8.2_live_run2.json`。

@@ -4,6 +4,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +26,13 @@ const CBIOPORTAL_API_BASE: &str = "https://www.cbioportal.org/api";
 const CBIOPORTAL_CLIENT_RELATIVE_DIR: &str = "examples/tools";
 const MAX_AUTO_SYNTH_ATTEMPTS: usize = 3;
 const VALIDATION_PATH: &str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
+// macOS seatbelt network address filters accept "*" or "localhost" as hosts;
+// numeric IP hosts fail profile parsing on current macOS. This keeps the
+// sandbox layer focused on loopback while DNS-pinning handles probe metadata
+// SSRF and the higher-level allowlist remains the primary egress control.
+const PYTHON_SEATBELT_PROFILE: &str = r#"(version 1)
+(allow default)
+(deny network-outbound (remote ip "localhost:*"))"#;
 const PRIMARY_VALIDATION_GENE: &str = "TP53";
 const ALTERNATE_VALIDATION_GENE: &str = "EGFR";
 const MAX_SOURCE_PROBE_BYTES: usize = 65_536;
@@ -37,13 +45,38 @@ const PUBLIC_SOURCE_ALLOWLIST: &[&str] = &[
     "rest.ensembl.org",
     "api.gdc.cancer.gov",
 ];
-const CBIOPORTAL_DISCOVERY_FETCH_PY: &str = r#"import json
+const CBIOPORTAL_DISCOVERY_FETCH_PY: &str = r#"import ipaddress
+import json
+import socket
 import sys
 import urllib.request
 
 url = sys.argv[1]
 timeout = float(sys.argv[2])
 request = urllib.request.Request(url, headers={"Accept": "application/json"})
+
+_real_getaddrinfo = socket.getaddrinfo
+
+def _is_blocked_ip(ip_str):
+    addr = ipaddress.ip_address(ip_str)
+    if addr.is_private or addr.is_loopback or addr.is_link_local \
+       or addr.is_reserved or addr.is_multicast or addr.is_unspecified:
+        return True
+    # CGNAT/shared address space plus link-local metadata hosts are SSRF targets.
+    if addr.version == 4 and addr in ipaddress.ip_network("100.64.0.0/10"):
+        return True
+    return False
+
+def _validating_getaddrinfo(host, *args, **kwargs):
+    results = _real_getaddrinfo(host, *args, **kwargs)
+    for res in results:
+        ip_str = res[4][0]
+        if _is_blocked_ip(ip_str):
+            raise RuntimeError("blocked non-public resolved IP %s for host %s" % (ip_str, host))
+    return results
+
+# DNS-rebinding/SSRF defense: validate the exact addresses urllib will connect to.
+socket.getaddrinfo = _validating_getaddrinfo
 
 # SSRF defense: do not follow redirects after Rust host allowlist checks.
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -56,7 +89,9 @@ with _opener.open(request, timeout=timeout) as response:
 json.loads(body)
 print(body, end="" if body.endswith("\n") else "\n")
 "#;
-const SOURCE_PROBE_FETCH_PY: &str = r#"import sys
+const SOURCE_PROBE_FETCH_PY: &str = r#"import ipaddress
+import socket
+import sys
 import urllib.request
 
 url = sys.argv[1]
@@ -66,6 +101,29 @@ request = urllib.request.Request(
     url,
     headers={"Accept": "application/json, text/plain, text/html, */*"},
 )
+
+_real_getaddrinfo = socket.getaddrinfo
+
+def _is_blocked_ip(ip_str):
+    addr = ipaddress.ip_address(ip_str)
+    if addr.is_private or addr.is_loopback or addr.is_link_local \
+       or addr.is_reserved or addr.is_multicast or addr.is_unspecified:
+        return True
+    # CGNAT/shared address space plus link-local metadata hosts are SSRF targets.
+    if addr.version == 4 and addr in ipaddress.ip_network("100.64.0.0/10"):
+        return True
+    return False
+
+def _validating_getaddrinfo(host, *args, **kwargs):
+    results = _real_getaddrinfo(host, *args, **kwargs)
+    for res in results:
+        ip_str = res[4][0]
+        if _is_blocked_ip(ip_str):
+            raise RuntimeError("blocked non-public resolved IP %s for host %s" % (ip_str, host))
+    return results
+
+# DNS-rebinding/SSRF defense: validate the exact addresses urllib will connect to.
+socket.getaddrinfo = _validating_getaddrinfo
 
 # SSRF defense: do not follow redirects after Rust host allowlist checks.
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -2148,19 +2206,8 @@ fn run_python_script(
     timeout: Duration,
     inputs: SynthValidationInputs<'_>,
 ) -> Result<ValidationOutput, CliError> {
-    let result_path = workdir.join("result.txt");
-    let mut command = Command::new("/usr/bin/env");
-    command
-        .env_clear()
-        .env("PATH", VALIDATION_PATH)
-        .env("PYTHONPATH", cbioportal_pythonpath_value())
-        .env("AGENTFLOW_WORKDIR", workdir)
-        .env("AGENTFLOW_OUTPUT_RESULT", &result_path)
-        .arg("python3")
-        .arg(script_path)
-        .current_dir(workdir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let (mut command, result_path) = python_command(script_path, workdir);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     set_validation_domain_param_env(&mut command, inputs);
     if let Some(fixture) = fixture {
         command.env("SYNTH_INPUT", fixture);
@@ -2202,6 +2249,67 @@ fn run_python_script(
 
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn sandbox_exec_available() -> bool {
+    cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists()
+}
+
+fn sandbox_exec_usable() -> bool {
+    static SANDBOX_EXEC_USABLE: OnceLock<bool> = OnceLock::new();
+    *SANDBOX_EXEC_USABLE.get_or_init(|| {
+        if !sandbox_exec_available() {
+            return false;
+        }
+        Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(PYTHON_SEATBELT_PROFILE)
+            .arg("/usr/bin/env")
+            .arg("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
+fn python_command(script_path: &Path, workdir: &Path) -> (Command, PathBuf) {
+    let result_path = workdir.join("result.txt");
+    let sandboxed = sandbox_exec_usable();
+    let mut command = if sandboxed {
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command
+            .arg("-p")
+            .arg(PYTHON_SEATBELT_PROFILE)
+            .arg("/usr/bin/env")
+            .arg("python3")
+            .arg(script_path);
+        command
+    } else {
+        // Fail open intentionally: seatbelt is macOS-only defense-in-depth.
+        // Linux CI, older hosts, and nested sandboxes that reject sandbox_apply
+        // must keep validating generated tools.
+        let mut command = Command::new("/usr/bin/env");
+        command.arg("python3").arg(script_path);
+        command
+    };
+    command
+        .env_clear()
+        .env("PATH", VALIDATION_PATH)
+        .env("PYTHONPATH", cbioportal_pythonpath_value())
+        .env("AGENTFLOW_WORKDIR", workdir)
+        .env("AGENTFLOW_OUTPUT_RESULT", &result_path)
+        .current_dir(workdir);
+    if sandboxed {
+        // Under seatbelt, macOS proxy auto-detection (urllib -> SystemConfiguration
+        // -> configd over loopback) hits the loopback deny rule and fails every
+        // urllib request with EPERM -- including generated tools and the trusted
+        // cBioPortal client. Disabling proxy discovery keeps direct egress to the
+        // allowlisted public hosts working while loopback stays blocked.
+        command.env("no_proxy", "*").env("NO_PROXY", "*");
+    }
+    (command, result_path)
 }
 
 fn set_validation_domain_param_env(command: &mut Command, inputs: SynthValidationInputs<'_>) {
@@ -3654,6 +3762,74 @@ steps:
             assert!(script.contains("build_opener(_NoRedirect)"));
             assert!(script.contains("_opener.open(request, timeout=timeout)"));
         }
+    }
+
+    #[test]
+    fn python_probe_scripts_pin_dns_and_reject_private_ips() {
+        for script in [CBIOPORTAL_DISCOVERY_FETCH_PY, SOURCE_PROBE_FETCH_PY] {
+            assert!(script.contains("import socket"));
+            assert!(script.contains("import ipaddress"));
+            assert!(script.contains("_validating_getaddrinfo"));
+            assert!(script.contains("socket.getaddrinfo = _validating_getaddrinfo"));
+            assert!(script.contains("is_private"));
+            assert!(script.contains("is_loopback"));
+            assert!(script.contains("is_link_local"));
+            assert!(script.contains("100.64.0.0/10"));
+            assert!(script.contains("raise RuntimeError"));
+        }
+    }
+
+    #[test]
+    fn seatbelt_profile_denies_loopback_after_allow_default() {
+        let allow_default = PYTHON_SEATBELT_PROFILE.find("(allow default)").unwrap();
+        let deny_loopback = PYTHON_SEATBELT_PROFILE
+            .find(r#"(deny network-outbound (remote ip "localhost:*"))"#)
+            .unwrap();
+        assert!(deny_loopback > allow_default);
+        assert!(PYTHON_SEATBELT_PROFILE.starts_with("(version 1)\n"));
+        assert!(!PYTHON_SEATBELT_PROFILE.contains("127.0.0.1:*"));
+        assert!(!PYTHON_SEATBELT_PROFILE.contains("169.254.169.254:*"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn run_python_script_uses_sandbox_exec_when_usable() {
+        if !sandbox_exec_usable() {
+            return;
+        }
+        assert!(sandbox_exec_available());
+        let path = temp_project_path("validation-seatbelt");
+        fs::create_dir_all(&path).unwrap();
+        let script = path.join("sandbox_ok.py");
+        fs::write(
+            &script,
+            r#"import os
+from pathlib import Path
+
+result = "SANDBOX_OK\n"
+Path(os.environ["AGENTFLOW_OUTPUT_RESULT"]).write_text(result, encoding="utf-8")
+print(result, end="")
+"#,
+        )
+        .unwrap();
+
+        let validation = run_python_script(
+            &script,
+            None,
+            &path,
+            Duration::from_secs(10),
+            SynthValidationInputs { gene: "TP53" },
+        )
+        .unwrap();
+
+        assert_eq!(validation.exit_code, Some(0), "{validation:?}");
+        assert!(validation.stdout.contains("SANDBOX_OK"));
+        assert!(validation
+            .result_output
+            .as_deref()
+            .is_some_and(|result| result.contains("SANDBOX_OK")));
+
+        let _ = fs::remove_dir_all(path);
     }
 
     #[test]

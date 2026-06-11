@@ -2448,8 +2448,8 @@ runtime:
         let tcga_json =
             example_tool_spec(&examples_root, "tcga_survival_assoc.tool.yaml").stored_json();
 
-        assert_eq!(migrations::checksum(&marker_json), "2f8e22fc89c1caf9");
-        assert_eq!(migrations::checksum(&tcga_json), "a3e9aca548cab542");
+        assert_eq!(migrations::checksum(&marker_json), "7368596c7e71f739");
+        assert_eq!(migrations::checksum(&tcga_json), "ba5f8753e95845de");
         let marker_payload: StoredToolSpecJson = serde_json::from_str(&marker_json).unwrap();
         assert_eq!(marker_payload.name, "marker_survival_scan");
     }
@@ -2557,23 +2557,13 @@ runtime:
     }
 
     fn example_tool_spec(examples_root: &std::path::Path, file_name: &str) -> ToolSpec {
+        // Hash the spec exactly as parsed from YAML. Production registration keeps
+        // the command path verbatim (it never canonicalizes), so we must not bake a
+        // machine-specific absolute path into the golden hash -- doing so made this
+        // test pass only on the machine that generated the constant and fail on CI.
         let spec_path = examples_root.join(file_name);
         let source = std::fs::read_to_string(&spec_path).unwrap();
-        let mut spec = ToolSpec::from_simple_yaml(&source).unwrap();
-        let spec_dir = spec_path.parent().unwrap();
-        for arg in spec.runtime.command.iter_mut().skip(1) {
-            if arg.starts_with('-') || std::path::Path::new(arg).is_absolute() {
-                continue;
-            }
-            let candidate = spec_dir.join(arg.as_str());
-            if candidate.exists() {
-                *arg = std::fs::canonicalize(candidate)
-                    .unwrap()
-                    .display()
-                    .to_string();
-            }
-        }
-        spec
+        ToolSpec::from_simple_yaml(&source).unwrap()
     }
 
     #[test]

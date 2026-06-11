@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rusqlite::params;
 use serde::ser::SerializeStruct;
@@ -19,9 +20,11 @@ use crate::tool_select::{extract_stored_string_field, CapabilityQuery, Fit, Tool
 
 const AGENT_CYCLE_COMPLETED_EVENT: &str = "agent.cycle_completed";
 const PARAMS_INFERRED_EVENT: &str = "agent.params_inferred";
+const SOURCE_DISCOVERY_EVENT: &str = "agent.source_discovery";
 const TOOL_SYNTHESIZED_EVENT: &str = "agent.tool_synthesized";
 const TOOL_GAP_HYPOTHESIS_MARKER: &str = "hypothesis_id = ";
 const STANCE_ASSESSMENT_OBSERVATION_MARKER: &str = "observation_id = ";
+const SOURCE_DISCOVERY_GAP_HYPOTHESIS_MARKER: &str = "source_gap_hypothesis_id = ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,6 +94,8 @@ impl ParamInferer for NoopParamInferer {
 }
 
 pub trait RelevanceScorer {
+    /// Returns whether a tool's output can directly test the hypothesis conclusion,
+    /// not merely whether the tool is topically related.
     fn is_relevant(
         &self,
         hypothesis_statement: &str,
@@ -113,25 +118,78 @@ impl RelevanceScorer for NoopRelevanceScorer {
     }
 }
 
+struct CachingRelevanceScorer<'a> {
+    inner: &'a dyn RelevanceScorer,
+    cache: RefCell<HashMap<(String, String), Option<bool>>>,
+}
+
+impl RelevanceScorer for CachingRelevanceScorer<'_> {
+    fn is_relevant(
+        &self,
+        hypothesis_statement: &str,
+        tool_ref: &str,
+        tool_description: &str,
+    ) -> Option<bool> {
+        let key = (tool_ref.to_string(), hypothesis_statement.to_string());
+        if let Some(cached) = self.cache.borrow().get(&key) {
+            return *cached;
+        }
+
+        let result = self
+            .inner
+            .is_relevant(hypothesis_statement, tool_ref, tool_description);
+        self.cache.borrow_mut().insert(key, result);
+        result
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct NoopToolSynthesizer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolSynthesisOutcome {
-    Registered { tool_ref: String },
-    Rejected { reason: String },
+    Registered {
+        tool_ref: String,
+        source_trace: Option<String>,
+    },
+    Rejected {
+        reason: String,
+        source_trace: Option<String>,
+        research_gap: bool,
+    },
 }
 
 impl ToolSynthesisOutcome {
     pub fn registered(tool_ref: impl Into<String>) -> Self {
         Self::Registered {
             tool_ref: tool_ref.into(),
+            source_trace: None,
+        }
+    }
+
+    pub fn registered_with_source_trace(
+        tool_ref: impl Into<String>,
+        source_trace: impl Into<String>,
+    ) -> Self {
+        Self::Registered {
+            tool_ref: tool_ref.into(),
+            source_trace: Some(source_trace.into()),
         }
     }
 
     pub fn rejected(reason: impl Into<String>) -> Self {
         Self::Rejected {
             reason: reason.into(),
+            source_trace: None,
+            research_gap: false,
+        }
+    }
+
+    pub fn rejected_research_gap(reason: impl Into<String>, source_trace: Option<String>) -> Self {
+        Self::Rejected {
+            reason: reason.into(),
+            source_trace,
+            research_gap: true,
         }
     }
 }
@@ -195,6 +253,20 @@ impl ApplyFailure {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceDiscoveryOutput {
+    pub hypothesis_id: String,
+    pub capability_need: String,
+    pub trace: String,
+    pub research_gap: bool,
+}
+
+impl SourceDiscoveryOutput {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("source discovery output serializes to JSON")
+    }
+}
+
 struct AppliedStepFinalization<'a> {
     action: AppliedAction,
     hypothesis_id: &'a str,
@@ -204,6 +276,7 @@ struct AppliedStepFinalization<'a> {
     inferred_param_names: &'a [String],
     auto_synth_tool_ref: Option<&'a str>,
     capability_need: Option<&'a str>,
+    auto_synth_source_trace: Option<&'a str>,
     auto_run: bool,
 }
 
@@ -224,6 +297,8 @@ pub struct CycleReport {
     pub applied: Vec<AppliedAction>,
     #[serde(default)]
     pub apply_failures: Vec<ApplyFailure>,
+    #[serde(default)]
+    pub source_discoveries: Vec<SourceDiscoveryOutput>,
     pub outcome: CycleOutcome,
 }
 
@@ -240,7 +315,8 @@ impl Serialize for CycleReport {
     {
         let field_count = 7
             + usize::from(!self.applied.is_empty())
-            + usize::from(!self.apply_failures.is_empty());
+            + usize::from(!self.apply_failures.is_empty())
+            + usize::from(!self.source_discoveries.is_empty());
         let mut state = serializer.serialize_struct("CycleReport", field_count)?;
         state.serialize_field("schema_version", "agentflow.agent_cycle.v0")?;
         state.serialize_field("checkpoint_id", &self.checkpoint_id)?;
@@ -253,6 +329,9 @@ impl Serialize for CycleReport {
         }
         if !self.apply_failures.is_empty() {
             state.serialize_field("apply_failures", &self.apply_failures)?;
+        }
+        if !self.source_discoveries.is_empty() {
+            state.serialize_field("source_discoveries", &self.source_discoveries)?;
         }
         state.serialize_field("outcome", &self.outcome)?;
         state.end()
@@ -315,6 +394,7 @@ impl ProjectStore {
         let mut branch_proposals = Vec::new();
         let mut applied = Vec::new();
         let mut apply_failures = Vec::new();
+        let mut source_discoveries = Vec::new();
 
         for hypothesis in self.list_hypotheses()? {
             let evidence = self.evidence_for(&hypothesis.id)?;
@@ -382,6 +462,10 @@ impl ProjectStore {
         } else {
             BTreeSet::new()
         };
+        let cycle_scorer = CachingRelevanceScorer {
+            inner: scorer,
+            cache: RefCell::new(HashMap::new()),
+        };
         for decision in decisions {
             match &decision.action {
                 BranchAction::Abandon {
@@ -402,10 +486,11 @@ impl ProjectStore {
                         &available_input_types,
                         &available,
                         inferer,
-                        scorer,
+                        &cycle_scorer,
                     )?;
                     let mut auto_synth_tool_ref = None;
                     let mut synthesized_capability_need = None;
+                    let mut auto_synth_source_trace = None;
                     if auto_synth && auto_synth_gap(&proposal) {
                         let flow_id = config.flow.clone().unwrap_or_else(|| {
                             auto_flow_id(&proposal.decision.candidate.hypothesis_id)
@@ -416,6 +501,7 @@ impl ProjectStore {
                             equivalent_branches: self.has_equivalent_tool_branches(
                                 &proposal.decision,
                                 &available_input_types,
+                                &cycle_scorer,
                             )?,
                             conflicts_user_premise: false,
                             mutates_goal: false,
@@ -460,7 +546,20 @@ impl ProjectStore {
                                     &capability_need,
                                     representative_gene.as_deref(),
                                 ) {
-                                    ToolSynthesisOutcome::Registered { tool_ref } => {
+                                    ToolSynthesisOutcome::Registered {
+                                        tool_ref,
+                                        source_trace,
+                                    } => {
+                                        if let Some(trace) = source_trace.as_deref() {
+                                            let output = source_discovery_output(
+                                                &proposal.decision.candidate.hypothesis_id,
+                                                &capability_need,
+                                                trace,
+                                                false,
+                                            );
+                                            self.emit_source_discovery(&output)?;
+                                            source_discoveries.push(output);
+                                        }
                                         match self.draft_synthesized_step(
                                             &tool_ref,
                                             &proposal.decision,
@@ -471,14 +570,16 @@ impl ProjectStore {
                                                 proposal.matched_tool = Some(tool_ref.clone());
                                                 proposal.matched_fit =
                                                     Some("synthesized".to_string());
-                                                proposal.match_reason = Some(
-                                                    "auto_synth: runtime-gated exploratory tool"
-                                                        .to_string(),
-                                                );
+                                                proposal.match_reason =
+                                                    Some(auto_synth_match_reason(
+                                                        "auto_synth: runtime-gated exploratory tool",
+                                                        source_trace.as_deref(),
+                                                    ));
                                                 proposal.drafted_step = Some(step);
                                                 inferred_param_names = synthesized_inferred_params;
                                                 auto_synth_tool_ref = Some(tool_ref);
                                                 synthesized_capability_need = Some(capability_need);
+                                                auto_synth_source_trace = source_trace;
                                             }
                                             Err(error) => {
                                                 proposal.drafted_step = None;
@@ -495,16 +596,54 @@ impl ProjectStore {
                                             }
                                         }
                                     }
-                                    ToolSynthesisOutcome::Rejected { reason } => {
+                                    ToolSynthesisOutcome::Rejected {
+                                        reason,
+                                        source_trace,
+                                        research_gap,
+                                    } => {
+                                        if let Some(trace) = source_trace.as_deref() {
+                                            let output = source_discovery_output(
+                                                &proposal.decision.candidate.hypothesis_id,
+                                                &capability_need,
+                                                trace,
+                                                research_gap,
+                                            );
+                                            self.emit_source_discovery(&output)?;
+                                            source_discoveries.push(output);
+                                        }
                                         proposal.drafted_step = None;
+                                        let failure_reason = auto_synth_failure_reason(
+                                            &reason,
+                                            source_trace.as_deref(),
+                                        );
                                         apply_failures.push(ApplyFailure {
                                             hypothesis_id: proposal
                                                 .decision
                                                 .candidate
                                                 .hypothesis_id
                                                 .clone(),
-                                            reason: format!("auto-synth skipped: {reason}"),
+                                            reason: failure_reason,
                                         });
+                                        if research_gap
+                                            && !self.has_pending_source_discovery_gap(
+                                                &proposal.decision.candidate.hypothesis_id,
+                                            )?
+                                        {
+                                            let point = self.raise_decision_point(
+                                                DecisionKind::FundamentalGap,
+                                                &auto_synth_research_gap_digest(
+                                                    &proposal.decision.candidate.hypothesis_id,
+                                                    &proposal.decision.candidate.statement,
+                                                    &reason,
+                                                    source_trace.as_deref(),
+                                                ),
+                                                auto_synth_research_gap_options(
+                                                    &proposal.decision.candidate.hypothesis_id,
+                                                ),
+                                                0,
+                                            )?;
+                                            raised_decisions.push(point);
+                                        }
                                     }
                                 }
                             }
@@ -534,6 +673,7 @@ impl ProjectStore {
                                 equivalent_branches: self.has_equivalent_tool_branches(
                                     &proposal.decision,
                                     &available_input_types,
+                                    &cycle_scorer,
                                 )?,
                                 conflicts_user_premise: false,
                                 mutates_goal: false,
@@ -595,6 +735,8 @@ impl ProjectStore {
                                                             .as_deref(),
                                                         capability_need:
                                                             synthesized_capability_need.as_deref(),
+                                                        auto_synth_source_trace:
+                                                            auto_synth_source_trace.as_deref(),
                                                         auto_run: config.auto_run,
                                                     },
                                                     ApplyCycleOutputs {
@@ -645,6 +787,7 @@ impl ProjectStore {
             branch_proposals,
             applied,
             apply_failures,
+            source_discoveries,
             outcome,
         };
         self.append_event(EventRecord {
@@ -662,6 +805,8 @@ impl ProjectStore {
 
 const SEMANTIC_RELEVANCE_TOP_K: usize = 3;
 const SEMANTIC_RELEVANCE_REASON: &str = "relevance:semantic";
+const KEYWORD_RELEVANCE_REASON: &str = "relevance:keyword";
+const QUESTION_MISMATCH_DEMOTION_REASON: &str = "relevance:demoted_question_mismatch";
 
 fn apply_semantic_relevance_to_candidates(
     store: &ProjectStore,
@@ -669,22 +814,34 @@ fn apply_semantic_relevance_to_candidates(
     hypothesis_statement: &str,
     scorer: &dyn RelevanceScorer,
 ) -> Result<bool, StorageError> {
-    let mut promoted = false;
+    let mut changed = false;
     for candidate in candidates.iter_mut().take(SEMANTIC_RELEVANCE_TOP_K) {
-        if candidate.fit != Fit::Low {
+        let is_low_candidate = candidate.fit == Fit::Low;
+        let is_keyword_medium_candidate =
+            candidate.fit == Fit::Medium && candidate.reason.contains(KEYWORD_RELEVANCE_REASON);
+        if !is_low_candidate && !is_keyword_medium_candidate {
             continue;
         }
+
         let tool_description = tool_description(store, &candidate.tool_ref)?;
-        if scorer.is_relevant(hypothesis_statement, &candidate.tool_ref, &tool_description)
-            == Some(true)
-        {
-            candidate.fit = Fit::Medium;
-            candidate.reason = append_match_reason(&candidate.reason, SEMANTIC_RELEVANCE_REASON);
-            promoted = true;
+        match scorer.is_relevant(hypothesis_statement, &candidate.tool_ref, &tool_description) {
+            Some(true) if is_low_candidate => {
+                candidate.fit = Fit::Medium;
+                candidate.reason =
+                    append_match_reason(&candidate.reason, SEMANTIC_RELEVANCE_REASON);
+                changed = true;
+            }
+            Some(false) if is_keyword_medium_candidate => {
+                candidate.fit = Fit::Low;
+                candidate.reason =
+                    append_match_reason(&candidate.reason, QUESTION_MISMATCH_DEMOTION_REASON);
+                changed = true;
+            }
+            _ => {}
         }
     }
 
-    if promoted {
+    if changed {
         candidates.sort_by(|left, right| {
             fit_rank(right.fit)
                 .cmp(&fit_rank(left.fit))
@@ -693,7 +850,7 @@ fn apply_semantic_relevance_to_candidates(
         });
     }
 
-    Ok(promoted)
+    Ok(changed)
 }
 
 fn tool_description(store: &ProjectStore, tool_ref: &str) -> Result<String, StorageError> {
@@ -733,6 +890,15 @@ impl ProjectStore {
             .filter(|point| point.kind == DecisionKind::ToolGap)
             .filter_map(|point| tool_gap_hypothesis_id(&point.digest))
             .collect())
+    }
+
+    fn has_pending_source_discovery_gap(&self, hypothesis_id: &str) -> Result<bool, StorageError> {
+        Ok(self
+            .pending_decision_points()?
+            .into_iter()
+            .filter(|point| point.kind == DecisionKind::FundamentalGap)
+            .filter_map(|point| source_discovery_gap_hypothesis_id(&point.digest))
+            .any(|pending| pending == hypothesis_id))
     }
 
     fn pending_stance_assessment_observation_ids(&self) -> Result<BTreeSet<String>, StorageError> {
@@ -878,14 +1044,21 @@ impl ProjectStore {
         &self,
         decision: &BranchDecision,
         available_input_types: &[String],
+        scorer: &dyn RelevanceScorer,
     ) -> Result<bool, StorageError> {
         let query = CapabilityQuery {
             desired_output_type: None,
             available_input_types: available_input_types.to_vec(),
             keywords: proposal_keywords(&decision.candidate.statement),
         };
-        let candidate_count = self
-            .match_tools(&query)?
+        let mut candidates = self.match_tools(&query)?;
+        apply_semantic_relevance_to_candidates(
+            self,
+            &mut candidates,
+            &decision.candidate.statement,
+            scorer,
+        )?;
+        let candidate_count = candidates
             .into_iter()
             .filter(|candidate| matches!(candidate.fit, Fit::High | Fit::Medium))
             .take(2)
@@ -959,6 +1132,7 @@ impl ProjectStore {
                 finalization.hypothesis_id,
                 tool_ref,
                 finalization.capability_need.unwrap_or(""),
+                finalization.auto_synth_source_trace,
             )?;
         }
         outputs.applied.push(finalization.action);
@@ -982,6 +1156,7 @@ impl ProjectStore {
         hypothesis_id: &str,
         tool_ref: &str,
         capability_need: &str,
+        source_trace: Option<&str>,
     ) -> Result<(), StorageError> {
         self.append_event(EventRecord {
             flow_id: Some(flow_id.to_string()),
@@ -994,7 +1169,20 @@ impl ProjectStore {
                 hypothesis_id,
                 tool_ref,
                 capability_need,
+                source_trace,
             ),
+        })?;
+        self.touch_project()?;
+        Ok(())
+    }
+
+    fn emit_source_discovery(&self, output: &SourceDiscoveryOutput) -> Result<(), StorageError> {
+        self.append_event(EventRecord {
+            flow_id: None,
+            step_id: None,
+            run_id: None,
+            event_type: SOURCE_DISCOVERY_EVENT.to_string(),
+            payload_json: output.to_json(),
         })?;
         self.touch_project()?;
         Ok(())
@@ -1105,18 +1293,19 @@ impl ProjectStore {
             observation.flow_id.as_deref(),
             observation.step_id.as_deref(),
         )?;
-        let auto_synth_tool_ref = self.auto_synthesized_tool_for_observation(
+        let auto_synth_provenance = self.auto_synthesized_tool_for_observation(
             observation.flow_id.as_deref(),
             observation.step_id.as_deref(),
         )?;
-        let mut digest = if let Some(tool_ref) = auto_synth_tool_ref.as_deref() {
+        let mut digest = if let Some(provenance) = auto_synth_provenance.as_ref() {
             auto_synth_stance_assessment_digest(
                 step_id,
                 observation_id,
                 &observation.summary,
                 hypothesis_id,
                 &hypothesis.statement,
-                tool_ref,
+                &provenance.tool_ref,
+                provenance.source_trace.as_deref(),
             )
         } else {
             stance_assessment_digest(
@@ -1211,7 +1400,7 @@ impl ProjectStore {
         &self,
         flow_id: Option<&str>,
         step_id: Option<&str>,
-    ) -> Result<Option<String>, StorageError> {
+    ) -> Result<Option<AutoSynthProvenance>, StorageError> {
         let (Some(flow_id), Some(step_id)) = (flow_id, step_id) else {
             return Ok(None);
         };
@@ -1236,7 +1425,10 @@ impl ProjectStore {
             let candidate_step_id = event_step_id.unwrap_or(payload.step_id);
             if candidate_flow_id == flow_id && step_ids_match(flow_id, step_id, &candidate_step_id)
             {
-                return Ok(Some(payload.tool_ref));
+                return Ok(Some(AutoSynthProvenance {
+                    tool_ref: payload.tool_ref,
+                    source_trace: payload.source_trace,
+                }));
             }
         }
         Ok(None)
@@ -1264,6 +1456,14 @@ struct ToolSynthesizedPayload {
     hypothesis_id: String,
     tool_ref: String,
     capability_need: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_trace: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AutoSynthProvenance {
+    pub tool_ref: String,
+    pub source_trace: Option<String>,
 }
 
 fn inferred_param_payloads(
@@ -1316,6 +1516,7 @@ fn tool_synthesized_payload_json(
     hypothesis_id: &str,
     tool_ref: &str,
     capability_need: &str,
+    source_trace: Option<&str>,
 ) -> String {
     serde_json::to_string(&ToolSynthesizedPayload {
         flow_id: flow_id.to_string(),
@@ -1323,8 +1524,23 @@ fn tool_synthesized_payload_json(
         hypothesis_id: hypothesis_id.to_string(),
         tool_ref: tool_ref.to_string(),
         capability_need: capability_need.to_string(),
+        source_trace: source_trace.map(ToOwned::to_owned),
     })
     .expect("tool synthesized payload serializes to JSON")
+}
+
+fn source_discovery_output(
+    hypothesis_id: &str,
+    capability_need: &str,
+    trace: &str,
+    research_gap: bool,
+) -> SourceDiscoveryOutput {
+    SourceDiscoveryOutput {
+        hypothesis_id: hypothesis_id.to_string(),
+        capability_need: capability_need.to_string(),
+        trace: trace.to_string(),
+        research_gap,
+    }
 }
 
 fn tool_synthesized_payload_from_json(
@@ -1754,15 +1970,107 @@ fn auto_synth_stance_assessment_digest(
     hypothesis_id: &str,
     hypothesis_statement: &str,
     tool_ref: &str,
+    source_trace: Option<&str>,
 ) -> String {
-    format!(
+    let mut digest = format!(
         "{} 摘要：{observation_summary}。{STANCE_ASSESSMENT_OBSERVATION_MARKER}{observation_id}；请判定它对假设「{hypothesis_statement}」的立场。若仍要记录立场，运行：evidence link --hypothesis {hypothesis_id} --observation {observation_id} --stance supports|contradicts --grade hypothesis。只有人工核验工具逻辑与数据来源后，才可另行升级证据。",
         auto_synth_warning_with_step(step_id, tool_ref)
-    )
+    );
+    if let Some(trace) = source_trace
+        .map(str::trim)
+        .filter(|trace| !trace.is_empty())
+    {
+        digest.push('\n');
+        digest.push_str(trace);
+    }
+    digest
 }
 
 fn auto_synth_warning_with_step(step_id: &str, tool_ref: &str) -> String {
     format!("⚠ 步骤 {step_id} {}", auto_synth_warning(tool_ref))
+}
+
+fn auto_synth_match_reason(base: &str, source_trace: Option<&str>) -> String {
+    match source_trace
+        .map(str::trim)
+        .filter(|trace| !trace.is_empty())
+    {
+        Some(trace) => format!("{base}; source discovery trace: {}", one_line(trace)),
+        None => base.to_string(),
+    }
+}
+
+fn auto_synth_failure_reason(reason: &str, source_trace: Option<&str>) -> String {
+    let base = format!("auto-synth skipped: {reason}");
+    match source_trace
+        .map(str::trim)
+        .filter(|trace| !trace.is_empty())
+    {
+        Some(trace) => format!("{base}\n{trace}"),
+        None => base,
+    }
+}
+
+fn auto_synth_research_gap_digest(
+    hypothesis_id: &str,
+    hypothesis_statement: &str,
+    reason: &str,
+    source_trace: Option<&str>,
+) -> String {
+    let mut digest = format!(
+        "§15 决策痕迹：{SOURCE_DISCOVERY_GAP_HYPOTHESIS_MARKER}{hypothesis_id}；未找到可访问公开数据源能直接提供回答该假设所需数据，可能是 Fundamental 研究空白（通常需前瞻 ICB 队列/响应标签/表达数据），请人类确认。假设「{hypothesis_statement}」。原因：{reason}。判决保持 inconclusive，系统未自动落 Fundamental；请人类判断是否接受研究空白、提供额外数据源或改写假设。"
+    );
+    if let Some(trace) = source_trace
+        .map(str::trim)
+        .filter(|trace| !trace.is_empty())
+    {
+        digest.push('\n');
+        digest.push_str(trace);
+    }
+    digest
+}
+
+fn auto_synth_research_gap_options(hypothesis_id: &str) -> Vec<HandoffOption> {
+    vec![
+        HandoffOption {
+            label: "确认 Fundamental 研究空白".to_string(),
+            direction: format!(
+                "人工确认假设 {hypothesis_id} 是 Fundamental 研究空白；如需落判决，走既有 render_verdict + self-deception gate"
+            ),
+            cost: Cost::Cheap,
+            risk: Risk::Low,
+            reversible: true,
+        },
+        HandoffOption {
+            label: "提供数据源".to_string(),
+            direction: format!("为假设 {hypothesis_id} 提供可访问公开源或本地数据后重跑"),
+            cost: Cost::Moderate,
+            risk: Risk::Low,
+            reversible: true,
+        },
+        HandoffOption {
+            label: "改写假设".to_string(),
+            direction: format!("收窄或改写假设 {hypothesis_id} 以匹配可访问数据"),
+            cost: Cost::Moderate,
+            risk: Risk::Medium,
+            reversible: true,
+        },
+    ]
+}
+
+fn source_discovery_gap_hypothesis_id(digest: &str) -> Option<String> {
+    let rest = digest.split_once(SOURCE_DISCOVERY_GAP_HYPOTHESIS_MARKER)?.1;
+    rest.split('；').next().map(str::trim).and_then(|id| {
+        if id.is_empty() {
+            None
+        } else {
+            Some(id.to_string())
+        }
+    })
+}
+
+fn one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn stance_assessment_options(hypothesis_id: &str, observation_id: &str) -> Vec<HandoffOption> {
@@ -1920,7 +2228,8 @@ mod tests {
         Stance, Verdict, VerdictTag,
     };
     use crate::branch::{
-        BranchAction, BranchCandidate, BranchDecision, CandidateKind, ProposedStep, SelectionMode,
+        BranchAction, BranchCandidate, BranchDecision, BranchPolicy, CandidateKind, ProposedStep,
+        RuleBasedSelector, SelectionMode,
     };
     use crate::handoff::DecisionKind;
     use crate::hypothesis::{Confidence, HypothesisRequest, HypothesisStatus};
@@ -2051,6 +2360,7 @@ mod tests {
             branch_proposals: vec![proposal.clone()],
             applied: vec![step_run_without_observation.clone()],
             apply_failures: vec![failure.clone()],
+            source_discoveries: Vec::new(),
             outcome: CycleOutcome::Advanced,
         };
         assert_eq!(
@@ -2071,6 +2381,7 @@ mod tests {
             branch_proposals: Vec::new(),
             applied: Vec::new(),
             apply_failures: Vec::new(),
+            source_discoveries: Vec::new(),
             outcome: CycleOutcome::Idle,
         };
         assert_eq!(
@@ -2447,6 +2758,8 @@ runtime:
         tool_name: &'static str,
         calls: RefCell<Vec<(String, String, Option<String>)>>,
         should_register: bool,
+        source_trace: Option<&'static str>,
+        research_gap: bool,
     }
 
     impl<'a> StubToolSynthesizer<'a> {
@@ -2467,6 +2780,8 @@ runtime:
                 tool_name,
                 calls: RefCell::new(Vec::new()),
                 should_register: true,
+                source_trace: None,
+                research_gap: false,
             }
         }
 
@@ -2477,7 +2792,26 @@ runtime:
                 tool_name: "unused",
                 calls: RefCell::new(Vec::new()),
                 should_register: false,
+                source_trace: None,
+                research_gap: false,
             }
+        }
+
+        fn research_gap(store: &'a ProjectStore, source_trace: &'static str) -> Self {
+            Self {
+                store,
+                script_path: PathBuf::new(),
+                tool_name: "unused",
+                calls: RefCell::new(Vec::new()),
+                should_register: false,
+                source_trace: Some(source_trace),
+                research_gap: true,
+            }
+        }
+
+        fn with_source_trace(mut self, source_trace: &'static str) -> Self {
+            self.source_trace = Some(source_trace);
+            self
         }
 
         fn calls(&self) -> Vec<(String, String, Option<String>)> {
@@ -2498,6 +2832,12 @@ runtime:
                 representative_gene.map(ToOwned::to_owned),
             ));
             if !self.should_register {
+                if self.research_gap {
+                    return ToolSynthesisOutcome::rejected_research_gap(
+                        "未找到可访问公开数据源能为该假设提供数据，可能是真实研究空白",
+                        self.source_trace.map(str::to_string),
+                    );
+                }
                 return ToolSynthesisOutcome::rejected("stub synthesizer returned no candidate");
             }
             let command = self.script_path.display();
@@ -2525,7 +2865,11 @@ runtime:
                 self.tool_name
             ))
             .unwrap();
-            ToolSynthesisOutcome::registered(self.store.register_tool(spec).unwrap().tool_ref)
+            let tool_ref = self.store.register_tool(spec).unwrap().tool_ref;
+            match self.source_trace {
+                Some(trace) => ToolSynthesisOutcome::registered_with_source_trace(tool_ref, trace),
+                None => ToolSynthesisOutcome::registered(tool_ref),
+            }
         }
     }
 
@@ -2608,6 +2952,51 @@ runtime:
             "Literature support alone is below the decision margin.",
         );
         (path, store)
+    }
+
+    fn setup_keyword_relevance_project(test_name: &str) -> (PathBuf, ProjectStore) {
+        let (path, store) = init_project(test_name);
+        register_semantic_tool(
+            &store,
+            "thrsp_survival_proxy",
+            "verified",
+            "THRSP survival association proxy for related cohort analysis",
+            &[],
+        );
+        let hypothesis_id = record_hypothesis(&store, "THRSP survival mechanism needs validation");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is below the decision margin.",
+        );
+        (path, store)
+    }
+
+    fn setup_equivalent_keyword_relevance_project(test_name: &str) -> (PathBuf, ProjectStore) {
+        let (path, store) = setup_keyword_relevance_project(test_name);
+        register_semantic_tool(
+            &store,
+            "thrsp_axis_assoc",
+            "verified",
+            "THRSP survival mechanism axis association proxy for related cohort analysis",
+            &[],
+        );
+        (path, store)
+    }
+
+    fn selected_branch_decision(store: &ProjectStore) -> BranchDecision {
+        let mut decisions = store
+            .select_branches(
+                &RuleBasedSelector,
+                &BranchPolicy {
+                    explore_enabled: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        decisions.remove(0)
     }
 
     fn import_expression_artifact(store: &ProjectStore, root: &std::path::Path) -> String {
@@ -3780,6 +4169,57 @@ steps:
     }
 
     #[test]
+    fn auto_synth_source_trace_is_visible_in_l4_digest() {
+        let (path, store) = init_project("auto-synth-source-trace-l4");
+        let statement = "MID1IP1 immunotherapy response needs public ICB data";
+        let hypothesis_id = record_hypothesis(&store, statement);
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+        let synthesizer = StubToolSynthesizer::registering(
+            &store,
+            &path,
+            "auto_synth_mid1ip1_source",
+        )
+        .with_source_trace(
+            "SOURCE DISCOVERY TRACE\n- NCBI GEO: viable; probe returned MID1IP1 immunotherapy response cohort",
+        );
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: true,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &NoopRelevanceScorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        let point = report
+            .raised_decisions
+            .iter()
+            .find(|point| point.kind == DecisionKind::StanceAssessment)
+            .unwrap();
+        assert!(point.digest.contains("SOURCE DISCOVERY TRACE"));
+        assert!(point.digest.contains("NCBI GEO"));
+        assert!(point
+            .digest
+            .contains("MID1IP1 immunotherapy response cohort"));
+        assert!(point.digest.contains("自动合成的未验证工具"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn auto_synth_reuses_registered_synth_tool_for_same_hypothesis_without_resynthesis() {
         let (path, store) = init_project("auto-synth-reuse-dedup");
         let statement = "Auto synth THRSP pathway validation needs custom validation";
@@ -3891,6 +4331,133 @@ steps:
         assert_eq!(event_count(&store, "tool_registered"), 0);
         assert_eq!(event_count(&store, "agent.tool_synthesized"), 0);
         assert!(store.list_observations().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_synth_research_gap_raises_honest_handoff_digest() {
+        let (path, store) = init_project("auto-synth-research-gap");
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "MID1IP1 immunotherapy response needs public ICB data",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+        let synthesizer = StubToolSynthesizer::research_gap(
+            &store,
+            "QUESTION DATA REQUIREMENTS\nrequired_data: ICB treatment cohort + response labels + gene expression\nSOURCE DISCOVERY TRACE\n- cBioPortal: related-but-insufficient; has_required_data=no; reason=related expression/survival data but no ICB response labels\n- NCBI GEO: probed, empty\n代理分析但不直接回答本问题",
+        );
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: false,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &NoopRelevanceScorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        assert_eq!(synthesizer.calls().len(), 1);
+        assert!(report.branch_proposals[0].matched_tool.is_none());
+        assert!(report
+            .apply_failures
+            .iter()
+            .any(|failure| failure.reason.contains("研究空白")));
+        let point = report
+            .raised_decisions
+            .iter()
+            .find(|point| point.kind == DecisionKind::FundamentalGap)
+            .unwrap();
+        assert!(point.digest.contains("未找到可访问公开数据源"));
+        assert!(point.digest.contains("可能是真实研究空白"));
+        assert!(point.digest.contains("ICB treatment cohort"));
+        assert!(point.digest.contains("SOURCE DISCOVERY TRACE"));
+        assert!(point.digest.contains("cBioPortal"));
+        assert!(point.digest.contains("no ICB response labels"));
+        assert!(point.digest.contains("需前瞻 ICB 队列"));
+        assert!(point.digest.contains("判决保持 inconclusive"));
+        assert_eq!(point.recommendation, 0);
+        assert_eq!(report.source_discoveries.len(), 1);
+        assert_eq!(report.source_discoveries[0].hypothesis_id, hypothesis_id);
+        assert!(report.source_discoveries[0]
+            .trace
+            .contains("QUESTION DATA REQUIREMENTS"));
+        assert!(report.source_discoveries[0]
+            .trace
+            .contains("related-but-insufficient"));
+        assert_eq!(event_count(&store, "agent.source_discovery"), 1);
+        let payload: String = store
+            .connection()
+            .query_row(
+                "SELECT payload_json FROM events WHERE event_type = ?1",
+                params!["agent.source_discovery"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(payload.contains("ICB treatment cohort"));
+        assert!(payload.contains("related-but-insufficient"));
+        assert!(report.applied.is_empty());
+        assert_eq!(event_count(&store, "tool_registered"), 0);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn pending_source_discovery_gap_only_counts_fundamental_gap_points() {
+        let (path, store) = init_project("source-gap-kind-filter");
+        let hypothesis_id = "hyp_source_gap";
+
+        assert!(!store
+            .has_pending_source_discovery_gap(hypothesis_id)
+            .unwrap());
+
+        let deepen_digest = super::auto_synth_research_gap_digest(
+            hypothesis_id,
+            "MID1IP1 immunotherapy response needs public ICB data",
+            "fixture deepen marker",
+            None,
+        );
+        store
+            .raise_decision_point(
+                DecisionKind::DeepenOrStop,
+                &deepen_digest,
+                super::auto_synth_research_gap_options(hypothesis_id),
+                0,
+            )
+            .unwrap();
+        assert!(!store
+            .has_pending_source_discovery_gap(hypothesis_id)
+            .unwrap());
+
+        let gap_digest = super::auto_synth_research_gap_digest(
+            hypothesis_id,
+            "MID1IP1 immunotherapy response needs public ICB data",
+            "fixture fundamental marker",
+            None,
+        );
+        store
+            .raise_decision_point(
+                DecisionKind::FundamentalGap,
+                &gap_digest,
+                super::auto_synth_research_gap_options(hypothesis_id),
+                0,
+            )
+            .unwrap();
+        assert!(store
+            .has_pending_source_discovery_gap(hypothesis_id)
+            .unwrap());
 
         let _ = std::fs::remove_dir_all(path);
     }
@@ -4239,6 +4806,330 @@ steps:
             .as_deref()
             .unwrap()
             .contains("relevance:semantic"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn semantic_relevance_false_demotes_keyword_medium_candidate_and_reranks() {
+        let (path, store) = init_project("semantic-keyword-demote-direct");
+        register_semantic_tool(
+            &store,
+            "thrsp_survival_proxy",
+            "verified",
+            "THRSP survival association proxy for related cohort analysis",
+            &[],
+        );
+        register_semantic_tool(
+            &store,
+            "fallback_low",
+            "verified",
+            "fallback validation helper",
+            &[],
+        );
+        let scorer = StubRelevanceScorer::always(Some(false));
+        let mut candidates = vec![
+            ToolCandidate {
+                tool_ref: "analysis/thrsp_survival_proxy".to_string(),
+                fit: Fit::Medium,
+                score: 8,
+                reason: "keyword:name:thrsp, relevance:keyword".to_string(),
+            },
+            ToolCandidate {
+                tool_ref: "analysis/fallback_low".to_string(),
+                fit: Fit::Low,
+                score: 20,
+                reason: "maturity:verified".to_string(),
+            },
+        ];
+
+        let changed = super::apply_semantic_relevance_to_candidates(
+            &store,
+            &mut candidates,
+            "THRSP survival mechanism needs validation",
+            &scorer,
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(
+            scorer.calls(),
+            vec![
+                "analysis/thrsp_survival_proxy".to_string(),
+                "analysis/fallback_low".to_string()
+            ]
+        );
+        assert_eq!(candidates[0].tool_ref, "analysis/fallback_low");
+        assert_eq!(candidates[0].fit, Fit::Low);
+        assert_eq!(candidates[1].tool_ref, "analysis/thrsp_survival_proxy");
+        assert_eq!(candidates[1].fit, Fit::Low);
+        assert!(candidates[1]
+            .reason
+            .contains("relevance:demoted_question_mismatch"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn keyword_medium_demoted_to_low_triggers_auto_synth_gap() {
+        let (path, store) = setup_keyword_relevance_project("semantic-keyword-demote-auto-synth");
+        let scorer = StubRelevanceScorer::always(Some(false));
+        let synthesizer = StubToolSynthesizer::none(&store);
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: false,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &scorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        let proposal = &report.branch_proposals[0];
+        assert_eq!(
+            proposal.matched_tool.as_deref(),
+            Some("analysis/thrsp_survival_proxy")
+        );
+        assert_eq!(proposal.matched_fit.as_deref(), Some("low"));
+        assert!(proposal
+            .match_reason
+            .as_deref()
+            .unwrap()
+            .contains("relevance:demoted_question_mismatch"));
+        assert_eq!(
+            scorer.calls(),
+            vec!["analysis/thrsp_survival_proxy".to_string()]
+        );
+        assert_eq!(synthesizer.calls().len(), 1);
+        assert!(synthesizer.calls()[0].1.contains("fit=low"));
+        assert!(report
+            .apply_failures
+            .iter()
+            .any(|failure| failure.reason.contains("auto-synth skipped")));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn run_cycle_caches_semantic_relevance_scoring_per_tool_and_hypothesis() {
+        let (path, store) = setup_keyword_relevance_project("semantic-cycle-cache");
+        let scorer = StubRelevanceScorer::always(Some(true));
+
+        let report = store
+            .run_cycle_with_scorer(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &scorer,
+            )
+            .unwrap();
+
+        assert_eq!(
+            report.branch_proposals[0].matched_tool.as_deref(),
+            Some("analysis/thrsp_survival_proxy")
+        );
+        assert_eq!(
+            scorer.calls(),
+            vec!["analysis/thrsp_survival_proxy".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn question_mismatch_demotion_prevents_equivalent_branch_brake_and_allows_auto_synth() {
+        let (path, store) =
+            setup_equivalent_keyword_relevance_project("semantic-equivalent-demote-auto-synth");
+        let scorer = StubRelevanceScorer::always(Some(false));
+        let synthesizer = StubToolSynthesizer::none(&store);
+        let decision = selected_branch_decision(&store);
+
+        assert!(!store
+            .has_equivalent_tool_branches(&decision, &[], &scorer)
+            .unwrap());
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: false,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &scorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        let proposal = &report.branch_proposals[0];
+        assert_eq!(
+            proposal.matched_tool.as_deref(),
+            Some("analysis/thrsp_survival_proxy")
+        );
+        assert_eq!(proposal.matched_fit.as_deref(), Some("low"));
+        assert!(proposal
+            .match_reason
+            .as_deref()
+            .unwrap()
+            .contains("relevance:demoted_question_mismatch"));
+        assert_eq!(synthesizer.calls().len(), 1);
+        assert!(report
+            .apply_failures
+            .iter()
+            .any(|failure| failure.reason.contains("auto-synth skipped")));
+        assert!(!report
+            .raised_decisions
+            .iter()
+            .any(|point| point.kind == DecisionKind::DeepenOrStop));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn question_confirmed_equivalent_branches_still_trigger_deepen_or_stop() {
+        let (path, store) =
+            setup_equivalent_keyword_relevance_project("semantic-equivalent-true-brake");
+        let scorer = StubRelevanceScorer::always(Some(true));
+        let synthesizer = StubToolSynthesizer::none(&store);
+        let decision = selected_branch_decision(&store);
+
+        assert!(store
+            .has_equivalent_tool_branches(&decision, &[], &scorer)
+            .unwrap());
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &scorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        let proposal = &report.branch_proposals[0];
+        assert_eq!(
+            proposal.matched_tool.as_deref(),
+            Some("analysis/thrsp_survival_proxy")
+        );
+        assert_eq!(proposal.matched_fit.as_deref(), Some("medium"));
+        assert!(proposal
+            .match_reason
+            .as_deref()
+            .unwrap()
+            .contains("relevance:keyword"));
+        assert!(report
+            .raised_decisions
+            .iter()
+            .any(|point| point.kind == DecisionKind::DeepenOrStop));
+        assert!(!report.applied.iter().any(|action| matches!(
+            action,
+            AppliedAction::GraphPatchApplied { .. }
+                | AppliedAction::FlowAutoCreated { .. }
+                | AppliedAction::StepRun { .. }
+        )));
+        assert!(synthesizer.calls().is_empty());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn single_question_relevant_keyword_candidate_does_not_trigger_equivalent_branch_brake() {
+        let (path, store) = setup_keyword_relevance_project("semantic-single-keyword-no-brake");
+        let scorer = StubRelevanceScorer::always(Some(true));
+        let synthesizer = StubToolSynthesizer::none(&store);
+        let decision = selected_branch_decision(&store);
+
+        assert!(!store
+            .has_equivalent_tool_branches(&decision, &[], &scorer)
+            .unwrap());
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &scorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        let proposal = &report.branch_proposals[0];
+        assert_eq!(
+            proposal.matched_tool.as_deref(),
+            Some("analysis/thrsp_survival_proxy")
+        );
+        assert_eq!(proposal.matched_fit.as_deref(), Some("medium"));
+        assert!(!report
+            .raised_decisions
+            .iter()
+            .any(|point| point.kind == DecisionKind::DeepenOrStop));
+        assert!(synthesizer.calls().is_empty());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn keyword_medium_confirmed_relevant_preserves_existing_auto_synth_behavior() {
+        let (path, store) = setup_keyword_relevance_project("semantic-keyword-true-preserve");
+        let scorer = StubRelevanceScorer::always(Some(true));
+        let synthesizer = StubToolSynthesizer::none(&store);
+
+        let report = store
+            .run_cycle_with_synth(
+                ApplyConfig {
+                    apply: false,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &scorer,
+                &synthesizer,
+            )
+            .unwrap();
+
+        let proposal = &report.branch_proposals[0];
+        assert_eq!(
+            proposal.matched_tool.as_deref(),
+            Some("analysis/thrsp_survival_proxy")
+        );
+        assert_eq!(proposal.matched_fit.as_deref(), Some("medium"));
+        assert!(proposal
+            .match_reason
+            .as_deref()
+            .unwrap()
+            .contains("relevance:keyword"));
+        assert_eq!(
+            scorer.calls(),
+            vec!["analysis/thrsp_survival_proxy".to_string()]
+        );
+        assert!(synthesizer.calls().is_empty());
+        assert!(report.apply_failures.is_empty());
 
         let _ = std::fs::remove_dir_all(path);
     }

@@ -624,8 +624,27 @@ impl ToolSynthesizer for LlmToolSynthesizer<'_> {
             Ok(synth_commands::AutoSynthToolResult::Registered(tool_ref)) => {
                 ToolSynthesisOutcome::registered(tool_ref)
             }
+            Ok(synth_commands::AutoSynthToolResult::RegisteredWithSource {
+                tool_ref,
+                source_trace,
+            }) => ToolSynthesisOutcome::registered_with_source_trace(tool_ref, source_trace),
             Ok(synth_commands::AutoSynthToolResult::Rejected(reason)) => {
                 ToolSynthesisOutcome::rejected(reason)
+            }
+            Ok(synth_commands::AutoSynthToolResult::RejectedWithSource {
+                reason,
+                source_trace,
+                research_gap,
+            }) => {
+                if research_gap {
+                    ToolSynthesisOutcome::rejected_research_gap(reason, Some(source_trace))
+                } else {
+                    ToolSynthesisOutcome::Rejected {
+                        reason,
+                        source_trace: Some(source_trace),
+                        research_gap: false,
+                    }
+                }
             }
             Err(error) => ToolSynthesisOutcome::rejected(format!(
                 "auto-synth backend or registration failed: {}",
@@ -642,7 +661,9 @@ fn param_inference_prompt(statement: &str, param_name: &str) -> String {
 }
 
 fn relevance_prompt(statement: &str, tool_ref: &str, tool_description: &str) -> String {
-    format!("假设「{statement}」与工具 <{tool_ref}>（描述：{tool_description}）是否研究相关？只答 yes/no。")
+    format!(
+        "工具 <{tool_ref}>（描述：{tool_description}）的输出能否直接作为证据检验假设「{statement}」中陈述的具体结论，而不只是主题、疾病或基因相关？只答 yes/no。"
+    )
 }
 
 fn first_non_empty_line(value: &str) -> Option<&str> {

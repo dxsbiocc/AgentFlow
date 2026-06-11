@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rusqlite::params;
 use serde::ser::SerializeStruct;
@@ -114,6 +115,31 @@ impl RelevanceScorer for NoopRelevanceScorer {
         _tool_description: &str,
     ) -> Option<bool> {
         None
+    }
+}
+
+struct CachingRelevanceScorer<'a> {
+    inner: &'a dyn RelevanceScorer,
+    cache: RefCell<HashMap<(String, String), Option<bool>>>,
+}
+
+impl RelevanceScorer for CachingRelevanceScorer<'_> {
+    fn is_relevant(
+        &self,
+        hypothesis_statement: &str,
+        tool_ref: &str,
+        tool_description: &str,
+    ) -> Option<bool> {
+        let key = (tool_ref.to_string(), hypothesis_statement.to_string());
+        if let Some(cached) = self.cache.borrow().get(&key) {
+            return *cached;
+        }
+
+        let result = self
+            .inner
+            .is_relevant(hypothesis_statement, tool_ref, tool_description);
+        self.cache.borrow_mut().insert(key, result);
+        result
     }
 }
 
@@ -436,6 +462,10 @@ impl ProjectStore {
         } else {
             BTreeSet::new()
         };
+        let cycle_scorer = CachingRelevanceScorer {
+            inner: scorer,
+            cache: RefCell::new(HashMap::new()),
+        };
         for decision in decisions {
             match &decision.action {
                 BranchAction::Abandon {
@@ -456,7 +486,7 @@ impl ProjectStore {
                         &available_input_types,
                         &available,
                         inferer,
-                        scorer,
+                        &cycle_scorer,
                     )?;
                     let mut auto_synth_tool_ref = None;
                     let mut synthesized_capability_need = None;
@@ -471,7 +501,7 @@ impl ProjectStore {
                             equivalent_branches: self.has_equivalent_tool_branches(
                                 &proposal.decision,
                                 &available_input_types,
-                                scorer,
+                                &cycle_scorer,
                             )?,
                             conflicts_user_premise: false,
                             mutates_goal: false,
@@ -643,7 +673,7 @@ impl ProjectStore {
                                 equivalent_branches: self.has_equivalent_tool_branches(
                                     &proposal.decision,
                                     &available_input_types,
-                                    scorer,
+                                    &cycle_scorer,
                                 )?,
                                 conflicts_user_premise: false,
                                 mutates_goal: false,
@@ -866,10 +896,7 @@ impl ProjectStore {
         Ok(self
             .pending_decision_points()?
             .into_iter()
-            .filter(|point| {
-                point.kind == DecisionKind::FundamentalGap
-                    || point.kind == DecisionKind::DeepenOrStop
-            })
+            .filter(|point| point.kind == DecisionKind::FundamentalGap)
             .filter_map(|point| source_discovery_gap_hypothesis_id(&point.digest))
             .any(|pending| pending == hypothesis_id))
     }
@@ -4388,6 +4415,54 @@ steps:
     }
 
     #[test]
+    fn pending_source_discovery_gap_only_counts_fundamental_gap_points() {
+        let (path, store) = init_project("source-gap-kind-filter");
+        let hypothesis_id = "hyp_source_gap";
+
+        assert!(!store
+            .has_pending_source_discovery_gap(hypothesis_id)
+            .unwrap());
+
+        let deepen_digest = super::auto_synth_research_gap_digest(
+            hypothesis_id,
+            "MID1IP1 immunotherapy response needs public ICB data",
+            "fixture deepen marker",
+            None,
+        );
+        store
+            .raise_decision_point(
+                DecisionKind::DeepenOrStop,
+                &deepen_digest,
+                super::auto_synth_research_gap_options(hypothesis_id),
+                0,
+            )
+            .unwrap();
+        assert!(!store
+            .has_pending_source_discovery_gap(hypothesis_id)
+            .unwrap());
+
+        let gap_digest = super::auto_synth_research_gap_digest(
+            hypothesis_id,
+            "MID1IP1 immunotherapy response needs public ICB data",
+            "fixture fundamental marker",
+            None,
+        );
+        store
+            .raise_decision_point(
+                DecisionKind::FundamentalGap,
+                &gap_digest,
+                super::auto_synth_research_gap_options(hypothesis_id),
+                0,
+            )
+            .unwrap();
+        assert!(store
+            .has_pending_source_discovery_gap(hypothesis_id)
+            .unwrap());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn auto_synth_treats_low_fit_as_gap_but_legacy_propose_synth_does_not() {
         let (path, store) = setup_semantic_project("auto-synth-low-fit-gap");
         let legacy = store
@@ -4829,10 +4904,7 @@ steps:
             .contains("relevance:demoted_question_mismatch"));
         assert_eq!(
             scorer.calls(),
-            vec![
-                "analysis/thrsp_survival_proxy".to_string(),
-                "analysis/thrsp_survival_proxy".to_string()
-            ]
+            vec!["analysis/thrsp_survival_proxy".to_string()]
         );
         assert_eq!(synthesizer.calls().len(), 1);
         assert!(synthesizer.calls()[0].1.contains("fit=low"));
@@ -4840,6 +4912,37 @@ steps:
             .apply_failures
             .iter()
             .any(|failure| failure.reason.contains("auto-synth skipped")));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn run_cycle_caches_semantic_relevance_scoring_per_tool_and_hypothesis() {
+        let (path, store) = setup_keyword_relevance_project("semantic-cycle-cache");
+        let scorer = StubRelevanceScorer::always(Some(true));
+
+        let report = store
+            .run_cycle_with_scorer(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: false,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &scorer,
+            )
+            .unwrap();
+
+        assert_eq!(
+            report.branch_proposals[0].matched_tool.as_deref(),
+            Some("analysis/thrsp_survival_proxy")
+        );
+        assert_eq!(
+            scorer.calls(),
+            vec!["analysis/thrsp_survival_proxy".to_string()]
+        );
 
         let _ = std::fs::remove_dir_all(path);
     }

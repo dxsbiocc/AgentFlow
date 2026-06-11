@@ -28,6 +28,7 @@ const VALIDATION_PATH: &str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
 const PRIMARY_VALIDATION_GENE: &str = "TP53";
 const ALTERNATE_VALIDATION_GENE: &str = "EGFR";
 const MAX_SOURCE_PROBE_BYTES: usize = 65_536;
+const MAX_PROBED_SOURCE_CANDIDATES: usize = 5;
 const PUBLIC_SOURCE_ALLOWLIST: &[&str] = &[
     "www.cbioportal.org",
     "eutils.ncbi.nlm.nih.gov",
@@ -43,7 +44,14 @@ import urllib.request
 url = sys.argv[1]
 timeout = float(sys.argv[2])
 request = urllib.request.Request(url, headers={"Accept": "application/json"})
-with urllib.request.urlopen(request, timeout=timeout) as response:
+
+# SSRF defense: do not follow redirects after Rust host allowlist checks.
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+_opener = urllib.request.build_opener(_NoRedirect)
+with _opener.open(request, timeout=timeout) as response:
     body = response.read().decode("utf-8")
 json.loads(body)
 print(body, end="" if body.endswith("\n") else "\n")
@@ -58,7 +66,14 @@ request = urllib.request.Request(
     url,
     headers={"Accept": "application/json, text/plain, text/html, */*"},
 )
-with urllib.request.urlopen(request, timeout=timeout) as response:
+
+# SSRF defense: do not follow redirects after Rust host allowlist checks.
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+_opener = urllib.request.build_opener(_NoRedirect)
+with _opener.open(request, timeout=timeout) as response:
     body = response.read(limit)
 text = body.decode("utf-8", errors="replace")
 print(text, end="" if text.endswith("\n") else "\n")
@@ -643,6 +658,7 @@ where
         format!("allowlist: {}", PUBLIC_SOURCE_ALLOWLIST.join(", ")),
     ];
 
+    let mut probed_source_candidates = 0usize;
     for candidate in &candidates {
         let label = if candidate.name.trim().is_empty() {
             "<unnamed>"
@@ -670,6 +686,14 @@ where
                 continue;
             }
         };
+
+        if probed_source_candidates >= MAX_PROBED_SOURCE_CANDIDATES {
+            trace_lines.push(format!(
+                "- {label}: skipped (probe budget {MAX_PROBED_SOURCE_CANDIDATES} reached)"
+            ));
+            continue;
+        }
+        probed_source_candidates += 1;
 
         let Some(body) = fetch_probe(&candidate.probe_url, SOURCE_DISCOVERY_TIMEOUT) else {
             trace_lines.push(format!(
@@ -3623,6 +3647,16 @@ steps:
     }
 
     #[test]
+    fn python_fetch_scripts_disable_redirect_following() {
+        for script in [CBIOPORTAL_DISCOVERY_FETCH_PY, SOURCE_PROBE_FETCH_PY] {
+            assert!(script.contains("HTTPRedirectHandler"));
+            assert!(script.contains("redirect_request"));
+            assert!(script.contains("build_opener(_NoRedirect)"));
+            assert!(script.contains("_opener.open(request, timeout=timeout)"));
+        }
+    }
+
+    #[test]
     fn autonomous_source_discovery_selects_viable_source_and_injects_probe_summary() {
         let raw_candidates = r#"[
           {
@@ -3670,6 +3704,73 @@ steps:
         assert!(prompt.contains("read-only GET"));
         assert!(prompt.contains("If the public source lacks usable real data, exit non-zero"));
         assert!(!prompt.contains("import agentflow_cbioportal as cbio"));
+    }
+
+    #[test]
+    fn source_discovery_probe_budget_skips_extra_safe_candidates() {
+        let raw_candidates = r#"[
+          {
+            "name": "Blocked mirror",
+            "base_url": "https://evil.example.org",
+            "probe_url": "https://evil.example.org/search?q=MID1IP1",
+            "access_note": "not public science allowlist"
+          },
+          {
+            "name": "NCBI 1",
+            "base_url": "https://www.ncbi.nlm.nih.gov",
+            "probe_url": "https://www.ncbi.nlm.nih.gov/probe1",
+            "access_note": "public source"
+          },
+          {
+            "name": "NCBI 2",
+            "base_url": "https://www.ncbi.nlm.nih.gov",
+            "probe_url": "https://www.ncbi.nlm.nih.gov/probe2",
+            "access_note": "public source"
+          },
+          {
+            "name": "NCBI 3",
+            "base_url": "https://www.ncbi.nlm.nih.gov",
+            "probe_url": "https://www.ncbi.nlm.nih.gov/probe3",
+            "access_note": "public source"
+          },
+          {
+            "name": "NCBI 4",
+            "base_url": "https://www.ncbi.nlm.nih.gov",
+            "probe_url": "https://www.ncbi.nlm.nih.gov/probe4",
+            "access_note": "public source"
+          },
+          {
+            "name": "NCBI 5",
+            "base_url": "https://www.ncbi.nlm.nih.gov",
+            "probe_url": "https://www.ncbi.nlm.nih.gov/probe5",
+            "access_note": "public source"
+          },
+          {
+            "name": "NCBI 6",
+            "base_url": "https://www.ncbi.nlm.nih.gov",
+            "probe_url": "https://www.ncbi.nlm.nih.gov/probe6",
+            "access_note": "public source"
+          }
+        ]"#;
+        let mut probed = Vec::new();
+
+        let discovery = discover_sources_from_candidate_json(
+            "MID1IP1 immunotherapy response biomarker",
+            "Need public ICB cohort response data",
+            raw_candidates,
+            |url, _timeout| {
+                probed.push(url.to_string());
+                Some("unrelated public index".to_string())
+            },
+        );
+
+        assert_eq!(probed.len(), 5);
+        assert!(probed.iter().all(|url| url.contains("ncbi.nlm.nih.gov")));
+        assert!(discovery.trace.contains("candidate proposals parsed: 7"));
+        assert!(discovery.trace.contains("Blocked mirror: skipped"));
+        assert!(discovery
+            .trace
+            .contains("NCBI 6: skipped (probe budget 5 reached)"));
     }
 
     #[test]

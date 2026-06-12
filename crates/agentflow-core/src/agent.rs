@@ -1,5 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::File;
+use std::io::Read;
 
 use rusqlite::params;
 use serde::ser::SerializeStruct;
@@ -31,6 +33,8 @@ const TOOL_GAP_HYPOTHESIS_MARKER: &str = "hypothesis_id = ";
 const STANCE_ASSESSMENT_OBSERVATION_MARKER: &str = "observation_id = ";
 const SOURCE_DISCOVERY_GAP_HYPOTHESIS_MARKER: &str = "source_gap_hypothesis_id = ";
 const MECHANISM_SPAWN_ORIGIN_PREFIX: &str = "mechanism-spawn:from:";
+const OUTPUT_GROUNDING_ARTIFACT_TEXT_LIMIT: u64 = 8 * 1024;
+const OUTPUT_DOMAIN_MISMATCH_PREFIX: &str = "output-domain-mismatch:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -120,6 +124,22 @@ impl RelevanceScorer for NoopRelevanceScorer {
         _tool_ref: &str,
         _tool_description: &str,
     ) -> Option<bool> {
+        None
+    }
+}
+
+pub trait OutputGroundingScorer {
+    /// Whether a produced finding actually addresses the hypothesis's domain/claim
+    /// (e.g. the finding's cohort/disease matches the hypothesis), not merely the topic.
+    /// Returns None when undecidable (e.g. no LLM configured).
+    fn grounds_hypothesis(&self, hypothesis_statement: &str, finding_text: &str) -> Option<bool>;
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct NoopOutputGroundingScorer;
+
+impl OutputGroundingScorer for NoopOutputGroundingScorer {
+    fn grounds_hypothesis(&self, _hypothesis_statement: &str, _finding_text: &str) -> Option<bool> {
         None
     }
 }
@@ -295,6 +315,7 @@ struct ApplyCycleOutputs<'a> {
     applied: &'a mut Vec<AppliedAction>,
     apply_failures: &'a mut Vec<ApplyFailure>,
     raised_decisions: &'a mut Vec<DecisionPoint>,
+    grounding: &'a dyn OutputGroundingScorer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -375,7 +396,31 @@ impl ProjectStore {
         inferer: &dyn ParamInferer,
         scorer: &dyn RelevanceScorer,
     ) -> Result<CycleReport, StorageError> {
-        self.run_cycle_inner(config, inferer, scorer, &NoopToolSynthesizer, false)
+        self.run_cycle_inner(
+            config,
+            inferer,
+            scorer,
+            &NoopToolSynthesizer,
+            &NoopOutputGroundingScorer,
+            false,
+        )
+    }
+
+    pub fn run_cycle_with_scorer_grounded(
+        &self,
+        config: ApplyConfig,
+        inferer: &dyn ParamInferer,
+        scorer: &dyn RelevanceScorer,
+        grounding: &dyn OutputGroundingScorer,
+    ) -> Result<CycleReport, StorageError> {
+        self.run_cycle_inner(
+            config,
+            inferer,
+            scorer,
+            &NoopToolSynthesizer,
+            grounding,
+            false,
+        )
     }
 
     pub fn run_cycle_with_synth(
@@ -385,7 +430,25 @@ impl ProjectStore {
         scorer: &dyn RelevanceScorer,
         synthesizer: &dyn ToolSynthesizer,
     ) -> Result<CycleReport, StorageError> {
-        self.run_cycle_inner(config, inferer, scorer, synthesizer, true)
+        self.run_cycle_inner(
+            config,
+            inferer,
+            scorer,
+            synthesizer,
+            &NoopOutputGroundingScorer,
+            true,
+        )
+    }
+
+    pub fn run_cycle_with_synth_grounded(
+        &self,
+        config: ApplyConfig,
+        inferer: &dyn ParamInferer,
+        scorer: &dyn RelevanceScorer,
+        synthesizer: &dyn ToolSynthesizer,
+        grounding: &dyn OutputGroundingScorer,
+    ) -> Result<CycleReport, StorageError> {
+        self.run_cycle_inner(config, inferer, scorer, synthesizer, grounding, true)
     }
 
     fn maybe_spawn_mechanism_child(
@@ -424,6 +487,7 @@ impl ProjectStore {
         inferer: &dyn ParamInferer,
         scorer: &dyn RelevanceScorer,
         synthesizer: &dyn ToolSynthesizer,
+        grounding: &dyn OutputGroundingScorer,
         auto_synth: bool,
     ) -> Result<CycleReport, StorageError> {
         let checkpoint = self.create_checkpoint("agent_cycle")?;
@@ -795,6 +859,7 @@ impl ProjectStore {
                                                         applied: &mut applied,
                                                         apply_failures: &mut apply_failures,
                                                         raised_decisions: &mut raised_decisions,
+                                                        grounding,
                                                     },
                                                 )?;
                                             } else {
@@ -1193,9 +1258,7 @@ impl ProjectStore {
                 finalization.hypothesis_id,
                 finalization.flow_id,
                 finalization.step_id,
-                outputs.applied,
-                outputs.apply_failures,
-                outputs.raised_decisions,
+                outputs,
             )?;
         }
         Ok(())
@@ -1269,19 +1332,17 @@ impl ProjectStore {
         hypothesis_id: &str,
         flow_id: &str,
         step_id: &str,
-        applied: &mut Vec<AppliedAction>,
-        apply_failures: &mut Vec<ApplyFailure>,
-        raised_decisions: &mut Vec<DecisionPoint>,
+        outputs: ApplyCycleOutputs<'_>,
     ) -> Result<(), StorageError> {
         let step_ref = format!("step:{flow_id}/{step_id}");
         let summary = match self.run_step_ref(&step_ref) {
             Ok(summary) => summary,
             Err(error) => {
-                apply_failures.push(ApplyFailure {
+                outputs.apply_failures.push(ApplyFailure {
                     hypothesis_id: hypothesis_id.to_string(),
                     reason: auto_run_failure_reason(step_id, &error.to_string()),
                 });
-                applied.push(AppliedAction::StepRun {
+                outputs.applied.push(AppliedAction::StepRun {
                     step_id: step_id.to_string(),
                     observation_id: None,
                 });
@@ -1301,7 +1362,7 @@ impl ProjectStore {
                 .first()
                 .map(|attempt| attempt.status.as_str())
                 .unwrap_or("unknown");
-            apply_failures.push(ApplyFailure {
+            outputs.apply_failures.push(ApplyFailure {
                 hypothesis_id: hypothesis_id.to_string(),
                 reason: auto_run_failure_reason(
                     step_id,
@@ -1315,11 +1376,13 @@ impl ProjectStore {
                 hypothesis_id,
                 step_id,
                 observation_id,
-                raised_decisions,
+                outputs.grounding,
+                outputs.apply_failures,
+                outputs.raised_decisions,
             )?;
         }
 
-        applied.push(AppliedAction::StepRun {
+        outputs.applied.push(AppliedAction::StepRun {
             step_id: step_id.to_string(),
             observation_id,
         });
@@ -1331,6 +1394,8 @@ impl ProjectStore {
         hypothesis_id: &str,
         step_id: &str,
         observation_id: &str,
+        grounding: &dyn OutputGroundingScorer,
+        apply_failures: &mut Vec<ApplyFailure>,
         raised_decisions: &mut Vec<DecisionPoint>,
     ) -> Result<(), StorageError> {
         let pending_observations = self.pending_stance_assessment_observation_ids()?;
@@ -1340,6 +1405,19 @@ impl ProjectStore {
 
         let observation = self.inspect_observation(observation_id)?;
         let hypothesis = self.inspect_hypothesis(hypothesis_id)?;
+        let finding_text = finding_text_for_grounding(
+            self,
+            &observation.summary,
+            observation.artifact_id.as_deref(),
+        );
+        if grounding.grounds_hypothesis(&hypothesis.statement, &finding_text) == Some(false) {
+            apply_failures.push(ApplyFailure {
+                hypothesis_id: hypothesis_id.to_string(),
+                reason: output_domain_mismatch_reason(observation_id, &finding_text),
+            });
+            return Ok(());
+        }
+
         let inferred_params = inferred_params_for_observation(
             self,
             observation.flow_id.as_deref(),
@@ -1612,6 +1690,59 @@ fn inferred_params_for_observation(
         return Ok(Vec::new());
     };
     store.inferred_params_for_step(flow_id, step_id)
+}
+
+fn finding_text_for_grounding(
+    store: &ProjectStore,
+    observation_summary: &str,
+    artifact_id: Option<&str>,
+) -> String {
+    let mut finding_text = observation_summary.to_string();
+    if let Some(artifact_body) = artifact_text_for_grounding(store, artifact_id)
+        .map(|body| body.trim().to_string())
+        .filter(|body| !body.is_empty())
+    {
+        finding_text.push_str("\n\n");
+        finding_text.push_str(&artifact_body);
+    }
+    finding_text
+}
+
+fn artifact_text_for_grounding(store: &ProjectStore, artifact_id: Option<&str>) -> Option<String> {
+    let artifact_id = artifact_id?.trim();
+    if artifact_id.is_empty() {
+        return None;
+    }
+
+    let artifact = store.inspect_artifact(artifact_id).ok()?;
+    let project_root = std::fs::canonicalize(store.root_path()).ok()?;
+    let artifact_path = std::fs::canonicalize(&artifact.summary.path).ok()?;
+    if !artifact_path.starts_with(project_root) {
+        return None;
+    }
+
+    let file = File::open(artifact_path).ok()?;
+    let mut limited = file.take(OUTPUT_GROUNDING_ARTIFACT_TEXT_LIMIT);
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn output_domain_mismatch_reason(observation_id: &str, finding_text: &str) -> String {
+    format!(
+        "{OUTPUT_DOMAIN_MISMATCH_PREFIX} 工具输出领域与假设不匹配，已拒绝作为证据；observation_id={observation_id}; finding={}",
+        compact_finding_excerpt(finding_text, 240)
+    )
+}
+
+fn compact_finding_excerpt(value: &str, max_chars: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let mut excerpt = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        excerpt.push_str("...");
+    }
+    excerpt
 }
 
 fn inferred_param_warning(params: &[(String, String)]) -> String {
@@ -2300,8 +2431,10 @@ mod tests {
     use crate::tool_select::{Fit, ToolCandidate};
 
     use super::{
-        proposal_keywords, AppliedAction, ApplyConfig, CycleOutcome, NoopParamInferer,
-        NoopRelevanceScorer, ParamInferer, RelevanceScorer, ToolSynthesisOutcome, ToolSynthesizer,
+        proposal_keywords, AppliedAction, ApplyConfig, ApplyFailure, CycleOutcome,
+        NoopOutputGroundingScorer, NoopParamInferer, NoopRelevanceScorer, NoopToolSynthesizer,
+        OutputGroundingScorer, ParamInferer, RelevanceScorer, ToolSynthesisOutcome,
+        ToolSynthesizer,
     };
 
     fn temp_project_path(test_name: &str) -> PathBuf {
@@ -2886,6 +3019,36 @@ runtime:
         }
     }
 
+    struct StubOutputGroundingScorer {
+        result: Option<bool>,
+        findings: RefCell<Vec<String>>,
+    }
+
+    impl StubOutputGroundingScorer {
+        fn always(result: Option<bool>) -> Self {
+            Self {
+                result,
+                findings: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn findings(&self) -> Vec<String> {
+            self.findings.borrow().clone()
+        }
+    }
+
+    impl OutputGroundingScorer for StubOutputGroundingScorer {
+        fn grounds_hypothesis(
+            &self,
+            hypothesis_statement: &str,
+            finding_text: &str,
+        ) -> Option<bool> {
+            assert!(hypothesis_statement.contains("THRSP"));
+            self.findings.borrow_mut().push(finding_text.to_string());
+            self.result
+        }
+    }
+
     struct StubToolSynthesizer<'a> {
         store: &'a ProjectStore,
         script_path: PathBuf,
@@ -3086,6 +3249,26 @@ runtime:
             "Literature support alone is below the decision margin.",
         );
         (path, store)
+    }
+
+    fn setup_auto_run_grounding_project(test_name: &str) -> (PathBuf, ProjectStore, String) {
+        let (path, store) = init_project(test_name);
+        let script = write_auto_run_marker_script(&path, false);
+        register_exploratory_marker_tool(&store, &script);
+        let artifact_id = import_expression_artifact(&store, &path);
+        approve_auto_run_marker_flow(&store, &artifact_id);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+        (path, store, hypothesis_id)
     }
 
     fn setup_keyword_relevance_project(test_name: &str) -> (PathBuf, ProjectStore) {
@@ -3484,6 +3667,163 @@ steps:
     }
 
     #[test]
+    fn output_grounding_mismatch_rejects_stance_assessment_as_apply_failure() {
+        let (path, store, _hypothesis_id) =
+            setup_auto_run_grounding_project("output-grounding-mismatch");
+        let grounding = StubOutputGroundingScorer::always(Some(false));
+
+        let report = store
+            .run_cycle_with_synth_grounded(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: true,
+                    flow: Some("auto_flow".to_string()),
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &NoopRelevanceScorer,
+                &NoopToolSynthesizer,
+                &grounding,
+            )
+            .unwrap();
+
+        assert!(report.applied.iter().any(|action| matches!(
+            action,
+            AppliedAction::StepRun {
+                observation_id: Some(_),
+                ..
+            }
+        )));
+        assert!(report.raised_decisions.is_empty());
+        assert!(report
+            .apply_failures
+            .iter()
+            .any(|failure| failure.reason.starts_with("output-domain-mismatch:")));
+        assert!(grounding
+            .findings()
+            .iter()
+            .any(|finding| finding.contains("Gene: THRSP")));
+        assert!(!report.to_json().contains("\"kind\":\"stance_assessment\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn output_grounding_match_and_noop_preserve_stance_assessment() {
+        for (suffix, grounding) in [
+            (
+                "match",
+                Box::new(StubOutputGroundingScorer::always(Some(true)))
+                    as Box<dyn OutputGroundingScorer>,
+            ),
+            (
+                "noop",
+                Box::new(NoopOutputGroundingScorer) as Box<dyn OutputGroundingScorer>,
+            ),
+        ] {
+            let (path, store, _hypothesis_id) =
+                setup_auto_run_grounding_project(&format!("output-grounding-{suffix}"));
+
+            let report = store
+                .run_cycle_with_synth_grounded(
+                    ApplyConfig {
+                        apply: true,
+                        auto_run: true,
+                        flow: Some("auto_flow".to_string()),
+                        max_apply: 5,
+                        propose_synth: false,
+                    },
+                    &NoopParamInferer,
+                    &NoopRelevanceScorer,
+                    &NoopToolSynthesizer,
+                    grounding.as_ref(),
+                )
+                .unwrap();
+
+            assert_eq!(report.raised_decisions.len(), 1);
+            assert_eq!(
+                report.raised_decisions[0].kind,
+                DecisionKind::StanceAssessment
+            );
+            assert!(!report
+                .apply_failures
+                .iter()
+                .any(|failure| failure.reason.starts_with("output-domain-mismatch:")));
+
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[test]
+    fn output_grounding_missing_artifact_text_falls_back_to_observation_summary() {
+        let (path, store) = init_project("output-grounding-summary-fallback");
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        let summaries = [
+            (
+                "observation_no_artifact",
+                None,
+                "Summary-only finding for THRSP when artifact id is absent",
+            ),
+            (
+                "observation_missing_artifact",
+                Some("artifact_missing"),
+                "Summary-only finding for THRSP when artifact body is unavailable",
+            ),
+        ];
+        for (observation_id, artifact_id, summary) in summaries {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO observations
+                     (id, flow_id, step_id, artifact_id, kind, severity, summary, payload_json, created_at)
+                     VALUES (?1, NULL, NULL, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        observation_id,
+                        artifact_id,
+                        "marker_report",
+                        "info",
+                        summary,
+                        "{}",
+                        now_unix_seconds()
+                    ],
+                )
+                .unwrap();
+        }
+        let grounding = StubOutputGroundingScorer::always(Some(true));
+        let mut apply_failures: Vec<ApplyFailure> = Vec::new();
+        let mut raised_decisions = Vec::new();
+
+        for (observation_id, _artifact_id, _summary) in summaries {
+            store
+                .raise_stance_assessment_for_observation(
+                    &hypothesis_id,
+                    "step_marker_deepen",
+                    observation_id,
+                    &grounding,
+                    &mut apply_failures,
+                    &mut raised_decisions,
+                )
+                .unwrap();
+        }
+
+        assert!(apply_failures.is_empty());
+        assert_eq!(raised_decisions.len(), 2);
+        assert_eq!(
+            grounding.findings(),
+            summaries
+                .into_iter()
+                .map(|(_observation_id, _artifact_id, summary)| summary.to_string())
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn apply_without_flow_auto_creates_flow_runs_step_and_raises_stance_assessment() {
         let (path, store) = init_project("auto-flow-runs-stance-assessment");
         let script = write_no_input_auto_run_marker_script(&path);
@@ -3747,15 +4087,19 @@ steps:
             .unwrap();
 
         let mut raised_decisions = Vec::new();
+        let mut apply_failures = Vec::new();
         store
             .raise_stance_assessment_for_observation(
                 &hypothesis_id,
                 "step_marker_deepen",
                 observation_id,
+                &NoopOutputGroundingScorer,
+                &mut apply_failures,
                 &mut raised_decisions,
             )
             .unwrap();
 
+        assert!(apply_failures.is_empty());
         assert!(raised_decisions.is_empty());
         assert_eq!(
             store

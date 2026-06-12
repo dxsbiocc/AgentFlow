@@ -3,8 +3,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentflow_core::agent::{
-    AppliedAction, ApplyConfig, CycleReport, EnrichedProposal, NoopParamInferer,
-    NoopRelevanceScorer, ParamInferer, RelevanceScorer, ToolSynthesisOutcome, ToolSynthesizer,
+    AppliedAction, ApplyConfig, CycleReport, EnrichedProposal, NoopOutputGroundingScorer,
+    NoopParamInferer, NoopRelevanceScorer, OutputGroundingScorer, ParamInferer, RelevanceScorer,
+    ToolSynthesisOutcome, ToolSynthesizer,
 };
 use agentflow_core::argument::{EvidenceLink, Stance, VerdictSummary, VerdictTag};
 use agentflow_core::branch::{
@@ -216,12 +217,17 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
             store: &store,
             synthesizer: &synthesizer,
         };
+        let grounding = LlmOutputGroundingScorer {
+            store: &store,
+            synthesizer: &synthesizer,
+        };
         let tool_synthesizer = LlmToolSynthesizer {
             store: &store,
             synthesizer: &synthesizer,
         };
         let noop_inferer = NoopParamInferer;
         let noop_scorer = NoopRelevanceScorer;
+        let noop_grounding = NoopOutputGroundingScorer;
         let inferer: &dyn ParamInferer = if options.infer_params {
             &inferer
         } else {
@@ -232,7 +238,18 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
         } else {
             &noop_scorer
         };
-        store.run_cycle_with_synth(config, inferer, scorer, &tool_synthesizer)?
+        let grounding: &dyn OutputGroundingScorer = if options.semantic_match {
+            &grounding
+        } else {
+            &noop_grounding
+        };
+        store.run_cycle_with_synth_grounded(
+            config,
+            inferer,
+            scorer,
+            &tool_synthesizer,
+            grounding,
+        )?
     } else {
         match (options.infer_params, options.semantic_match) {
             (true, true) => {
@@ -244,7 +261,11 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
                     store: &store,
                     synthesizer: &synthesizer,
                 };
-                store.run_cycle_with_scorer(config, &inferer, &scorer)?
+                let grounding = LlmOutputGroundingScorer {
+                    store: &store,
+                    synthesizer: &synthesizer,
+                };
+                store.run_cycle_with_scorer_grounded(config, &inferer, &scorer, &grounding)?
             }
             (true, false) => {
                 let inferer = LlmParamInferer {
@@ -258,7 +279,16 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
                     store: &store,
                     synthesizer: &synthesizer,
                 };
-                store.run_cycle_with_scorer(config, &NoopParamInferer, &scorer)?
+                let grounding = LlmOutputGroundingScorer {
+                    store: &store,
+                    synthesizer: &synthesizer,
+                };
+                store.run_cycle_with_scorer_grounded(
+                    config,
+                    &NoopParamInferer,
+                    &scorer,
+                    &grounding,
+                )?
             }
             (false, false) => store.run_cycle_with_apply_config(config)?,
         }
@@ -602,6 +632,25 @@ impl RelevanceScorer for LlmRelevanceScorer<'_> {
     }
 }
 
+struct LlmOutputGroundingScorer<'a> {
+    store: &'a ProjectStore,
+    synthesizer: &'a str,
+}
+
+impl OutputGroundingScorer for LlmOutputGroundingScorer<'_> {
+    fn grounds_hypothesis(&self, hypothesis_statement: &str, finding_text: &str) -> Option<bool> {
+        let prompt = output_grounding_prompt(hypothesis_statement, finding_text);
+        let candidate = synth_commands::run_project_synthesizer(
+            self.store.root_path(),
+            self.synthesizer,
+            &prompt,
+        )
+        .ok()?;
+        let stripped = synth_commands::strip_markdown_fence(&candidate);
+        parse_yes_no(&stripped)
+    }
+}
+
 struct LlmToolSynthesizer<'a> {
     store: &'a ProjectStore,
     synthesizer: &'a str,
@@ -663,6 +712,12 @@ fn param_inference_prompt(statement: &str, param_name: &str) -> String {
 fn relevance_prompt(statement: &str, tool_ref: &str, tool_description: &str) -> String {
     format!(
         "工具 <{tool_ref}>（描述：{tool_description}）的输出能否直接作为证据检验假设「{statement}」中陈述的具体结论，而不只是主题、疾病或基因相关？只答 yes/no。"
+    )
+}
+
+fn output_grounding_prompt(statement: &str, finding_text: &str) -> String {
+    format!(
+        "请判断该工具发现的领域/队列/疾病是否与假设一致，而不是仅主题相关。\n假设：{statement}\n发现：{finding_text}\n如果发现实际来自不同队列、疾病、癌种、物种或研究领域，请答 no；只有发现确实针对假设中的领域/队列/疾病时答 yes。只答 yes/no。"
     )
 }
 
@@ -2174,6 +2229,20 @@ EOF
         assert!(!old_behavior.infer_params);
         assert!(!old_behavior.semantic_match);
         assert!(!old_behavior.auto_forage);
+    }
+
+    #[test]
+    fn output_grounding_prompt_requires_domain_match_not_topical_similarity() {
+        let prompt = output_grounding_prompt(
+            "LUAD hypothesis for THRSP survival mechanism",
+            "report body: study: lihc; gene: THRSP",
+        );
+
+        assert!(prompt.contains("领域/队列/疾病"));
+        assert!(prompt.contains("而不是仅主题相关"));
+        assert!(prompt.contains("只答 yes/no"));
+        assert!(prompt.contains("LUAD hypothesis"));
+        assert!(prompt.contains("study: lihc"));
     }
 
     #[test]

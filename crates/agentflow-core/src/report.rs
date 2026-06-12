@@ -185,6 +185,9 @@ impl ProjectStore {
         }
         writeln!(&mut markdown).unwrap();
 
+        write_methods_and_tools(self, &mut markdown)?;
+        writeln!(&mut markdown).unwrap();
+
         writeln!(
             &mut markdown,
             "## Research notes ({})",
@@ -722,6 +725,77 @@ fn format_cross_modal_assessment(assessment: &CrossModalAssessment) -> String {
     }
 }
 
+fn write_methods_and_tools(
+    store: &ProjectStore,
+    markdown: &mut String,
+) -> Result<(), StorageError> {
+    let mut tools = store.list_tools()?;
+    tools.sort_by_key(|tool| tool.tool_ref());
+
+    writeln!(markdown, "## Methods & Tools ({})", tools.len()).unwrap();
+    writeln!(markdown).unwrap();
+
+    if tools.is_empty() {
+        writeln!(markdown, "- No tools registered.").unwrap();
+        return Ok(());
+    }
+
+    for tool in tools {
+        let tool_ref = tool.tool_ref();
+        let inspection = store.inspect_tool(&tool_ref)?;
+        let stored_spec = parse_methods_tool_spec(&inspection.spec_json).ok();
+        let description = stored_spec
+            .as_ref()
+            .map(|spec| spec.description.trim())
+            .filter(|description| !description.is_empty())
+            .unwrap_or("(no description)");
+        let runtime_command = stored_spec
+            .as_ref()
+            .map(|spec| spec.runtime_command.join(" "))
+            .unwrap_or_default();
+        let namespace = stored_spec
+            .as_ref()
+            .map(|spec| spec.namespace.as_str())
+            .unwrap_or(inspection.summary.namespace.as_str());
+        let provenance = if namespace == "synth" {
+            "自主合成工具(runtime-gate 已验证)；源码见 runtime 路径"
+        } else {
+            "预置/外部工具"
+        };
+
+        writeln!(
+            markdown,
+            "- `{}` [{}]: {}",
+            tool_ref, inspection.summary.maturity, description
+        )
+        .unwrap();
+        writeln!(markdown, "  - runtime: {runtime_command}").unwrap();
+        writeln!(markdown, "  - provenance: {provenance}").unwrap();
+    }
+
+    Ok(())
+}
+
+/// Minimal projection of a stored tool spec for the Methods & Tools report
+/// section. Named distinctly from the (private) canonical parser in
+/// `storage::tool_registry` to avoid grep-level ambiguity; only the fields the
+/// report renders are deserialized, tolerant of missing fields.
+#[derive(Debug, serde::Deserialize)]
+struct MethodsToolSpec {
+    #[serde(default)]
+    namespace: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    runtime_command: Vec<String>,
+}
+
+fn parse_methods_tool_spec(spec_json: &str) -> Result<MethodsToolSpec, StorageError> {
+    serde_json::from_str(spec_json).map_err(|err| {
+        StorageError::InvalidInput(format!("stored tool spec JSON is invalid: {err}"))
+    })
+}
+
 fn format_research_verdict(verdict: Option<&VerdictSummary>) -> String {
     verdict.map_or_else(
         || "(no verdict)".to_string(),
@@ -1064,8 +1138,85 @@ fi
         assert!(report.contains("No pending decision points."));
         assert!(report.contains("## Literature foraged (0)"));
         assert!(report.contains("No literature foraged."));
+        assert!(report.contains("## Methods & Tools (0)"));
+        assert!(report.contains("- No tools registered."));
         assert!(report.contains("## Research notes (0)"));
         assert!(report.contains("No research notes recorded."));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn generate_research_report_markdown_includes_methods_and_tools() {
+        let path = temp_project_path("research-methods-tools");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Research Methods")).unwrap();
+        register_tool(
+            &store,
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: marker_survival_scan
+version: 0.1.0
+maturity: wrapped
+description: Scan a candidate marker against survival table
+outputs:
+  marker_report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+    - marker
+"#
+            .to_string(),
+        );
+
+        let report = store.generate_research_report_markdown().unwrap();
+
+        assert!(report.contains("## Methods & Tools (1)"));
+        assert!(report.contains(
+            "- `marker/marker_survival_scan` [wrapped]: Scan a candidate marker against survival table"
+        ));
+        assert!(report.contains("  - runtime: /bin/echo marker"));
+        assert!(report.contains("  - provenance: 预置/外部工具"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn generate_research_report_markdown_marks_synth_tools_provenance() {
+        let path = temp_project_path("research-synth-tool-provenance");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Research Synth Tool")).unwrap();
+        register_tool(
+            &store,
+            r#"
+schema_version: agentflow.tool.v0
+namespace: synth
+name: synthesized_summary
+version: 0.1.0
+maturity: exploratory
+description: Summarize an intermediate analysis artifact
+outputs:
+  summary:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+    - synth
+"#
+            .to_string(),
+        );
+
+        let report = store.generate_research_report_markdown().unwrap();
+
+        assert!(report.contains("## Methods & Tools (1)"));
+        assert!(report.contains("`synth/synthesized_summary` [exploratory]"));
+        assert!(report.contains("  - runtime: /bin/echo synth"));
+        assert!(report
+            .contains("  - provenance: 自主合成工具(runtime-gate 已验证)；源码见 runtime 路径"));
 
         let _ = fs::remove_dir_all(path);
     }

@@ -1182,6 +1182,14 @@ fn format_applied_actions(actions: &[AppliedAction]) -> String {
             AppliedAction::LifecycleTransition { hypothesis_id, to } => {
                 format!("  lifecycle {} -> {}", hypothesis_id, to)
             }
+            AppliedAction::MechanismHypothesisSpawned {
+                parent_id,
+                child_id,
+                statement,
+            } => format!(
+                "  mechanism hypothesis {} spawned from {}: {}",
+                child_id, parent_id, statement
+            ),
             AppliedAction::GraphPatchApplied {
                 flow_id,
                 patch_id,

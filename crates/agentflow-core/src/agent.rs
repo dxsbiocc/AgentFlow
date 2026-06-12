@@ -9,12 +9,14 @@ use crate::argument::{
     recognized_citation, ArgumentEngine, EvidenceGrade, InconclusiveKind, RuleBasedEngine, Verdict,
     VerdictReport,
 };
-use crate::branch::{BranchAction, BranchDecision, BranchPolicy, ProposedStep, RuleBasedSelector};
+use crate::branch::{
+    BranchAction, BranchCandidate, BranchDecision, BranchPolicy, ProposedStep, RuleBasedSelector,
+};
 use crate::handoff::{
     Cost, DecisionKind, DecisionPoint, DefaultPolicy, HandoffOption, InterventionPolicy, Risk,
     StepContext,
 };
-use crate::hypothesis::HypothesisStatus;
+use crate::hypothesis::{HypothesisRequest, HypothesisStatus};
 use crate::storage::{
     validate_param_value, ArtifactSummary, EventRecord, FlowDraft, FlowStepDraft, ProjectStore,
     StorageError, ToolParamSpec,
@@ -28,6 +30,7 @@ const TOOL_SYNTHESIZED_EVENT: &str = "agent.tool_synthesized";
 const TOOL_GAP_HYPOTHESIS_MARKER: &str = "hypothesis_id = ";
 const STANCE_ASSESSMENT_OBSERVATION_MARKER: &str = "observation_id = ";
 const SOURCE_DISCOVERY_GAP_HYPOTHESIS_MARKER: &str = "source_gap_hypothesis_id = ";
+const MECHANISM_SPAWN_ORIGIN_PREFIX: &str = "mechanism-spawn:from:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -224,6 +227,11 @@ pub enum AppliedAction {
         hypothesis_id: String,
         to: String,
     },
+    MechanismHypothesisSpawned {
+        parent_id: String,
+        child_id: String,
+        statement: String,
+    },
     GraphPatchApplied {
         flow_id: String,
         patch_id: String,
@@ -380,6 +388,36 @@ impl ProjectStore {
         self.run_cycle_inner(config, inferer, scorer, synthesizer, true)
     }
 
+    fn maybe_spawn_mechanism_child(
+        &self,
+        candidate: &BranchCandidate,
+    ) -> Result<Option<(String, String)>, StorageError> {
+        let parent = self.inspect_hypothesis(&candidate.hypothesis_id)?;
+        if parent.origin.starts_with(MECHANISM_SPAWN_ORIGIN_PREFIX) {
+            return Ok(None);
+        }
+
+        let child_origin = format!("{MECHANISM_SPAWN_ORIGIN_PREFIX}{}", parent.id);
+        if self
+            .list_hypotheses()?
+            .into_iter()
+            .any(|hypothesis| hypothesis.origin == child_origin)
+        {
+            return Ok(None);
+        }
+
+        let statement = format!(
+            "机制探究：哪些分子机制可解释「{}」？需要哪些可直接检验该机制的证据？",
+            parent.statement.trim()
+        );
+        let child = self.record_hypothesis(HypothesisRequest {
+            statement,
+            origin: child_origin,
+            related_goal_id: parent.related_goal_id.clone(),
+        })?;
+        Ok(Some((child.id, child.statement)))
+    }
+
     fn run_cycle_inner(
         &self,
         config: ApplyConfig,
@@ -484,6 +522,17 @@ impl ProjectStore {
                     raised_decisions.push(point);
                 }
                 BranchAction::Deepen { .. } | BranchAction::Spawn { .. } => {
+                    if matches!(&decision.action, BranchAction::Spawn { .. }) {
+                        if let Some((child_id, statement)) =
+                            self.maybe_spawn_mechanism_child(&decision.candidate)?
+                        {
+                            applied.push(AppliedAction::MechanismHypothesisSpawned {
+                                parent_id: decision.candidate.hypothesis_id.clone(),
+                                child_id,
+                                statement,
+                            });
+                        }
+                    }
                     let (mut proposal, mut inferred_param_names) = self.enrich_branch_proposal(
                         decision,
                         &available_input_types,
@@ -2567,6 +2616,23 @@ mod tests {
             .unwrap();
     }
 
+    fn affirm_hypothesis(store: &ProjectStore, hypothesis_id: &str) {
+        link_evidence(
+            store,
+            hypothesis_id,
+            EvidenceGrade::Observed,
+            Stance::Supports,
+            "Observed support reaches the rule margin.",
+        );
+        store
+            .render_verdict(
+                hypothesis_id,
+                &crate::argument::RuleBasedEngine,
+                Some(gate()),
+            )
+            .unwrap();
+    }
+
     fn register_marker_tool(store: &ProjectStore) {
         let spec = ToolSpec::from_simple_yaml(
             r#"
@@ -4128,6 +4194,142 @@ steps:
             Some("analysis/marker_deepen")
         );
         assert_eq!(event_count(&store, "handoff.decision_point_raised"), 0);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn spawn_branch_creates_proposed_mechanism_child() {
+        let (path, store) = init_project("mechanism-spawn");
+        let statement = "Observed support should seed a mechanism question";
+        let hypothesis_id = record_hypothesis(&store, statement);
+        affirm_hypothesis(&store, &hypothesis_id);
+
+        let report = store.run_cycle().unwrap();
+
+        let (child_id, child_statement) = report
+            .applied
+            .iter()
+            .find_map(|action| match action {
+                AppliedAction::MechanismHypothesisSpawned {
+                    parent_id,
+                    child_id,
+                    statement,
+                } if parent_id == &hypothesis_id => Some((child_id.clone(), statement.clone())),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(
+            &report.branch_proposals[0].decision.action,
+            BranchAction::Spawn { .. }
+        ));
+        assert_eq!(report.outcome, CycleOutcome::HandedOff);
+        assert_eq!(report.branch_proposals.len(), 1);
+        assert_eq!(store.list_hypotheses().unwrap().len(), 2);
+
+        let child = store.inspect_hypothesis(&child_id).unwrap();
+        assert_eq!(child.status, HypothesisStatus::Proposed);
+        assert_eq!(child.related_goal_id, "goal_agent");
+        assert_eq!(
+            child.origin,
+            format!("{}{}", super::MECHANISM_SPAWN_ORIGIN_PREFIX, hypothesis_id)
+        );
+        assert_eq!(child.statement, child_statement);
+        assert!(child.statement.contains("机制探究"));
+        assert!(child.statement.contains(statement));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn mechanism_spawn_is_idempotent_per_parent_across_cycles() {
+        let (path, store) = init_project("mechanism-spawn-idempotent");
+        let hypothesis_id = record_hypothesis(&store, "Observed support should spawn once");
+        affirm_hypothesis(&store, &hypothesis_id);
+
+        let first = store.run_cycle().unwrap();
+        let second = store.run_cycle().unwrap();
+
+        assert!(first.applied.iter().any(|action| matches!(
+            action,
+            AppliedAction::MechanismHypothesisSpawned { parent_id, .. }
+                if parent_id == &hypothesis_id
+        )));
+        assert!(!second.applied.iter().any(|action| matches!(
+            action,
+            AppliedAction::MechanismHypothesisSpawned { parent_id, .. }
+                if parent_id == &hypothesis_id
+        )));
+        let child_origin = format!("{}{}", super::MECHANISM_SPAWN_ORIGIN_PREFIX, hypothesis_id);
+        let children = store
+            .list_hypotheses()
+            .unwrap()
+            .into_iter()
+            .filter(|hypothesis| hypothesis.origin == child_origin)
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 1);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn mechanism_spawn_child_does_not_spawn_grandchild() {
+        let (path, store) = init_project("mechanism-spawn-no-chain");
+        let hypothesis_id = record_hypothesis(&store, "Observed support should stop at one child");
+        affirm_hypothesis(&store, &hypothesis_id);
+        let first = store.run_cycle().unwrap();
+        let child_id = first
+            .applied
+            .iter()
+            .find_map(|action| match action {
+                AppliedAction::MechanismHypothesisSpawned { child_id, .. } => {
+                    Some(child_id.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+
+        affirm_hypothesis(&store, &child_id);
+        let second = store.run_cycle().unwrap();
+
+        assert!(!second.applied.iter().any(|action| matches!(
+            action,
+            AppliedAction::MechanismHypothesisSpawned { parent_id, .. }
+                if parent_id == &child_id
+        )));
+        let grandchild_origin = format!("{}{}", super::MECHANISM_SPAWN_ORIGIN_PREFIX, child_id);
+        assert!(store
+            .list_hypotheses()
+            .unwrap()
+            .iter()
+            .all(|hypothesis| hypothesis.origin.as_str() != grandchild_origin));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn deepen_branch_does_not_spawn_mechanism_child() {
+        let (path, store) = init_project("mechanism-spawn-deepen-none");
+        let hypothesis_id = record_hypothesis(&store, "Weak support needs deeper validation");
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+
+        let report = store.run_cycle().unwrap();
+
+        assert!(matches!(
+            &report.branch_proposals[0].decision.action,
+            BranchAction::Deepen { .. }
+        ));
+        assert!(report
+            .applied
+            .iter()
+            .all(|action| !matches!(action, AppliedAction::MechanismHypothesisSpawned { .. })));
+        assert_eq!(store.list_hypotheses().unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(path);
     }

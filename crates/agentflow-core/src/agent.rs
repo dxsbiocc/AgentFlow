@@ -5,7 +5,10 @@ use rusqlite::params;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 
-use crate::argument::{ArgumentEngine, InconclusiveKind, RuleBasedEngine, Verdict, VerdictReport};
+use crate::argument::{
+    recognized_citation, ArgumentEngine, EvidenceGrade, InconclusiveKind, RuleBasedEngine, Verdict,
+    VerdictReport,
+};
 use crate::branch::{BranchAction, BranchDecision, BranchPolicy, ProposedStep, RuleBasedSelector};
 use crate::handoff::{
     Cost, DecisionKind, DecisionPoint, DefaultPolicy, HandoffOption, InterventionPolicy, Risk,
@@ -1832,8 +1835,8 @@ fn strong_verdict_digest(preview: &VerdictReport) -> String {
         preview.hypothesis_id,
         verdict_label(&preview.verdict),
         preview.rationale,
-        evidence_ids(&preview.supporting),
-        evidence_ids(&preview.contradicting)
+        evidence_citations(&preview.supporting),
+        evidence_citations(&preview.contradicting)
     )
 }
 
@@ -2182,13 +2185,21 @@ fn verdict_label(verdict: &Verdict) -> &'static str {
     }
 }
 
-fn evidence_ids(evidence: &[crate::argument::EvidenceLink]) -> String {
+fn evidence_citations(evidence: &[crate::argument::EvidenceLink]) -> String {
     if evidence.is_empty() {
         "none".to_string()
     } else {
         evidence
             .iter()
-            .map(|link| link.id.as_str())
+            .map(|link| {
+                recognized_citation(link.source.as_deref()).unwrap_or_else(|| {
+                    if link.grade == EvidenceGrade::LiteratureSupported {
+                        "⚠未引用"
+                    } else {
+                        link.id.as_str()
+                    }
+                })
+            })
             .collect::<Vec<_>>()
             .join(",")
     }
@@ -2224,8 +2235,8 @@ mod tests {
     use rusqlite::params;
 
     use crate::argument::{
-        ArgumentEngine, EvidenceGrade, EvidenceLinkRequest, InconclusiveKind, RuleBasedEngine,
-        Stance, Verdict, VerdictTag,
+        ArgumentEngine, EvidenceGrade, EvidenceLink, EvidenceLinkRequest, InconclusiveKind,
+        RuleBasedEngine, Stance, Verdict, VerdictReport, VerdictTag,
     };
     use crate::branch::{
         BranchAction, BranchCandidate, BranchDecision, BranchPolicy, CandidateKind, ProposedStep,
@@ -2392,6 +2403,63 @@ mod tests {
             super::cycle_completed_payload_json(&report),
             "{\"checkpoint_id\":\"checkpoint_1\",\"provisional_verdict_count\":1,\"strong_candidate_count\":1,\"raised_decision_count\":0,\"branch_proposal_count\":1,\"outcome\":\"advanced\"}"
         );
+    }
+
+    #[test]
+    fn evidence_citations_prefers_verifiable_sources_and_marks_uncited_literature() {
+        let cited = EvidenceLink {
+            id: "literature_cited".to_string(),
+            hypothesis_id: "hypothesis_1".to_string(),
+            observation_id: None,
+            source: Some(" PMID:123 ".to_string()),
+            grade: EvidenceGrade::LiteratureSupported,
+            stance: Stance::Supports,
+            note: "Cited literature support".to_string(),
+            created_at: 1,
+        };
+        let uncited = EvidenceLink {
+            id: "literature_uncited".to_string(),
+            hypothesis_id: "hypothesis_1".to_string(),
+            observation_id: None,
+            source: Some("trust me".to_string()),
+            grade: EvidenceGrade::LiteratureSupported,
+            stance: Stance::Supports,
+            note: "Uncited literature support".to_string(),
+            created_at: 1,
+        };
+        let observed = EvidenceLink {
+            id: "observed_1".to_string(),
+            hypothesis_id: "hypothesis_1".to_string(),
+            observation_id: Some("observation_1".to_string()),
+            source: None,
+            grade: EvidenceGrade::Observed,
+            stance: Stance::Contradicts,
+            note: "Observed contradiction".to_string(),
+            created_at: 1,
+        };
+
+        assert_eq!(
+            super::evidence_citations(&[cited.clone(), uncited.clone(), observed.clone()]),
+            "PMID:123,⚠未引用,observed_1"
+        );
+        assert_eq!(super::evidence_citations(&[]), "none");
+
+        let digest = super::strong_verdict_digest(&VerdictReport {
+            hypothesis_id: "hypothesis_1".to_string(),
+            verdict: Verdict::Affirmed,
+            confidence: Confidence::High,
+            supporting: vec![cited, uncited],
+            contradicting: vec![EvidenceLink {
+                source: Some("DOI:10.test/against".to_string()),
+                ..observed
+            }],
+            rationale: "Strong but needs human gate".to_string(),
+        });
+
+        assert!(digest.contains("支持证据 PMID:123,⚠未引用"));
+        assert!(digest.contains("反证 DOI:10.test/against"));
+        assert!(!digest.contains("literature_cited"));
+        assert!(!digest.contains("literature_uncited"));
     }
 
     #[test]

@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use rusqlite::params;
 
 use crate::argument::{
-    cross_modal_corroboration, CrossModalAssessment, CrossModalStatus, EvidenceLink, Stance,
-    VerdictSummary, VerdictTag,
+    cross_modal_corroboration, recognized_citation, CrossModalAssessment, CrossModalStatus,
+    EvidenceGrade, EvidenceLink, Stance, VerdictSummary, VerdictTag,
 };
 use crate::handoff::DecisionStatus;
 use crate::storage::{
@@ -640,12 +640,20 @@ fn write_research_evidence_group(
         writeln!(markdown, "  - No {label} recorded.").unwrap();
     } else {
         for link in evidence {
+            let citation_warning = if link.grade == EvidenceGrade::LiteratureSupported
+                && recognized_citation(link.source.as_deref()).is_none()
+            {
+                " ⚠未引用"
+            } else {
+                ""
+            };
             writeln!(
                 markdown,
-                "  - [{}] {} - source: {}",
+                "  - [{}] {} - source: {}{}",
                 link.grade.as_str(),
                 link.note,
-                research_evidence_source(link)
+                research_evidence_source(link),
+                citation_warning
             )
             .unwrap();
             // Embed the actual finding (observation summary) so the report surfaces what
@@ -1125,6 +1133,54 @@ fi
         assert!(report.contains("[hypothesis] Mechanism remains speculative - source: -"));
         assert!(report
             .contains("- uncertainty: evidence below decision margin / needs stronger evidence"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn generate_research_report_markdown_marks_literature_supported_without_citation() {
+        let path = temp_project_path("uncited-literature");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Citation Audit")).unwrap();
+        let hypothesis = store
+            .record_hypothesis(HypothesisRequest {
+                statement: "Literature claims need auditable citation tokens".to_string(),
+                origin: "agent".to_string(),
+                related_goal_id: "goal_citation_audit".to_string(),
+            })
+            .unwrap();
+
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis.id.clone(),
+                observation_id: None,
+                source: None,
+                grade: EvidenceGrade::LiteratureSupported,
+                stance: Stance::Supports,
+                note: "Uncited literature support".to_string(),
+            })
+            .unwrap();
+        store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis.id,
+                observation_id: None,
+                source: Some("PMID:123".to_string()),
+                grade: EvidenceGrade::LiteratureSupported,
+                stance: Stance::Supports,
+                note: "Cited literature support".to_string(),
+            })
+            .unwrap();
+
+        let report = store.generate_research_report_markdown().unwrap();
+
+        assert!(report
+            .contains("[literature_supported] Uncited literature support - source: - ⚠未引用"));
+        assert!(
+            report.contains("[literature_supported] Cited literature support - source: PMID:123")
+        );
+        assert!(!report.contains(
+            "[literature_supported] Cited literature support - source: PMID:123 ⚠未引用"
+        ));
 
         let _ = fs::remove_dir_all(path);
     }

@@ -3,9 +3,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentflow_core::agent::{
-    AppliedAction, ApplyConfig, CycleReport, EnrichedProposal, NoopOutputGroundingScorer,
-    NoopParamInferer, NoopRelevanceScorer, OutputGroundingScorer, ParamInferer, RelevanceScorer,
-    ToolSynthesisOutcome, ToolSynthesizer,
+    AppliedAction, ApplyConfig, CycleReport, EnrichedProposal, GeneralizationCandidate,
+    NoopOutputGroundingScorer, NoopParamInferer, NoopRelevanceScorer, OutputGroundingScorer,
+    ParamInferer, RelevanceScorer, ToolSynthesisOutcome, ToolSynthesizer,
 };
 use agentflow_core::argument::{EvidenceLink, Stance, VerdictSummary, VerdictTag};
 use agentflow_core::branch::{
@@ -1176,7 +1176,7 @@ fn format_auto_forage_skipped(skipped: &[String]) -> String {
 }
 
 fn format_cycle_report(report: &CycleReport) -> String {
-    let base = format!(
+    let mut output = format!(
         "Agent cycle complete\nCheckpoint: {}\nProvisional verdicts: {}\nStrong candidates: {}\nRaised decisions: {}\nBranch proposals: {}\nOutcome: {}\nDecision points:\n{}\nBranch proposal details:\n{}",
         report.checkpoint_id,
         report.provisional_verdicts.len(),
@@ -1187,14 +1187,35 @@ fn format_cycle_report(report: &CycleReport) -> String {
         format_cycle_decision_summaries(&report.raised_decisions),
         format_cycle_branch_summaries(&report.branch_proposals)
     );
-    if report.applied.is_empty() {
-        base
-    } else {
-        format!(
-            "{base}\nApplied:\n{}",
-            format_applied_actions(&report.applied)
-        )
+    if !report.generalization_candidates.is_empty() {
+        output.push('\n');
+        output.push_str(&format_generalization_candidates(
+            &report.generalization_candidates,
+        ));
     }
+    if !report.applied.is_empty() {
+        output.push_str("\nApplied:\n");
+        output.push_str(&format_applied_actions(&report.applied));
+    }
+    output
+}
+
+fn format_generalization_candidates(candidates: &[GeneralizationCandidate]) -> String {
+    candidates
+        .iter()
+        .map(|candidate| {
+            let peers = if candidate.io_compatible_peers.is_empty() {
+                "无".to_string()
+            } else {
+                candidate.io_compatible_peers.join(", ")
+            };
+            format!(
+                "🔁 可泛化候选: {}(I/O 同签名 peers: {}) — 因 output-domain-mismatch；候选：参数化领域(cohort)以通用",
+                candidate.tool_ref, peers
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn format_cycle_decision_summaries(points: &[DecisionPoint]) -> String {
@@ -2086,6 +2107,39 @@ EOF
         assert!(json.contains(&hypothesis_id));
 
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn agent_run_human_output_surfaces_generalization_candidates() {
+        let report = CycleReport {
+            checkpoint_id: "checkpoint_candidate".to_string(),
+            provisional_verdicts: Vec::new(),
+            strong_candidates: Vec::new(),
+            raised_decisions: Vec::new(),
+            branch_proposals: Vec::new(),
+            applied: Vec::new(),
+            apply_failures: Vec::new(),
+            generalization_candidates: vec![agentflow_core::agent::GeneralizationCandidate {
+                tool_ref: "analysis/marker_deepen".to_string(),
+                hypothesis_id: "hypothesis_1".to_string(),
+                fingerprint: agentflow_core::agent::CapabilityFingerprint {
+                    output_types: vec!["Markdown".to_string()],
+                    required_input_types: Vec::new(),
+                },
+                io_compatible_peers: vec!["analysis/zz_generic_peer".to_string()],
+                evidence: "output-domain-mismatch: observation mismatch".to_string(),
+            }],
+            source_discoveries: Vec::new(),
+            outcome: agentflow_core::agent::CycleOutcome::Advanced,
+        };
+
+        let human = format_cycle_report(&report);
+
+        assert!(human.contains(
+            "🔁 可泛化候选: analysis/marker_deepen(I/O 同签名 peers: analysis/zz_generic_peer)"
+        ));
+        assert!(human.contains("因 output-domain-mismatch"));
+        assert!(human.contains("候选：参数化领域(cohort)以通用"));
     }
 
     #[test]

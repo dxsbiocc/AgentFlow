@@ -19,7 +19,7 @@ use crate::{last_value, CliError};
 
 pub(crate) const DEFAULT_SYNTHESIZER: &str = "claude -p";
 const SYNTH_VERSION: &str = "0.1.0";
-const VALIDATION_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const VALIDATION_TIMEOUT: Duration = Duration::from_secs(60);
 const CBIOPORTAL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 const SOURCE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 const CBIOPORTAL_API_BASE: &str = "https://www.cbioportal.org/api";
@@ -198,7 +198,7 @@ struct SynthOptions {
 }
 
 #[derive(Debug)]
-struct ValidationOutput {
+pub(crate) struct ValidationOutput {
     stdout: String,
     stderr: String,
     exit_code: Option<i32>,
@@ -209,6 +209,7 @@ struct ValidationOutput {
 #[derive(Debug, Clone, Copy)]
 struct SynthValidationInputs<'a> {
     gene: &'a str,
+    study: Option<&'a str>,
 }
 
 #[derive(Debug)]
@@ -589,6 +590,7 @@ fn validate_auto_synth_candidate(
         fixture_path,
         SynthValidationInputs {
             gene: PRIMARY_VALIDATION_GENE,
+            study: None,
         },
     )?;
     if !auto_synth_validation_passed(&fixture_validation, &candidate.expect) {
@@ -603,6 +605,7 @@ fn validate_auto_synth_candidate(
         alternate_fixture_path,
         SynthValidationInputs {
             gene: ALTERNATE_VALIDATION_GENE,
+            study: None,
         },
     )?;
     if !auto_synth_validation_passed(&alternate_validation, &candidate.expect) {
@@ -2196,6 +2199,7 @@ fn validate_candidate_script(
         fixture,
         SynthValidationInputs {
             gene: PRIMARY_VALIDATION_GENE,
+            study: None,
         },
     )
 }
@@ -2229,7 +2233,31 @@ fn validate_runtime_candidate_script(
         None,
         &workdir,
         VALIDATION_TIMEOUT,
-        SynthValidationInputs { gene: runtime_gene },
+        SynthValidationInputs {
+            gene: runtime_gene,
+            study: None,
+        },
+    );
+    let _ = fs::remove_dir_all(&workdir);
+    result
+}
+
+pub(crate) fn validate_runtime_script_with_domain_params(
+    script_path: &Path,
+    runtime_gene: &str,
+    runtime_study: Option<&str>,
+) -> Result<ValidationOutput, CliError> {
+    let workdir = isolated_workdir()?;
+    fs::create_dir_all(&workdir)?;
+    let result = run_python_script(
+        script_path,
+        None,
+        &workdir,
+        VALIDATION_TIMEOUT,
+        SynthValidationInputs {
+            gene: runtime_gene,
+            study: runtime_study,
+        },
     );
     let _ = fs::remove_dir_all(&workdir);
     result
@@ -2336,6 +2364,7 @@ fn python_command(script_path: &Path, workdir: &Path) -> (Command, PathBuf) {
         .env("PYTHONPATH", cbioportal_pythonpath_value())
         .env("AGENTFLOW_WORKDIR", workdir)
         .env("AGENTFLOW_OUTPUT_RESULT", &result_path)
+        .env("AGENTFLOW_OUTPUT_REPORT", &result_path)
         .current_dir(workdir);
     if sandboxed {
         // Under seatbelt, macOS proxy auto-detection (urllib -> SystemConfiguration
@@ -2354,6 +2383,9 @@ fn set_validation_domain_param_env(command: &mut Command, inputs: SynthValidatio
             continue;
         };
         command.env(synth_domain_param_env_name(param.name), value);
+    }
+    if let Some(study) = inputs.study {
+        command.env(synth_domain_param_env_name("study"), study);
     }
 }
 
@@ -2522,6 +2554,29 @@ fn validate_runtime_gate_behavior(
     alternate: &ValidationOutput,
     fixture_paths: &[&Path],
 ) -> Result<(), String> {
+    validate_runtime_output(runtime)?;
+
+    let runtime_output =
+        normalize_output_for_sensitivity(validation_result_text(runtime), fixture_paths);
+    let primary_output =
+        normalize_output_for_sensitivity(validation_result_text(primary), fixture_paths);
+    let alternate_output =
+        normalize_output_for_sensitivity(validation_result_text(alternate), fixture_paths);
+    if runtime_output == primary_output || runtime_output == alternate_output {
+        return Err(format!(
+            concat!(
+                "candidate failed runtime gate: output matched fixture smoke output, ",
+                "suggesting a default fallback; stdout={}, stderr={}"
+            ),
+            snippet(&runtime.stdout),
+            snippet(&runtime.stderr)
+        ));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_runtime_output(runtime: &ValidationOutput) -> Result<(), String> {
     if runtime.timed_out {
         return Err(format!(
             "candidate failed runtime gate: timed_out=true, stdout={}, stderr={}",
@@ -2546,23 +2601,6 @@ fn validate_runtime_gate_behavior(
         return Err("candidate failed runtime gate: exited 0 without output".to_string());
     }
 
-    let runtime_output =
-        normalize_output_for_sensitivity(validation_result_text(runtime), fixture_paths);
-    let primary_output =
-        normalize_output_for_sensitivity(validation_result_text(primary), fixture_paths);
-    let alternate_output =
-        normalize_output_for_sensitivity(validation_result_text(alternate), fixture_paths);
-    if runtime_output == primary_output || runtime_output == alternate_output {
-        return Err(format!(
-            concat!(
-                "candidate failed runtime gate: output matched fixture smoke output, ",
-                "suggesting a default fallback; stdout={}, stderr={}"
-            ),
-            snippet(&runtime.stdout),
-            snippet(&runtime.stderr)
-        ));
-    }
-
     Ok(())
 }
 
@@ -2572,6 +2610,10 @@ fn validation_result_text(validation: &ValidationOutput) -> &str {
         .as_deref()
         .filter(|output| !output.trim().is_empty())
         .unwrap_or(&validation.stdout)
+}
+
+pub(crate) fn validation_output_summary(validation: &ValidationOutput) -> String {
+    snippet(validation_result_text(validation))
 }
 
 fn normalize_fixture_for_comparison(value: &str) -> String {
@@ -3868,7 +3910,10 @@ print(result, end="")
             None,
             &path,
             Duration::from_secs(10),
-            SynthValidationInputs { gene: "TP53" },
+            SynthValidationInputs {
+                gene: "TP53",
+                study: None,
+            },
         )
         .unwrap();
 

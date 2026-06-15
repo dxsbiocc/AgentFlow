@@ -1,0 +1,30 @@
+schema_version: agentflow.tool.v0
+namespace: local
+name: survival_assoc
+version: 0.1.0
+maturity: wrapped
+description: Local survival association for a gene over imported expression and survival tables (median split, log-rank). Offline, no network.
+validator_profile: paired_expression_survival_v0
+inputs:
+  expression_table:
+    type: ExpressionTable
+    required: true
+    required_columns: sample
+  survival_table:
+    type: SurvivalTable
+    required: true
+params:
+  gene:
+    type: string
+    required: true
+outputs:
+  report:
+    type: Markdown
+    observer: marker_report
+    min_rows: 3
+runtime:
+  backend: local
+  command:
+    - /usr/bin/env
+    - python3
+    - local_survival_assoc.py

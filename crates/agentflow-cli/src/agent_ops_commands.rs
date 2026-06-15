@@ -711,16 +711,318 @@ struct LlmCohortInferer<'a> {
 
 impl CohortInferer for LlmCohortInferer<'_> {
     fn infer_cohort_study(&self, hypothesis_statement: &str) -> Option<String> {
-        let prompt = cohort_inference_prompt(hypothesis_statement);
-        let candidate = synth_commands::run_project_synthesizer(
-            self.store.root_path(),
-            self.synthesizer,
-            &prompt,
+        infer_grounded_cohort_study(
+            hypothesis_statement,
+            |url| {
+                synth_commands::fetch_cbioportal_json_with_python(
+                    url,
+                    synth_commands::CBIOPORTAL_DISCOVERY_TIMEOUT,
+                )
+            },
+            |prompt| {
+                synth_commands::run_project_synthesizer(
+                    self.store.root_path(),
+                    self.synthesizer,
+                    prompt,
+                )
+                .ok()
+            },
         )
-        .ok()?;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CbioportalStudy {
+    study_id: String,
+    name: String,
+    cancer_type_id: String,
+}
+
+const GROUNDED_COHORT_SHORTLIST_LIMIT: usize = 20;
+
+fn infer_grounded_cohort_study<F, S>(
+    hypothesis_statement: &str,
+    mut fetch_json: F,
+    mut synthesize: S,
+) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+    S: FnMut(&str) -> Option<String>,
+{
+    let api_base = synth_commands::CBIOPORTAL_API_BASE.trim_end_matches('/');
+    let Some(studies_json) = fetch_json(&format!("{api_base}/studies")) else {
+        return infer_cohort_study_with_llm(hypothesis_statement, &mut synthesize);
+    };
+    let studies = parse_cbioportal_studies(&studies_json);
+    let shortlist = shortlist_cbioportal_studies(hypothesis_statement, &studies);
+    if shortlist.is_empty() {
+        return None;
+    }
+
+    let prompt = grounded_cohort_inference_prompt(hypothesis_statement, &shortlist);
+    let selected_study_id = synthesize(&prompt).and_then(|candidate| {
         let stripped = synth_commands::strip_markdown_fence(&candidate);
         parse_optional_llm_value(&stripped)
+    });
+    if let Some(selected_study_id) = selected_study_id {
+        if shortlist
+            .iter()
+            .any(|study| study.study_id == selected_study_id)
+        {
+            return Some(selected_study_id);
+        }
     }
+
+    heuristic_best_cbioportal_study(&shortlist).map(|study| study.study_id.clone())
+}
+
+fn infer_cohort_study_with_llm<S>(hypothesis_statement: &str, synthesize: &mut S) -> Option<String>
+where
+    S: FnMut(&str) -> Option<String>,
+{
+    let prompt = cohort_inference_prompt(hypothesis_statement);
+    let candidate = synthesize(&prompt)?;
+    let stripped = synth_commands::strip_markdown_fence(&candidate);
+    parse_optional_llm_value(&stripped)
+}
+
+fn parse_cbioportal_studies(studies_json: &str) -> Vec<CbioportalStudy> {
+    synth_commands::parse_json_string_objects(studies_json)
+        .into_iter()
+        .filter_map(|study| {
+            Some(CbioportalStudy {
+                study_id: synth_commands::json_field(&study, "studyId")?
+                    .trim()
+                    .to_string(),
+                name: synth_commands::json_field(&study, "name")?
+                    .trim()
+                    .to_string(),
+                cancer_type_id: synth_commands::json_field(&study, "cancerTypeId")?
+                    .trim()
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+fn shortlist_cbioportal_studies(
+    hypothesis_statement: &str,
+    studies: &[CbioportalStudy],
+) -> Vec<CbioportalStudy> {
+    let keywords = cohort_keyword_terms(hypothesis_statement);
+    if keywords.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored = studies
+        .iter()
+        .filter_map(|study| {
+            let score = score_cbioportal_study_match(study, &keywords)?;
+            Some((study, score))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|(left_study, left_score), (right_study, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_study.study_id.cmp(&right_study.study_id))
+    });
+    scored
+        .into_iter()
+        .take(GROUNDED_COHORT_SHORTLIST_LIMIT)
+        .map(|(study, _)| study.clone())
+        .collect()
+}
+
+fn cohort_keyword_terms(statement: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for token in statement.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+        let token = token.trim();
+        let normalized = token.to_ascii_lowercase();
+        if is_cohort_keyword_candidate(token, &normalized) && !terms.contains(&normalized) {
+            terms.push(normalized);
+        }
+    }
+    terms
+}
+
+fn is_cohort_keyword_candidate(original: &str, normalized: &str) -> bool {
+    if !(2..=40).contains(&normalized.len()) {
+        return false;
+    }
+    if !normalized.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+        return false;
+    }
+    if COHORT_KEYWORD_STOPWORDS.contains(&normalized) {
+        return false;
+    }
+    if original.chars().all(|ch| ch.is_ascii_uppercase()) && normalized.len() > 10 {
+        return false;
+    }
+    true
+}
+
+const COHORT_KEYWORD_STOPWORDS: &[&str] = &[
+    "about",
+    "across",
+    "after",
+    "against",
+    "also",
+    "among",
+    "analysis",
+    "and",
+    "are",
+    "association",
+    "associated",
+    "between",
+    "can",
+    "case",
+    "cases",
+    "cancer",
+    "cohort",
+    "cohorts",
+    "correlate",
+    "correlated",
+    "correlates",
+    "correlation",
+    "data",
+    "dataset",
+    "datasets",
+    "disease",
+    "does",
+    "effect",
+    "expression",
+    "for",
+    "gene",
+    "genes",
+    "group",
+    "groups",
+    "has",
+    "have",
+    "high",
+    "hypothesis",
+    "impact",
+    "in",
+    "into",
+    "is",
+    "label",
+    "labels",
+    "low",
+    "marker",
+    "measurement",
+    "measurements",
+    "non",
+    "not",
+    "of",
+    "on",
+    "outcome",
+    "outcomes",
+    "overall",
+    "patient",
+    "patients",
+    "predict",
+    "predicts",
+    "prognosis",
+    "prognostic",
+    "related",
+    "response",
+    "samples",
+    "show",
+    "shows",
+    "study",
+    "survival",
+    "target",
+    "that",
+    "the",
+    "this",
+    "to",
+    "tumor",
+    "tumour",
+    "with",
+];
+
+fn score_cbioportal_study_match(study: &CbioportalStudy, keywords: &[String]) -> Option<i32> {
+    let study_id = study.study_id.to_ascii_lowercase();
+    let name = study.name.to_ascii_lowercase();
+    let cancer_type_id = study.cancer_type_id.to_ascii_lowercase();
+    let mut score = 0;
+    let mut matched = false;
+
+    for keyword in keywords {
+        if contains_cohort_keyword(&cancer_type_id, keyword) {
+            score += 45;
+            matched = true;
+        }
+        if contains_cohort_keyword(&study_id, keyword) {
+            score += 35;
+            matched = true;
+        }
+        if contains_cohort_keyword(&name, keyword) {
+            score += 20;
+            matched = true;
+        }
+    }
+
+    if !matched {
+        return None;
+    }
+    if study_id.contains("pan_can_atlas") || name.contains("pancancer atlas") {
+        score += 80;
+    }
+    if study_id.contains("tcga") {
+        score += 25;
+    }
+    Some(score)
+}
+
+fn contains_cohort_keyword(haystack: &str, keyword: &str) -> bool {
+    if keyword.chars().all(|ch| ch.is_ascii_alphanumeric()) && keyword.len() <= 4 {
+        contains_ascii_word(haystack, keyword)
+    } else {
+        haystack.contains(keyword)
+    }
+}
+
+fn contains_ascii_word(haystack: &str, needle: &str) -> bool {
+    let mut search_start = 0usize;
+    while let Some(relative_index) = haystack[search_start..].find(needle) {
+        let start = search_start + relative_index;
+        let end = start + needle.len();
+        let before = haystack[..start].chars().next_back();
+        let after = haystack[end..].chars().next();
+        let before_boundary = before.is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        let after_boundary = after.is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        if before_boundary && after_boundary {
+            return true;
+        }
+        search_start = end;
+    }
+    false
+}
+
+fn grounded_cohort_inference_prompt(statement: &str, shortlist: &[CbioportalStudy]) -> String {
+    let mut prompt = format!(
+        "Research hypothesis: \"{statement}\".\nChoose the single best cBioPortal studyId for the disease/cohort in this hypothesis from the shortlist below. Prefer TCGA PanCancer Atlas when appropriate (studyId contains pan_can_atlas). Reply with ONLY one exact studyId from the shortlist, or none.\nShortlist:\n"
+    );
+    for study in shortlist {
+        prompt.push_str(&format!(
+            "- studyId={} | name={}\n",
+            study.study_id,
+            study.name.replace('\n', " ")
+        ));
+    }
+    prompt
+}
+
+fn heuristic_best_cbioportal_study(shortlist: &[CbioportalStudy]) -> Option<&CbioportalStudy> {
+    shortlist
+        .iter()
+        .find(|study| study.study_id.contains("pan_can_atlas"))
+        .or_else(|| {
+            shortlist
+                .iter()
+                .find(|study| study.study_id.contains("tcga"))
+        })
+        .or_else(|| shortlist.first())
 }
 
 struct LlmToolSynthesizer<'a> {
@@ -2732,6 +3034,78 @@ steps:
         )
         .unwrap();
         format!("/bin/sh {}", stub_path.display())
+    }
+
+    fn cbioportal_studies_fixture() -> String {
+        r#"[
+          {"studyId":"stad_tcga_pan_can_atlas_2018","name":"Stomach Adenocarcinoma (TCGA, PanCancer Atlas)","cancerTypeId":"stad"},
+          {"studyId":"stad_tcga","name":"Stomach Adenocarcinoma (TCGA, Firehose Legacy)","cancerTypeId":"stad"},
+          {"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","cancerTypeId":"brca"},
+          {"studyId":"paad_public_2020","name":"Pancreatic Adenocarcinoma Public Cohort","cancerTypeId":"paad"}
+        ]"#
+        .to_string()
+    }
+
+    #[test]
+    fn grounded_cohort_inference_accepts_llm_selection_within_shortlist() {
+        let result = infer_grounded_cohort_study(
+            "GENE_STUB expression is associated with survival in stomach adenocarcinoma",
+            |_| Some(cbioportal_studies_fixture()),
+            |prompt| {
+                assert!(prompt.contains("stad_tcga_pan_can_atlas_2018"));
+                assert!(prompt.contains("stad_tcga"));
+                Some("stad_tcga".to_string())
+            },
+        );
+
+        assert_eq!(result.as_deref(), Some("stad_tcga"));
+    }
+
+    #[test]
+    fn grounded_cohort_inference_rejects_llm_answer_outside_shortlist() {
+        let result = infer_grounded_cohort_study(
+            "GENE_STUB expression is associated with survival in stomach adenocarcinoma",
+            |_| Some(cbioportal_studies_fixture()),
+            |_| Some("stad_tcga_malformed".to_string()),
+        );
+
+        assert_eq!(result.as_deref(), Some("stad_tcga_pan_can_atlas_2018"));
+    }
+
+    #[test]
+    fn grounded_cohort_inference_returns_none_when_keywords_have_no_matches() {
+        let result = infer_grounded_cohort_study(
+            "GENE_STUB expression is associated with survival in sarcoma",
+            |_| Some(cbioportal_studies_fixture()),
+            |_| panic!("shortlist is empty, so the LLM should not be called"),
+        );
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn grounded_cohort_inference_falls_back_to_legacy_llm_when_fetch_fails() {
+        let result = infer_grounded_cohort_study(
+            "GENE_STUB expression is associated with survival in stomach adenocarcinoma",
+            |_| None,
+            |prompt| {
+                assert!(prompt.contains("Infer the single best cBioPortal study id"));
+                Some("legacy_llm_guess".to_string())
+            },
+        );
+
+        assert_eq!(result.as_deref(), Some("legacy_llm_guess"));
+    }
+
+    #[test]
+    fn grounded_cohort_inference_prefers_pan_can_atlas_when_llm_does_not_select() {
+        let result = infer_grounded_cohort_study(
+            "GENE_STUB expression is associated with survival in stomach adenocarcinoma",
+            |_| Some(cbioportal_studies_fixture()),
+            |_| Some("none".to_string()),
+        );
+
+        assert_eq!(result.as_deref(), Some("stad_tcga_pan_can_atlas_2018"));
     }
 
     fn write_auto_synthesizer_stub(path: &Path) -> String {

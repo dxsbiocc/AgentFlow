@@ -20,9 +20,9 @@ use crate::{last_value, CliError};
 pub(crate) const DEFAULT_SYNTHESIZER: &str = "claude -p";
 const SYNTH_VERSION: &str = "0.1.0";
 pub(crate) const VALIDATION_TIMEOUT: Duration = Duration::from_secs(60);
-const CBIOPORTAL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const CBIOPORTAL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 const SOURCE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
-const CBIOPORTAL_API_BASE: &str = "https://www.cbioportal.org/api";
+pub(crate) const CBIOPORTAL_API_BASE: &str = "https://www.cbioportal.org/api";
 const CBIOPORTAL_CLIENT_RELATIVE_DIR: &str = "examples/tools";
 const MAX_AUTO_SYNTH_ATTEMPTS: usize = 3;
 const VALIDATION_PATH: &str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
@@ -178,7 +178,7 @@ const DEFAULT_SYNTH_DOMAIN_PARAMS: &[SynthDomainParam] = &[SynthDomainParam {
     required: true,
 }];
 
-type JsonObject = HashMap<String, String>;
+pub(crate) type JsonObject = HashMap<String, String>;
 
 #[derive(Debug, Clone, Copy)]
 struct SynthDomainParam {
@@ -1534,7 +1534,7 @@ fn score_cbioportal_sample_list(sample_list: &JsonObject, study_id: &str) -> Opt
     Some(score)
 }
 
-fn fetch_cbioportal_json_with_python(url: &str, timeout: Duration) -> Option<String> {
+pub(crate) fn fetch_cbioportal_json_with_python(url: &str, timeout: Duration) -> Option<String> {
     let mut command = Command::new("/usr/bin/env");
     command
         .arg("python3")
@@ -1603,7 +1603,7 @@ fn fetch_public_source_probe_with_python(url: &str, timeout: Duration) -> Option
     }
 }
 
-fn parse_json_string_objects(json: &str) -> Vec<JsonObject> {
+pub(crate) fn parse_json_string_objects(json: &str) -> Vec<JsonObject> {
     let mut objects = Vec::new();
     let mut in_string = false;
     let mut escaped = false;
@@ -1723,7 +1723,7 @@ fn skip_json_whitespace(value: &str, start: usize) -> usize {
         .unwrap_or(value.len())
 }
 
-fn json_field<'a>(object: &'a JsonObject, key: &str) -> Option<&'a str> {
+pub(crate) fn json_field<'a>(object: &'a JsonObject, key: &str) -> Option<&'a str> {
     object
         .get(key)
         .map(String::as_str)

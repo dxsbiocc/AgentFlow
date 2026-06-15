@@ -285,6 +285,21 @@ impl ApplyFailure {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityFingerprint {
+    pub output_types: Vec<String>,
+    pub required_input_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneralizationCandidate {
+    pub tool_ref: String,
+    pub hypothesis_id: String,
+    pub fingerprint: CapabilityFingerprint,
+    pub io_compatible_peers: Vec<String>,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceDiscoveryOutput {
     pub hypothesis_id: String,
     pub capability_need: String,
@@ -314,8 +329,15 @@ struct AppliedStepFinalization<'a> {
 struct ApplyCycleOutputs<'a> {
     applied: &'a mut Vec<AppliedAction>,
     apply_failures: &'a mut Vec<ApplyFailure>,
+    generalization_candidates: &'a mut Vec<GeneralizationCandidate>,
     raised_decisions: &'a mut Vec<DecisionPoint>,
     grounding: &'a dyn OutputGroundingScorer,
+}
+
+struct StanceAssessmentOutputs<'a> {
+    apply_failures: &'a mut Vec<ApplyFailure>,
+    generalization_candidates: &'a mut Vec<GeneralizationCandidate>,
+    raised_decisions: &'a mut Vec<DecisionPoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -329,6 +351,8 @@ pub struct CycleReport {
     pub applied: Vec<AppliedAction>,
     #[serde(default)]
     pub apply_failures: Vec<ApplyFailure>,
+    #[serde(default)]
+    pub generalization_candidates: Vec<GeneralizationCandidate>,
     #[serde(default)]
     pub source_discoveries: Vec<SourceDiscoveryOutput>,
     pub outcome: CycleOutcome,
@@ -348,6 +372,7 @@ impl Serialize for CycleReport {
         let field_count = 7
             + usize::from(!self.applied.is_empty())
             + usize::from(!self.apply_failures.is_empty())
+            + usize::from(!self.generalization_candidates.is_empty())
             + usize::from(!self.source_discoveries.is_empty());
         let mut state = serializer.serialize_struct("CycleReport", field_count)?;
         state.serialize_field("schema_version", "agentflow.agent_cycle.v0")?;
@@ -361,6 +386,9 @@ impl Serialize for CycleReport {
         }
         if !self.apply_failures.is_empty() {
             state.serialize_field("apply_failures", &self.apply_failures)?;
+        }
+        if !self.generalization_candidates.is_empty() {
+            state.serialize_field("generalization_candidates", &self.generalization_candidates)?;
         }
         if !self.source_discoveries.is_empty() {
             state.serialize_field("source_discoveries", &self.source_discoveries)?;
@@ -499,6 +527,7 @@ impl ProjectStore {
         let mut branch_proposals = Vec::new();
         let mut applied = Vec::new();
         let mut apply_failures = Vec::new();
+        let mut generalization_candidates = Vec::new();
         let mut source_discoveries = Vec::new();
 
         for hypothesis in self.list_hypotheses()? {
@@ -858,6 +887,8 @@ impl ProjectStore {
                                                     ApplyCycleOutputs {
                                                         applied: &mut applied,
                                                         apply_failures: &mut apply_failures,
+                                                        generalization_candidates:
+                                                            &mut generalization_candidates,
                                                         raised_decisions: &mut raised_decisions,
                                                         grounding,
                                                     },
@@ -904,6 +935,7 @@ impl ProjectStore {
             branch_proposals,
             applied,
             apply_failures,
+            generalization_candidates,
             source_discoveries,
             outcome,
         };
@@ -997,6 +1029,63 @@ fn fit_rank(fit: Fit) -> u8 {
         Fit::Medium => 2,
         Fit::Low => 1,
     }
+}
+
+impl ProjectStore {
+    pub fn capability_fingerprint(
+        &self,
+        tool_ref: &str,
+    ) -> Result<CapabilityFingerprint, StorageError> {
+        let inspection = self.inspect_tool(tool_ref)?;
+        capability_fingerprint_from_spec_json(&inspection.spec_json)
+    }
+}
+
+fn capability_fingerprint_from_spec_json(
+    spec_json: &str,
+) -> Result<CapabilityFingerprint, StorageError> {
+    let spec: serde_json::Value = serde_json::from_str(spec_json).map_err(|error| {
+        StorageError::InvalidInput(format!("stored tool spec JSON is invalid: {error}"))
+    })?;
+
+    let output_types = sorted_unique_string_values(spec.get("output_types"));
+    let mut required_input_types = BTreeSet::new();
+    let input_types = spec
+        .get("input_types")
+        .and_then(serde_json::Value::as_object);
+    if let Some(required_inputs) = spec
+        .get("required_inputs")
+        .and_then(serde_json::Value::as_array)
+    {
+        for input_name in required_inputs.iter().filter_map(serde_json::Value::as_str) {
+            if let Some(type_name) = input_types
+                .and_then(|types| types.get(input_name))
+                .and_then(serde_json::Value::as_str)
+            {
+                required_input_types.insert(type_name.to_string());
+            }
+        }
+    }
+
+    Ok(CapabilityFingerprint {
+        output_types,
+        required_input_types: required_input_types.into_iter().collect(),
+    })
+}
+
+fn sorted_unique_string_values(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(serde_json::Value::as_object)
+        .map(|object| {
+            object
+                .values()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl ProjectStore {
@@ -1377,8 +1466,11 @@ impl ProjectStore {
                 step_id,
                 observation_id,
                 outputs.grounding,
-                outputs.apply_failures,
-                outputs.raised_decisions,
+                StanceAssessmentOutputs {
+                    apply_failures: &mut *outputs.apply_failures,
+                    generalization_candidates: &mut *outputs.generalization_candidates,
+                    raised_decisions: &mut *outputs.raised_decisions,
+                },
             )?;
         }
 
@@ -1395,8 +1487,7 @@ impl ProjectStore {
         step_id: &str,
         observation_id: &str,
         grounding: &dyn OutputGroundingScorer,
-        apply_failures: &mut Vec<ApplyFailure>,
-        raised_decisions: &mut Vec<DecisionPoint>,
+        outputs: StanceAssessmentOutputs<'_>,
     ) -> Result<(), StorageError> {
         let pending_observations = self.pending_stance_assessment_observation_ids()?;
         if pending_observations.contains(observation_id) {
@@ -1411,10 +1502,20 @@ impl ProjectStore {
             observation.artifact_id.as_deref(),
         );
         if grounding.grounds_hypothesis(&hypothesis.statement, &finding_text) == Some(false) {
-            apply_failures.push(ApplyFailure {
+            let reason = output_domain_mismatch_reason(observation_id, &finding_text);
+            outputs.apply_failures.push(ApplyFailure {
                 hypothesis_id: hypothesis_id.to_string(),
-                reason: output_domain_mismatch_reason(observation_id, &finding_text),
+                reason: reason.clone(),
             });
+            if let Some(candidate) = generalization_candidate_for_mismatch(
+                self,
+                hypothesis_id,
+                observation.flow_id.as_deref(),
+                observation.step_id.as_deref(),
+                &reason,
+            ) {
+                outputs.generalization_candidates.push(candidate);
+            }
             return Ok(());
         }
 
@@ -1456,7 +1557,7 @@ impl ProjectStore {
             stance_assessment_options(hypothesis_id, observation_id),
             2,
         )?;
-        raised_decisions.push(point);
+        outputs.raised_decisions.push(point);
         Ok(())
     }
 
@@ -1679,6 +1780,67 @@ fn tool_synthesized_payload_from_json(
     serde_json::from_str(payload_json).map_err(|err| {
         StorageError::InvalidInput(format!("tool synthesized event has invalid payload: {err}"))
     })
+}
+
+fn generalization_candidate_for_mismatch(
+    store: &ProjectStore,
+    hypothesis_id: &str,
+    flow_id: Option<&str>,
+    step_id: Option<&str>,
+    evidence: &str,
+) -> Option<GeneralizationCandidate> {
+    let tool_ref = tool_ref_for_observation(store, flow_id, step_id)?;
+    let fingerprint = store.capability_fingerprint(&tool_ref).ok()?;
+    let peers = io_compatible_peers(store, &tool_ref, &fingerprint)?;
+    Some(GeneralizationCandidate {
+        tool_ref,
+        hypothesis_id: hypothesis_id.to_string(),
+        fingerprint,
+        io_compatible_peers: peers,
+        evidence: evidence.to_string(),
+    })
+}
+
+fn tool_ref_for_observation(
+    store: &ProjectStore,
+    flow_id: Option<&str>,
+    step_id: Option<&str>,
+) -> Option<String> {
+    if let Some(provenance) = store
+        .auto_synthesized_tool_for_observation(flow_id, step_id)
+        .ok()
+        .flatten()
+    {
+        return Some(provenance.tool_ref);
+    }
+
+    let flow_id = flow_id?;
+    let step_id = step_id?;
+    let flow = store.inspect_flow(flow_id).ok()?;
+    flow.steps
+        .into_iter()
+        .find(|step| step_ids_match(flow_id, step_id, &step.local_id))
+        .and_then(|step| step.tool_ref)
+}
+
+fn io_compatible_peers(
+    store: &ProjectStore,
+    tool_ref: &str,
+    fingerprint: &CapabilityFingerprint,
+) -> Option<Vec<String>> {
+    let mut peers = Vec::new();
+    for summary in store.list_tools().ok()? {
+        let peer_ref = summary.tool_ref();
+        if peer_ref == tool_ref {
+            continue;
+        }
+        if store.capability_fingerprint(&peer_ref).ok().as_ref() == Some(fingerprint) {
+            peers.push(peer_ref);
+        }
+    }
+    peers.sort();
+    peers.dedup();
+    Some(peers)
 }
 
 fn inferred_params_for_observation(
@@ -2433,8 +2595,8 @@ mod tests {
     use super::{
         proposal_keywords, AppliedAction, ApplyConfig, ApplyFailure, CycleOutcome,
         NoopOutputGroundingScorer, NoopParamInferer, NoopRelevanceScorer, NoopToolSynthesizer,
-        OutputGroundingScorer, ParamInferer, RelevanceScorer, ToolSynthesisOutcome,
-        ToolSynthesizer,
+        OutputGroundingScorer, ParamInferer, RelevanceScorer, StanceAssessmentOutputs,
+        ToolSynthesisOutcome, ToolSynthesizer,
     };
 
     fn temp_project_path(test_name: &str) -> PathBuf {
@@ -2553,6 +2715,7 @@ mod tests {
             branch_proposals: vec![proposal.clone()],
             applied: vec![step_run_without_observation.clone()],
             apply_failures: vec![failure.clone()],
+            generalization_candidates: Vec::new(),
             source_discoveries: Vec::new(),
             outcome: CycleOutcome::Advanced,
         };
@@ -2574,6 +2737,7 @@ mod tests {
             branch_proposals: Vec::new(),
             applied: Vec::new(),
             apply_failures: Vec::new(),
+            generalization_candidates: Vec::new(),
             source_discoveries: Vec::new(),
             outcome: CycleOutcome::Idle,
         };
@@ -2695,6 +2859,7 @@ mod tests {
         assert_eq!(report.branch_proposals.len(), 1);
         assert!(report.applied.is_empty());
         assert!(report.apply_failures.is_empty());
+        assert!(report.generalization_candidates.is_empty());
         assert_eq!(report.outcome, CycleOutcome::HandedOff);
         let step = report.branch_proposals[0].drafted_step.as_ref().unwrap();
         assert_eq!(
@@ -2947,6 +3112,96 @@ runtime:
   command:
     - /bin/sh
     - {command}
+"#
+        ))
+        .unwrap();
+        store.register_tool(spec).unwrap();
+    }
+
+    fn register_io_compatible_marker_peer(store: &ProjectStore) {
+        let spec = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: zz_generic_peer
+version: 0.1.0
+maturity: exploratory
+description: Auxiliary report generator
+outputs:
+  marker_report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap();
+        store.register_tool(spec).unwrap();
+    }
+
+    fn register_fingerprint_order_tool(store: &ProjectStore, name: &str, reversed: bool) {
+        let (inputs, outputs) = if reversed {
+            (
+                r#"
+inputs:
+  cohort:
+    type: CohortTable
+    required: true
+  expr_b:
+    type: ExpressionTable
+    required: true
+  expr_a:
+    type: ExpressionTable
+    required: true
+"#,
+                r#"
+outputs:
+  table:
+    type: ResultTable
+  report:
+    type: Markdown
+  details:
+    type: Markdown
+"#,
+            )
+        } else {
+            (
+                r#"
+inputs:
+  expr_a:
+    type: ExpressionTable
+    required: true
+  expr_b:
+    type: ExpressionTable
+    required: true
+  cohort:
+    type: CohortTable
+    required: true
+"#,
+                r#"
+outputs:
+  details:
+    type: Markdown
+  report:
+    type: Markdown
+  table:
+    type: ResultTable
+"#,
+            )
+        };
+        let spec = ToolSpec::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: {name}
+version: 0.1.0
+maturity: exploratory
+description: Fingerprint order fixture
+{inputs}{outputs}runtime:
+  backend: local
+  command:
+    - /bin/echo
 "#
         ))
         .unwrap();
@@ -3710,6 +3965,63 @@ steps:
     }
 
     #[test]
+    fn output_grounding_mismatch_surfaces_generalization_candidate_with_io_peers() {
+        let (path, store) = init_project("output-grounding-generalization-candidate");
+        let script = write_no_input_auto_run_marker_script(&path);
+        register_no_input_constrained_marker_tool(&store, &script);
+        register_io_compatible_marker_peer(&store);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is provisional.",
+        );
+        let grounding = StubOutputGroundingScorer::always(Some(false));
+
+        let report = store
+            .run_cycle_with_scorer_grounded(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: true,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &StubParamInferer,
+                &NoopRelevanceScorer,
+                &grounding,
+            )
+            .unwrap();
+
+        assert_eq!(report.generalization_candidates.len(), 1);
+        let candidate = &report.generalization_candidates[0];
+        assert_eq!(candidate.tool_ref, "analysis/marker_deepen");
+        assert_eq!(candidate.hypothesis_id, hypothesis_id);
+        assert_eq!(
+            candidate.fingerprint,
+            super::CapabilityFingerprint {
+                output_types: vec!["Markdown".to_string()],
+                required_input_types: Vec::new(),
+            }
+        );
+        assert_eq!(
+            candidate.io_compatible_peers,
+            vec!["analysis/zz_generic_peer".to_string()]
+        );
+        assert!(candidate.evidence.starts_with("output-domain-mismatch:"));
+        assert!(report
+            .to_json()
+            .contains("\"generalization_candidates\":[{"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn output_grounding_match_and_noop_preserve_stance_assessment() {
         for (suffix, grounding) in [
             (
@@ -3750,9 +4062,117 @@ steps:
                 .apply_failures
                 .iter()
                 .any(|failure| failure.reason.starts_with("output-domain-mismatch:")));
+            assert!(report.generalization_candidates.is_empty());
 
             let _ = std::fs::remove_dir_all(path);
         }
+    }
+
+    #[test]
+    fn capability_fingerprint_is_deterministic_and_order_insensitive() {
+        let (path, store) = init_project("capability-fingerprint-deterministic");
+        register_fingerprint_order_tool(&store, "fingerprint_a", false);
+        register_fingerprint_order_tool(&store, "fingerprint_b", true);
+
+        let first = store
+            .capability_fingerprint("analysis/fingerprint_a")
+            .unwrap();
+        let second = store
+            .capability_fingerprint("analysis/fingerprint_a")
+            .unwrap();
+        let reversed = store
+            .capability_fingerprint("analysis/fingerprint_b")
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first, reversed);
+        assert_eq!(
+            first,
+            super::CapabilityFingerprint {
+                output_types: vec!["Markdown".to_string(), "ResultTable".to_string()],
+                required_input_types: vec![
+                    "CohortTable".to_string(),
+                    "ExpressionTable".to_string()
+                ],
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn generalization_candidate_detection_tolerates_missing_tool_ref_and_inspect_failure() {
+        let (path_missing, store_missing) =
+            init_project("generalization-candidate-missing-tool-ref");
+        let hypothesis_id = record_hypothesis(
+            &store_missing,
+            "Marker THRSP evidence requires deeper pathway validation",
+        );
+        let artifact_id = import_expression_artifact(&store_missing, &path_missing);
+        let observation = store_missing.observe_artifact(&artifact_id).unwrap();
+        let grounding = StubOutputGroundingScorer::always(Some(false));
+        let mut apply_failures = Vec::new();
+        let mut raised_decisions = Vec::new();
+        let mut generalization_candidates = Vec::new();
+
+        store_missing
+            .raise_stance_assessment_for_observation(
+                &hypothesis_id,
+                "detached_step",
+                &observation.id,
+                &grounding,
+                StanceAssessmentOutputs {
+                    apply_failures: &mut apply_failures,
+                    generalization_candidates: &mut generalization_candidates,
+                    raised_decisions: &mut raised_decisions,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(apply_failures.len(), 1);
+        assert!(raised_decisions.is_empty());
+        assert!(generalization_candidates.is_empty());
+        let _ = std::fs::remove_dir_all(path_missing);
+
+        let (path_inspect, store_inspect, hypothesis_id) =
+            setup_auto_run_grounding_project("generalization-candidate-inspect-failure");
+        store_inspect.run_step_ref("step:auto_flow/seed").unwrap();
+        let observation_id = store_inspect
+            .list_observations()
+            .unwrap()
+            .last()
+            .unwrap()
+            .id
+            .clone();
+        store_inspect
+            .connection()
+            .execute(
+                "UPDATE steps SET tool_ref = ?1 WHERE flow_id = ?2 AND id = ?3",
+                rusqlite::params!["analysis/missing_tool", "auto_flow", "step:auto_flow/seed"],
+            )
+            .unwrap();
+        let mut apply_failures = Vec::new();
+        let mut raised_decisions = Vec::new();
+        let mut generalization_candidates = Vec::new();
+
+        store_inspect
+            .raise_stance_assessment_for_observation(
+                &hypothesis_id,
+                "seed",
+                &observation_id,
+                &grounding,
+                StanceAssessmentOutputs {
+                    apply_failures: &mut apply_failures,
+                    generalization_candidates: &mut generalization_candidates,
+                    raised_decisions: &mut raised_decisions,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(apply_failures.len(), 1);
+        assert!(raised_decisions.is_empty());
+        assert!(generalization_candidates.is_empty());
+        let _ = std::fs::remove_dir_all(path_inspect);
     }
 
     #[test]
@@ -3796,6 +4216,7 @@ steps:
         let grounding = StubOutputGroundingScorer::always(Some(true));
         let mut apply_failures: Vec<ApplyFailure> = Vec::new();
         let mut raised_decisions = Vec::new();
+        let mut generalization_candidates = Vec::new();
 
         for (observation_id, _artifact_id, _summary) in summaries {
             store
@@ -3804,13 +4225,17 @@ steps:
                     "step_marker_deepen",
                     observation_id,
                     &grounding,
-                    &mut apply_failures,
-                    &mut raised_decisions,
+                    StanceAssessmentOutputs {
+                        apply_failures: &mut apply_failures,
+                        generalization_candidates: &mut generalization_candidates,
+                        raised_decisions: &mut raised_decisions,
+                    },
                 )
                 .unwrap();
         }
 
         assert!(apply_failures.is_empty());
+        assert!(generalization_candidates.is_empty());
         assert_eq!(raised_decisions.len(), 2);
         assert_eq!(
             grounding.findings(),
@@ -4088,18 +4513,23 @@ steps:
 
         let mut raised_decisions = Vec::new();
         let mut apply_failures = Vec::new();
+        let mut generalization_candidates = Vec::new();
         store
             .raise_stance_assessment_for_observation(
                 &hypothesis_id,
                 "step_marker_deepen",
                 observation_id,
                 &NoopOutputGroundingScorer,
-                &mut apply_failures,
-                &mut raised_decisions,
+                StanceAssessmentOutputs {
+                    apply_failures: &mut apply_failures,
+                    generalization_candidates: &mut generalization_candidates,
+                    raised_decisions: &mut raised_decisions,
+                },
             )
             .unwrap();
 
         assert!(apply_failures.is_empty());
+        assert!(generalization_candidates.is_empty());
         assert!(raised_decisions.is_empty());
         assert_eq!(
             store

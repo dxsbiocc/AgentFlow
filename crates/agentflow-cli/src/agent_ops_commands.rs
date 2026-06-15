@@ -14,6 +14,7 @@ use agentflow_core::branch::{
 };
 use agentflow_core::forage::{AccessStatus, ForageObservation};
 use agentflow_core::handoff::{DecisionPoint, DecisionStatus};
+use agentflow_core::storage::ExecutableToolSpec;
 use agentflow_core::storage::ProjectStore;
 use agentflow_core::trace_guard::{Checkpoint, DriftReport, RevertRecord};
 
@@ -293,11 +294,51 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
             (false, false) => store.run_cycle_with_apply_config(config)?,
         }
     };
+    let generalization_validations = if report.generalization_candidates.is_empty() {
+        Vec::new()
+    } else {
+        let validation_gene_inferer = LlmParamInferer {
+            store: &store,
+            synthesizer: &synthesizer,
+        };
+        let validation_cohort_inferer = LlmCohortInferer {
+            store: &store,
+            synthesizer: &synthesizer,
+        };
+        let noop_gene_inferer = NoopParamInferer;
+        let noop_cohort_inferer = NoopCohortInferer;
+        let gene_inferer: &dyn ParamInferer = if options.infer_params {
+            &validation_gene_inferer
+        } else {
+            &noop_gene_inferer
+        };
+        let cohort_inferer: &dyn CohortInferer = if options.semantic_match {
+            &validation_cohort_inferer
+        } else {
+            &noop_cohort_inferer
+        };
+        let runtime_validator = PythonGeneralizationRuntimeValidator { store: &store };
+        generalization_validation_pass(
+            &store,
+            &report.generalization_candidates,
+            gene_inferer,
+            cohort_inferer,
+            &runtime_validator,
+        )
+    };
 
     if options.project.json {
-        Ok(format_agent_run_json(&report, auto_forage.as_ref()))
+        Ok(format_agent_run_json(
+            &report,
+            auto_forage.as_ref(),
+            &generalization_validations,
+        ))
     } else {
-        Ok(format_agent_run_human(&report, auto_forage.as_ref()))
+        Ok(format_agent_run_human(
+            &report,
+            auto_forage.as_ref(),
+            &generalization_validations,
+        ))
     }
 }
 
@@ -651,6 +692,37 @@ impl OutputGroundingScorer for LlmOutputGroundingScorer<'_> {
     }
 }
 
+trait CohortInferer {
+    fn infer_cohort_study(&self, hypothesis_statement: &str) -> Option<String>;
+}
+
+struct NoopCohortInferer;
+
+impl CohortInferer for NoopCohortInferer {
+    fn infer_cohort_study(&self, _hypothesis_statement: &str) -> Option<String> {
+        None
+    }
+}
+
+struct LlmCohortInferer<'a> {
+    store: &'a ProjectStore,
+    synthesizer: &'a str,
+}
+
+impl CohortInferer for LlmCohortInferer<'_> {
+    fn infer_cohort_study(&self, hypothesis_statement: &str) -> Option<String> {
+        let prompt = cohort_inference_prompt(hypothesis_statement);
+        let candidate = synth_commands::run_project_synthesizer(
+            self.store.root_path(),
+            self.synthesizer,
+            &prompt,
+        )
+        .ok()?;
+        let stripped = synth_commands::strip_markdown_fence(&candidate);
+        parse_optional_llm_value(&stripped)
+    }
+}
+
 struct LlmToolSynthesizer<'a> {
     store: &'a ProjectStore,
     synthesizer: &'a str,
@@ -721,8 +793,30 @@ fn output_grounding_prompt(statement: &str, finding_text: &str) -> String {
     )
 }
 
+fn cohort_inference_prompt(statement: &str) -> String {
+    format!(
+        "Research hypothesis: \"{statement}\".\nInfer the single best cBioPortal study id for the disease/cohort in this hypothesis. Reply with ONLY the study id. If the cohort is unclear, reply NONE."
+    )
+}
+
 fn first_non_empty_line(value: &str) -> Option<&str> {
     value.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn parse_optional_llm_value(value: &str) -> Option<String> {
+    let answer = first_non_empty_line(value)?;
+    let normalized = answer
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '.' | '。'))
+        .trim();
+    if normalized.is_empty()
+        || matches!(
+            normalized.to_ascii_lowercase().as_str(),
+            "none" | "null" | "unknown" | "unclear" | "n/a" | "no"
+        )
+    {
+        return None;
+    }
+    Some(normalized.to_string())
 }
 
 fn parse_yes_no(value: &str) -> Option<bool> {
@@ -735,6 +829,368 @@ fn parse_yes_no(value: &str) -> Option<bool> {
         "no" => Some(false),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeneralizationValidationVerdict {
+    Promotable,
+    Rejected,
+    Skipped,
+}
+
+impl GeneralizationValidationVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Promotable => "promotable",
+            Self::Rejected => "rejected",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneralizationValidation {
+    tool_ref: String,
+    hypothesis_id: String,
+    parameter: String,
+    verdict: GeneralizationValidationVerdict,
+    original_cohort: Option<String>,
+    inferred_cohort: Option<String>,
+    failure_cohort: Option<String>,
+    reason: String,
+    evidence: String,
+}
+
+impl GeneralizationValidation {
+    fn skipped(candidate: &GeneralizationCandidate, reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            tool_ref: candidate.tool_ref.clone(),
+            hypothesis_id: candidate.hypothesis_id.clone(),
+            parameter: "cohort".to_string(),
+            verdict: GeneralizationValidationVerdict::Skipped,
+            original_cohort: None,
+            inferred_cohort: None,
+            failure_cohort: None,
+            evidence: String::new(),
+            reason,
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"tool_ref\":\"{}\",",
+                "\"hypothesis_id\":\"{}\",",
+                "\"parameter\":\"{}\",",
+                "\"verdict\":\"{}\",",
+                "\"original_cohort\":{},",
+                "\"inferred_cohort\":{},",
+                "\"failure_cohort\":{},",
+                "\"reason\":\"{}\",",
+                "\"evidence\":\"{}\"",
+                "}}"
+            ),
+            escape_json(&self.tool_ref),
+            escape_json(&self.hypothesis_id),
+            escape_json(&self.parameter),
+            self.verdict.as_str(),
+            json_string_or_null(self.original_cohort.as_deref()),
+            json_string_or_null(self.inferred_cohort.as_deref()),
+            json_string_or_null(self.failure_cohort.as_deref()),
+            escape_json(&self.reason),
+            escape_json(&self.evidence)
+        )
+    }
+}
+
+fn json_string_or_null(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneralizationRuntimeEvidence {
+    summary: String,
+}
+
+trait GeneralizationRuntimeValidator {
+    fn validate_cohort(
+        &self,
+        tool: &ExecutableToolSpec,
+        gene: &str,
+        cohort: &str,
+    ) -> Result<GeneralizationRuntimeEvidence, String>;
+}
+
+struct PythonGeneralizationRuntimeValidator<'a> {
+    store: &'a ProjectStore,
+}
+
+impl GeneralizationRuntimeValidator for PythonGeneralizationRuntimeValidator<'_> {
+    fn validate_cohort(
+        &self,
+        tool: &ExecutableToolSpec,
+        gene: &str,
+        cohort: &str,
+    ) -> Result<GeneralizationRuntimeEvidence, String> {
+        let script_path = resolve_runtime_python_script(self.store.root_path(), tool)
+            .ok_or_else(|| "runtime Python script 未识别".to_string())?;
+        let output = synth_commands::validate_runtime_script_with_domain_params(
+            &script_path,
+            gene,
+            Some(cohort),
+        )
+        .map_err(|error| error.message())?;
+        synth_commands::validate_runtime_output(&output)?;
+        Ok(GeneralizationRuntimeEvidence {
+            summary: synth_commands::validation_output_summary(&output),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CohortVariationPoint {
+    original_cohort: String,
+}
+
+fn generalization_validation_pass(
+    store: &ProjectStore,
+    candidates: &[GeneralizationCandidate],
+    gene_inferer: &dyn ParamInferer,
+    cohort_inferer: &dyn CohortInferer,
+    runtime_validator: &dyn GeneralizationRuntimeValidator,
+) -> Vec<GeneralizationValidation> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            validate_generalization_candidate(
+                store,
+                candidate,
+                gene_inferer,
+                cohort_inferer,
+                runtime_validator,
+            )
+        })
+        .collect()
+}
+
+fn validate_generalization_candidate(
+    store: &ProjectStore,
+    candidate: &GeneralizationCandidate,
+    gene_inferer: &dyn ParamInferer,
+    cohort_inferer: &dyn CohortInferer,
+    runtime_validator: &dyn GeneralizationRuntimeValidator,
+) -> GeneralizationValidation {
+    let Ok(hypothesis) = store.inspect_hypothesis(&candidate.hypothesis_id) else {
+        return GeneralizationValidation::skipped(candidate, "hypothesis 未读取");
+    };
+    let Some(inferred_cohort) = cohort_inferer.infer_cohort_study(&hypothesis.statement) else {
+        return GeneralizationValidation::skipped(candidate, "cohort 未推断");
+    };
+    let Some(gene) = gene_inferer.infer(&hypothesis.statement, "gene") else {
+        let mut validation = GeneralizationValidation::skipped(candidate, "gene 未推断");
+        validation.inferred_cohort = Some(inferred_cohort);
+        return validation;
+    };
+    let Ok((tool, variation)) = identify_cohort_variation_point(store, candidate) else {
+        let mut validation = GeneralizationValidation::skipped(candidate, "变异点未识别");
+        validation.inferred_cohort = Some(inferred_cohort);
+        return validation;
+    };
+
+    match runtime_validator.validate_cohort(&tool, &gene, &variation.original_cohort) {
+        Ok(original_evidence) => {
+            match runtime_validator.validate_cohort(&tool, &gene, &inferred_cohort) {
+                Ok(inferred_evidence) => GeneralizationValidation {
+                    tool_ref: candidate.tool_ref.clone(),
+                    hypothesis_id: candidate.hypothesis_id.clone(),
+                    parameter: "cohort".to_string(),
+                    verdict: GeneralizationValidationVerdict::Promotable,
+                    original_cohort: Some(variation.original_cohort.clone()),
+                    inferred_cohort: Some(inferred_cohort.clone()),
+                    failure_cohort: None,
+                    reason: String::new(),
+                    evidence: format!(
+                        "{}✓ + {}✓ ({}; {})",
+                        variation.original_cohort,
+                        inferred_cohort,
+                        original_evidence.summary,
+                        inferred_evidence.summary
+                    ),
+                },
+                Err(reason) => GeneralizationValidation {
+                    tool_ref: candidate.tool_ref.clone(),
+                    hypothesis_id: candidate.hypothesis_id.clone(),
+                    parameter: "cohort".to_string(),
+                    verdict: GeneralizationValidationVerdict::Rejected,
+                    original_cohort: Some(variation.original_cohort),
+                    inferred_cohort: Some(inferred_cohort.clone()),
+                    failure_cohort: Some(inferred_cohort),
+                    reason,
+                    evidence: String::new(),
+                },
+            }
+        }
+        Err(reason) => GeneralizationValidation {
+            tool_ref: candidate.tool_ref.clone(),
+            hypothesis_id: candidate.hypothesis_id.clone(),
+            parameter: "cohort".to_string(),
+            verdict: GeneralizationValidationVerdict::Rejected,
+            original_cohort: Some(variation.original_cohort.clone()),
+            inferred_cohort: Some(inferred_cohort),
+            failure_cohort: Some(variation.original_cohort),
+            reason,
+            evidence: String::new(),
+        },
+    }
+}
+
+fn identify_cohort_variation_point(
+    store: &ProjectStore,
+    candidate: &GeneralizationCandidate,
+) -> Result<(ExecutableToolSpec, CohortVariationPoint), String> {
+    let tool = store
+        .executable_tool(&candidate.tool_ref)
+        .map_err(|_| "变异点未识别".to_string())?;
+    let inspection = store
+        .inspect_tool(&candidate.tool_ref)
+        .map_err(|_| "变异点未识别".to_string())?;
+    let script_text = resolve_runtime_python_script(store.root_path(), &tool)
+        .and_then(|path| std::fs::read_to_string(path).ok());
+    if !mentions_cohort_variation(&tool, &inspection.spec_json, script_text.as_deref()) {
+        return Err("变异点未识别".to_string());
+    }
+    let original_cohort =
+        infer_original_cohort(&inspection.spec_json, &tool, script_text.as_deref())
+            .ok_or_else(|| "变异点未识别".to_string())?;
+    Ok((tool, CohortVariationPoint { original_cohort }))
+}
+
+fn mentions_cohort_variation(
+    tool: &ExecutableToolSpec,
+    spec_json: &str,
+    script_text: Option<&str>,
+) -> bool {
+    tool.params
+        .keys()
+        .any(|name| is_cohort_param_name(name.as_str()))
+        || text_mentions_cohort(spec_json)
+        || text_mentions_cohort(&tool.runtime.command.join(" "))
+        || script_text.is_some_and(text_mentions_cohort)
+}
+
+fn is_cohort_param_name(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    normalized.contains("study") || normalized.contains("cohort")
+}
+
+fn text_mentions_cohort(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    normalized.contains("agentflow_param_study")
+        || normalized.contains("agentflow_param_cohort")
+        || normalized.contains("study")
+        || normalized.contains("cohort")
+}
+
+fn infer_original_cohort(
+    spec_json: &str,
+    tool: &ExecutableToolSpec,
+    script_text: Option<&str>,
+) -> Option<String> {
+    script_text
+        .and_then(original_cohort_from_text)
+        .or_else(|| original_cohort_from_text(spec_json))
+        .or_else(|| original_cohort_from_text(&tool.runtime.command.join(" ")))
+}
+
+fn original_cohort_from_text(text: &str) -> Option<String> {
+    const STUDY_ENV: &str = "AGENTFLOW_PARAM_STUDY";
+    for (index, _) in text.match_indices(STUDY_ENV) {
+        let tail = &text[index + STUDY_ENV.len()..];
+        let tail = tail
+            .strip_prefix('"')
+            .or_else(|| tail.strip_prefix('\''))
+            .unwrap_or(tail);
+        if let Some(value) = first_plausible_quoted_identifier(tail) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn first_plausible_quoted_identifier(input: &str) -> Option<String> {
+    let mut chars = input.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        if ch != '"' && ch != '\'' {
+            continue;
+        }
+        let quote = ch;
+        let mut value = String::new();
+        let mut escaped = false;
+        for (_, ch) in chars.by_ref() {
+            if escaped {
+                value.push(ch);
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == quote {
+                if is_plausible_cohort_identifier(&value) {
+                    return Some(value);
+                }
+                break;
+            }
+            value.push(ch);
+        }
+    }
+    None
+}
+
+fn is_plausible_cohort_identifier(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.len() < 2 || trimmed.len() > 128 {
+        return false;
+    }
+    if trimmed.starts_with("AGENTFLOW_") {
+        return false;
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "study" | "cohort") {
+        return false;
+    }
+    trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn resolve_runtime_python_script(
+    project_root: &Path,
+    tool: &ExecutableToolSpec,
+) -> Option<PathBuf> {
+    tool.runtime
+        .command
+        .iter()
+        .find(|arg| Path::new(arg).extension().is_some_and(|ext| ext == "py"))
+        .and_then(|arg| resolve_script_candidate(project_root, Path::new(arg)))
+}
+
+fn resolve_script_candidate(project_root: &Path, script: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if script.is_absolute() {
+        candidates.push(script.to_path_buf());
+    } else {
+        candidates.push(project_root.join(script));
+        candidates.push(project_root.join("examples").join("tools").join(script));
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        candidates.push(repo_root.join("examples").join("tools").join(script));
+    }
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 fn should_auto_forage(verdict: Option<&VerdictSummary>) -> bool {
@@ -1113,16 +1569,41 @@ fn forage_ingest_summary_json(observations: &[ForageObservation]) -> String {
     )
 }
 
-fn format_agent_run_json(report: &CycleReport, auto_forage: Option<&AutoForageSummary>) -> String {
+fn format_agent_run_json(
+    report: &CycleReport,
+    auto_forage: Option<&AutoForageSummary>,
+    generalization_validations: &[GeneralizationValidation],
+) -> String {
     let report_json = report.to_json();
-    let Some(auto_forage) = auto_forage else {
+    let mut extra_fields = Vec::new();
+    if let Some(auto_forage) = auto_forage {
+        extra_fields.push(format!(
+            "\"auto_forage\":{}",
+            auto_forage_summary_json(auto_forage)
+        ));
+    }
+    if !generalization_validations.is_empty() {
+        extra_fields.push(format!(
+            "\"generalization_validations\":{}",
+            generalization_validations_json(generalization_validations)
+        ));
+    }
+    if extra_fields.is_empty() {
         return report_json;
-    };
+    }
 
     let report_without_closing = report_json.strip_suffix('}').unwrap_or(&report_json);
+    format!("{report_without_closing},{}}}", extra_fields.join(","))
+}
+
+fn generalization_validations_json(validations: &[GeneralizationValidation]) -> String {
     format!(
-        "{report_without_closing},\"auto_forage\":{}}}",
-        auto_forage_summary_json(auto_forage)
+        "[{}]",
+        validations
+            .iter()
+            .map(GeneralizationValidation::to_json)
+            .collect::<Vec<_>>()
+            .join(",")
     )
 }
 
@@ -1145,8 +1626,13 @@ fn auto_forage_summary_json(summary: &AutoForageSummary) -> String {
     )
 }
 
-fn format_agent_run_human(report: &CycleReport, auto_forage: Option<&AutoForageSummary>) -> String {
-    let report = format_cycle_report(report);
+fn format_agent_run_human(
+    report: &CycleReport,
+    auto_forage: Option<&AutoForageSummary>,
+    generalization_validations: &[GeneralizationValidation],
+) -> String {
+    let report =
+        format_cycle_report_with_generalization_validations(report, generalization_validations);
     if let Some(summary) = auto_forage {
         format!("{}\n{report}", format_auto_forage_summary(summary))
     } else {
@@ -1200,6 +1686,20 @@ fn format_cycle_report(report: &CycleReport) -> String {
     output
 }
 
+fn format_cycle_report_with_generalization_validations(
+    report: &CycleReport,
+    generalization_validations: &[GeneralizationValidation],
+) -> String {
+    let mut output = format_cycle_report(report);
+    if !generalization_validations.is_empty() {
+        output.push('\n');
+        output.push_str(&format_generalization_validations(
+            generalization_validations,
+        ));
+    }
+    output
+}
+
 fn format_generalization_candidates(candidates: &[GeneralizationCandidate]) -> String {
     candidates
         .iter()
@@ -1213,6 +1713,32 @@ fn format_generalization_candidates(candidates: &[GeneralizationCandidate]) -> S
                 "🔁 可泛化候选: {}(I/O 同签名 peers: {}) — 因 output-domain-mismatch；候选：参数化领域(cohort)以通用",
                 candidate.tool_ref, peers
             )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_generalization_validations(validations: &[GeneralizationValidation]) -> String {
+    validations
+        .iter()
+        .map(|validation| match validation.verdict {
+            GeneralizationValidationVerdict::Promotable => format!(
+                "🧪 泛化验证: {} — cohort 参数化 [promotable: {}]",
+                validation.tool_ref, validation.evidence
+            ),
+            GeneralizationValidationVerdict::Rejected => format!(
+                "🧪 泛化验证: {} — cohort 参数化 [rejected: {} ✗ {}]",
+                validation.tool_ref,
+                validation
+                    .failure_cohort
+                    .as_deref()
+                    .unwrap_or("unknown cohort"),
+                validation.reason
+            ),
+            GeneralizationValidationVerdict::Skipped => format!(
+                "🧪 泛化验证: {} — cohort 参数化 [skipped: {}]",
+                validation.tool_ref, validation.reason
+            ),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1672,6 +2198,7 @@ fn stderr_summary(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::ffi::OsString;
 
     use super::*;
@@ -1960,6 +2487,205 @@ runtime:
         store.register_tool(spec).unwrap();
     }
 
+    fn register_study_runtime_tool(
+        store: &ProjectStore,
+        root: &Path,
+        original_cohort: &str,
+    ) -> String {
+        let script_path = root.join("study_runtime.py");
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"import os
+from pathlib import Path
+
+gene = os.environ.get("AGENTFLOW_PARAM_GENE")
+study = os.environ.get("AGENTFLOW_PARAM_STUDY", "{}")
+out = os.environ.get("AGENTFLOW_OUTPUT_RESULT") or os.environ.get("AGENTFLOW_OUTPUT_REPORT")
+if not gene or not out:
+    raise SystemExit("gene and out are required")
+Path(out).write_text(f"gene={{gene}}\nstudy={{study}}\n", encoding="utf-8")
+print(f"runtime ok {{gene}} {{study}}")
+"#,
+                original_cohort
+            ),
+        )
+        .unwrap();
+        let spec = ToolSpec::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: study_runtime
+version: 0.1.0
+maturity: exploratory
+description: Runtime report with a configurable study parameter
+params:
+  gene:
+    type: string
+    required: true
+  study:
+    type: string
+    required: false
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /usr/bin/env
+    - python3
+    - {}
+"#,
+            script_path.display()
+        ))
+        .unwrap();
+        store.register_tool(spec).unwrap();
+        "analysis/study_runtime".to_string()
+    }
+
+    fn register_non_study_runtime_tool(store: &ProjectStore) -> String {
+        let spec = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: generic_runtime
+version: 0.1.0
+maturity: exploratory
+description: Generic marker report
+params:
+  gene:
+    type: string
+    required: true
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap();
+        store.register_tool(spec).unwrap();
+        "analysis/generic_runtime".to_string()
+    }
+
+    fn generalization_candidate(tool_ref: &str, hypothesis_id: &str) -> GeneralizationCandidate {
+        GeneralizationCandidate {
+            tool_ref: tool_ref.to_string(),
+            hypothesis_id: hypothesis_id.to_string(),
+            fingerprint: agentflow_core::agent::CapabilityFingerprint {
+                output_types: vec!["Markdown".to_string()],
+                required_input_types: Vec::new(),
+            },
+            io_compatible_peers: Vec::new(),
+            evidence: "output-domain-mismatch: test fixture".to_string(),
+        }
+    }
+
+    fn cycle_report_with_generalization_candidate(
+        candidate: GeneralizationCandidate,
+    ) -> CycleReport {
+        CycleReport {
+            checkpoint_id: "checkpoint_candidate".to_string(),
+            provisional_verdicts: Vec::new(),
+            strong_candidates: Vec::new(),
+            raised_decisions: Vec::new(),
+            branch_proposals: Vec::new(),
+            applied: Vec::new(),
+            apply_failures: Vec::new(),
+            generalization_candidates: vec![candidate],
+            source_discoveries: Vec::new(),
+            outcome: agentflow_core::agent::CycleOutcome::Advanced,
+        }
+    }
+
+    struct StubGeneInferer {
+        gene: String,
+    }
+
+    impl StubGeneInferer {
+        fn new(gene: &str) -> Self {
+            Self {
+                gene: gene.to_string(),
+            }
+        }
+    }
+
+    impl ParamInferer for StubGeneInferer {
+        fn infer(&self, _hypothesis_statement: &str, param_name: &str) -> Option<String> {
+            (param_name == "gene").then(|| self.gene.clone())
+        }
+    }
+
+    struct StubCohortInferer {
+        study: Option<String>,
+    }
+
+    impl StubCohortInferer {
+        fn new(study: Option<&str>) -> Self {
+            Self {
+                study: study.map(ToOwned::to_owned),
+            }
+        }
+    }
+
+    impl CohortInferer for StubCohortInferer {
+        fn infer_cohort_study(&self, _hypothesis_statement: &str) -> Option<String> {
+            self.study.clone()
+        }
+    }
+
+    struct StubGeneralizationRuntimeValidator {
+        failing: Option<(String, String)>,
+        calls: RefCell<Vec<(String, String, String)>>,
+    }
+
+    impl StubGeneralizationRuntimeValidator {
+        fn passing() -> Self {
+            Self {
+                failing: None,
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn failing(cohort: &str, reason: &str) -> Self {
+            Self {
+                failing: Some((cohort.to_string(), reason.to_string())),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, String, String)> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl GeneralizationRuntimeValidator for StubGeneralizationRuntimeValidator {
+        fn validate_cohort(
+            &self,
+            tool: &ExecutableToolSpec,
+            gene: &str,
+            cohort: &str,
+        ) -> Result<GeneralizationRuntimeEvidence, String> {
+            self.calls.borrow_mut().push((
+                tool.tool_ref.clone(),
+                gene.to_string(),
+                cohort.to_string(),
+            ));
+            if self
+                .failing
+                .as_ref()
+                .is_some_and(|(failing_cohort, _)| failing_cohort == cohort)
+            {
+                return Err(self.failing.as_ref().unwrap().1.clone());
+            }
+            Ok(GeneralizationRuntimeEvidence {
+                summary: format!("{cohort} runtime gate ok"),
+            })
+        }
+    }
+
     fn approve_auto_run_marker_flow(store: &ProjectStore, artifact_id: &str) {
         store
             .approve_flow(
@@ -2140,6 +2866,199 @@ EOF
         ));
         assert!(human.contains("因 output-domain-mismatch"));
         assert!(human.contains("候选：参数化领域(cohort)以通用"));
+    }
+
+    #[test]
+    fn generalization_validation_promotes_when_original_and_inferred_cohorts_pass() {
+        let path = temp_project_path("generalization-validation-promotable");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis_with_statement(
+            &store,
+            "GENE_STUB expression is associated with survival in a target cohort",
+        );
+        let tool_ref = register_study_runtime_tool(&store, &path, "original_study_fixture");
+        let runtime = StubGeneralizationRuntimeValidator::passing();
+
+        let validations = generalization_validation_pass(
+            &store,
+            &[generalization_candidate(&tool_ref, &hypothesis_id)],
+            &StubGeneInferer::new("GENE_STUB"),
+            &StubCohortInferer::new(Some("inferred_study_fixture")),
+            &runtime,
+        );
+
+        assert_eq!(validations.len(), 1);
+        assert_eq!(
+            validations[0].verdict,
+            GeneralizationValidationVerdict::Promotable,
+            "{:?}",
+            validations[0]
+        );
+        assert_eq!(
+            validations[0].original_cohort.as_deref(),
+            Some("original_study_fixture")
+        );
+        assert_eq!(
+            validations[0].inferred_cohort.as_deref(),
+            Some("inferred_study_fixture")
+        );
+        assert!(validations[0].evidence.contains("original_study_fixture✓"));
+        assert!(validations[0].evidence.contains("inferred_study_fixture✓"));
+        assert_eq!(
+            runtime.calls(),
+            vec![
+                (
+                    tool_ref.clone(),
+                    "GENE_STUB".to_string(),
+                    "original_study_fixture".to_string()
+                ),
+                (
+                    tool_ref.clone(),
+                    "GENE_STUB".to_string(),
+                    "inferred_study_fixture".to_string()
+                ),
+            ]
+        );
+
+        let human = format_generalization_validations(&validations);
+        assert!(human.contains("🧪 泛化验证: analysis/study_runtime"));
+        assert!(human.contains("promotable: original_study_fixture✓ + inferred_study_fixture✓"));
+        let json = format_agent_run_json(
+            &cycle_report_with_generalization_candidate(generalization_candidate(
+                &tool_ref,
+                &hypothesis_id,
+            )),
+            None,
+            &validations,
+        );
+        assert!(json.contains("\"generalization_validations\":["));
+        assert!(json.contains("\"verdict\":\"promotable\""));
+        assert!(json.contains("\"original_cohort\":\"original_study_fixture\""));
+        assert!(json.contains("\"inferred_cohort\":\"inferred_study_fixture\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn generalization_validation_rejects_when_inferred_cohort_runtime_fails() {
+        let path = temp_project_path("generalization-validation-rejected");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis_with_statement(
+            &store,
+            "GENE_STUB expression is associated with survival in a target cohort",
+        );
+        let tool_ref = register_study_runtime_tool(&store, &path, "original_study_fixture");
+        let runtime = StubGeneralizationRuntimeValidator::failing(
+            "inferred_study_fixture",
+            "candidate failed runtime gate: field missing",
+        );
+
+        let validations = generalization_validation_pass(
+            &store,
+            &[generalization_candidate(&tool_ref, &hypothesis_id)],
+            &StubGeneInferer::new("GENE_STUB"),
+            &StubCohortInferer::new(Some("inferred_study_fixture")),
+            &runtime,
+        );
+
+        assert_eq!(
+            validations[0].verdict,
+            GeneralizationValidationVerdict::Rejected,
+            "{:?}",
+            validations[0]
+        );
+        assert_eq!(
+            validations[0].failure_cohort.as_deref(),
+            Some("inferred_study_fixture")
+        );
+        assert!(validations[0].reason.contains("field missing"));
+        assert!(format_generalization_validations(&validations)
+            .contains("rejected: inferred_study_fixture ✗ candidate failed runtime gate"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn generalization_validation_skips_when_cohort_is_not_inferred() {
+        let path = temp_project_path("generalization-validation-no-cohort");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis_with_statement(
+            &store,
+            "GENE_STUB expression is associated with survival in a target cohort",
+        );
+        let tool_ref = register_study_runtime_tool(&store, &path, "original_study_fixture");
+
+        let validations = generalization_validation_pass(
+            &store,
+            &[generalization_candidate(&tool_ref, &hypothesis_id)],
+            &StubGeneInferer::new("GENE_STUB"),
+            &StubCohortInferer::new(None),
+            &StubGeneralizationRuntimeValidator::passing(),
+        );
+
+        assert_eq!(
+            validations[0].verdict,
+            GeneralizationValidationVerdict::Skipped
+        );
+        assert_eq!(validations[0].reason, "cohort 未推断");
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn generalization_validation_skips_when_variation_point_is_not_identified() {
+        let path = temp_project_path("generalization-validation-no-variation");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis_with_statement(
+            &store,
+            "GENE_STUB expression is associated with survival in a target cohort",
+        );
+        let tool_ref = register_non_study_runtime_tool(&store);
+
+        let validations = generalization_validation_pass(
+            &store,
+            &[generalization_candidate(&tool_ref, &hypothesis_id)],
+            &StubGeneInferer::new("GENE_STUB"),
+            &StubCohortInferer::new(Some("inferred_study_fixture")),
+            &StubGeneralizationRuntimeValidator::passing(),
+        );
+
+        assert_eq!(
+            validations[0].verdict,
+            GeneralizationValidationVerdict::Skipped
+        );
+        assert_eq!(validations[0].reason, "变异点未识别");
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn noop_cohort_inferer_produces_skipped_validation_without_runtime_calls() {
+        let path = temp_project_path("generalization-validation-noop");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis_with_statement(
+            &store,
+            "GENE_STUB expression is associated with survival in a target cohort",
+        );
+        let tool_ref = register_study_runtime_tool(&store, &path, "original_study_fixture");
+        let runtime = StubGeneralizationRuntimeValidator::passing();
+
+        let validations = generalization_validation_pass(
+            &store,
+            &[generalization_candidate(&tool_ref, &hypothesis_id)],
+            &StubGeneInferer::new("GENE_STUB"),
+            &NoopCohortInferer,
+            &runtime,
+        );
+
+        assert_eq!(
+            validations[0].verdict,
+            GeneralizationValidationVerdict::Skipped
+        );
+        assert_eq!(validations[0].reason, "cohort 未推断");
+        assert!(runtime.calls().is_empty());
+
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]

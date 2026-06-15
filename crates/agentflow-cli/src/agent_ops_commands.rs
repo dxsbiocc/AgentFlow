@@ -739,6 +739,8 @@ struct CbioportalStudy {
 }
 
 const GROUNDED_COHORT_SHORTLIST_LIMIT: usize = 20;
+const PAN_CAN_ATLAS_STUDY_ID_FRAGMENT: &str = "pan_can_atlas";
+const PAN_CAN_ATLAS_SCORE_BONUS: i32 = 10_000;
 
 fn infer_grounded_cohort_study<F, S>(
     hypothesis_statement: &str,
@@ -759,13 +761,24 @@ where
         return None;
     }
 
-    let prompt = grounded_cohort_inference_prompt(hypothesis_statement, &shortlist);
+    let pan_can_subset = shortlist
+        .iter()
+        .filter(|study| is_pan_can_atlas_study_id(&study.study_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let selection_shortlist = if pan_can_subset.is_empty() {
+        &shortlist
+    } else {
+        &pan_can_subset
+    };
+
+    let prompt = grounded_cohort_inference_prompt(hypothesis_statement, selection_shortlist);
     let selected_study_id = synthesize(&prompt).and_then(|candidate| {
         let stripped = synth_commands::strip_markdown_fence(&candidate);
         parse_optional_llm_value(&stripped)
     });
     if let Some(selected_study_id) = selected_study_id {
-        if shortlist
+        if selection_shortlist
             .iter()
             .any(|study| study.study_id == selected_study_id)
         {
@@ -773,7 +786,7 @@ where
         }
     }
 
-    heuristic_best_cbioportal_study(&shortlist).map(|study| study.study_id.clone())
+    heuristic_best_cbioportal_study(selection_shortlist).map(|study| study.study_id.clone())
 }
 
 fn infer_cohort_study_with_llm<S>(hypothesis_statement: &str, synthesize: &mut S) -> Option<String>
@@ -822,9 +835,13 @@ fn shortlist_cbioportal_studies(
         })
         .collect::<Vec<_>>();
     scored.sort_by(|(left_study, left_score), (right_study, right_score)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left_study.study_id.cmp(&right_study.study_id))
+        is_pan_can_atlas_study_id(&right_study.study_id)
+            .cmp(&is_pan_can_atlas_study_id(&left_study.study_id))
+            .then_with(|| {
+                right_score
+                    .cmp(left_score)
+                    .then_with(|| left_study.study_id.cmp(&right_study.study_id))
+            })
     });
     scored
         .into_iter()
@@ -965,13 +982,17 @@ fn score_cbioportal_study_match(study: &CbioportalStudy, keywords: &[String]) ->
     if !matched {
         return None;
     }
-    if study_id.contains("pan_can_atlas") || name.contains("pancancer atlas") {
-        score += 80;
+    if is_pan_can_atlas_study_id(&study_id) || name.contains("pancancer atlas") {
+        score += PAN_CAN_ATLAS_SCORE_BONUS;
     }
     if study_id.contains("tcga") {
         score += 25;
     }
     Some(score)
+}
+
+fn is_pan_can_atlas_study_id(study_id: &str) -> bool {
+    study_id.contains(PAN_CAN_ATLAS_STUDY_ID_FRAGMENT)
 }
 
 fn contains_cohort_keyword(haystack: &str, keyword: &str) -> bool {
@@ -1016,7 +1037,7 @@ fn grounded_cohort_inference_prompt(statement: &str, shortlist: &[CbioportalStud
 fn heuristic_best_cbioportal_study(shortlist: &[CbioportalStudy]) -> Option<&CbioportalStudy> {
     shortlist
         .iter()
-        .find(|study| study.study_id.contains("pan_can_atlas"))
+        .find(|study| is_pan_can_atlas_study_id(&study.study_id))
         .or_else(|| {
             shortlist
                 .iter()
@@ -3047,18 +3068,74 @@ steps:
     }
 
     #[test]
-    fn grounded_cohort_inference_accepts_llm_selection_within_shortlist() {
+    fn grounded_cohort_inference_prefers_pan_can_atlas_over_legacy_llm_selection() {
         let result = infer_grounded_cohort_study(
-            "GENE_STUB expression is associated with survival in stomach adenocarcinoma",
-            |_| Some(cbioportal_studies_fixture()),
+            "GENE_STUB expression is associated with survival in breast invasive carcinoma",
+            |_| {
+                Some(
+                    r#"[
+                      {"studyId":"brca_tcga","name":"Breast Invasive Carcinoma (TCGA, Firehose Legacy)","cancerTypeId":"brca"},
+                      {"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Invasive Carcinoma (TCGA, PanCancer Atlas)","cancerTypeId":"brca"}
+                    ]"#
+                    .to_string(),
+                )
+            },
             |prompt| {
-                assert!(prompt.contains("stad_tcga_pan_can_atlas_2018"));
-                assert!(prompt.contains("stad_tcga"));
-                Some("stad_tcga".to_string())
+                assert!(prompt.contains("brca_tcga_pan_can_atlas_2018"));
+                assert!(!prompt.contains("studyId=brca_tcga |"));
+                Some("brca_tcga".to_string())
             },
         );
 
-        assert_eq!(result.as_deref(), Some("stad_tcga"));
+        assert_eq!(result.as_deref(), Some("brca_tcga_pan_can_atlas_2018"));
+    }
+
+    #[test]
+    fn grounded_cohort_inference_accepts_llm_selection_within_pan_can_subset() {
+        let result = infer_grounded_cohort_study(
+            "GENE_STUB expression is associated with survival in breast carcinoma",
+            |_| {
+                Some(
+                    r#"[
+                      {"studyId":"brca_tcga","name":"Breast Carcinoma (TCGA, Firehose Legacy)","cancerTypeId":"brca"},
+                      {"studyId":"brca_tcga_pan_can_atlas_2018","name":"Breast Carcinoma (TCGA, PanCancer Atlas)","cancerTypeId":"brca"},
+                      {"studyId":"brca_tcga_pan_can_atlas_2020","name":"Breast Carcinoma Follow-up (TCGA, PanCancer Atlas)","cancerTypeId":"brca"}
+                    ]"#
+                    .to_string(),
+                )
+            },
+            |prompt| {
+                assert!(prompt.contains("brca_tcga_pan_can_atlas_2018"));
+                assert!(prompt.contains("brca_tcga_pan_can_atlas_2020"));
+                assert!(!prompt.contains("studyId=brca_tcga |"));
+                Some("brca_tcga_pan_can_atlas_2020".to_string())
+            },
+        );
+
+        assert_eq!(result.as_deref(), Some("brca_tcga_pan_can_atlas_2020"));
+    }
+
+    #[test]
+    fn grounded_cohort_inference_accepts_legacy_llm_selection_when_no_pan_can_atlas_matches() {
+        let result = infer_grounded_cohort_study(
+            "GENE_STUB expression is associated with survival in breast carcinoma",
+            |_| {
+                Some(
+                    r#"[
+                      {"studyId":"brca_tcga","name":"Breast Carcinoma (TCGA, Firehose Legacy)","cancerTypeId":"brca"},
+                      {"studyId":"brca_msk_2020","name":"Breast Carcinoma Public Cohort","cancerTypeId":"brca"}
+                    ]"#
+                    .to_string(),
+                )
+            },
+            |prompt| {
+                assert!(prompt.contains("brca_tcga"));
+                assert!(prompt.contains("brca_msk_2020"));
+                Some("brca_tcga".to_string())
+            },
+        );
+
+        assert_eq!(result.as_deref(), Some("brca_tcga"));
     }
 
     #[test]
@@ -3070,6 +3147,32 @@ steps:
         );
 
         assert_eq!(result.as_deref(), Some("stad_tcga_pan_can_atlas_2018"));
+    }
+
+    #[test]
+    fn cbioportal_shortlist_keeps_pan_can_atlas_when_cap_would_drop_late_id() {
+        let mut studies = (0..GROUNDED_COHORT_SHORTLIST_LIMIT)
+            .map(|index| CbioportalStudy {
+                study_id: format!("brca_breast_carcinoma_metastatic_tcga_{index:02}"),
+                name: "Breast carcinoma metastatic ductal TCGA cohort".to_string(),
+                cancer_type_id: "brca".to_string(),
+            })
+            .collect::<Vec<_>>();
+        studies.push(CbioportalStudy {
+            study_id: "zzzz_brca_tcga_pan_can_atlas_2018".to_string(),
+            name: "TCGA PanCancer Atlas".to_string(),
+            cancer_type_id: "brca".to_string(),
+        });
+
+        let shortlist = shortlist_cbioportal_studies(
+            "GENE_STUB expression in breast carcinoma metastatic ductal brca",
+            &studies,
+        );
+
+        assert_eq!(shortlist.len(), GROUNDED_COHORT_SHORTLIST_LIMIT);
+        assert!(shortlist
+            .iter()
+            .any(|study| study.study_id == "zzzz_brca_tcga_pan_can_atlas_2018"));
     }
 
     #[test]

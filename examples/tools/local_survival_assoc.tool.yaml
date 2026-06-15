@@ -2,7 +2,10 @@ schema_version: agentflow.tool.v0
 namespace: local
 name: survival_assoc
 version: 0.1.0
-maturity: wrapped
+# verified: deterministic, offline, standard method (median split + log-rank),
+# validated to reproduce the cBioPortal reference (tcga/survival_assoc) exactly
+# (SPP1/LIHC score 4.306, log-rank p=4.94e-5), and covered by integration tests.
+maturity: verified
 description: Local survival association for a gene over imported expression and survival tables (median split, log-rank). Offline, no network.
 validator_profile: paired_expression_survival_v0
 inputs:

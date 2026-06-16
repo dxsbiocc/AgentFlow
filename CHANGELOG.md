@@ -1,11 +1,15 @@
 # Changelog
 
 All notable changes to AgentFlow are documented here. The format is based on
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project is a
-pre-1.0 technical preview; until a tagged release, everything lands under
-**Unreleased**.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
+to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). This is a pre-1.0
+technical preview; the public API and CLI surface may change between minor versions.
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-06-16
+
+First tagged technical-preview release.
 
 ### Added — Tool Evolution Engine (full loop)
 

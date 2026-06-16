@@ -64,8 +64,16 @@ three issues that defeated controls claimed to hold — all now fixed:
   `64:ff9b::/96` bypassed the private-IP classifiers via a hostile DNS AAAA answer.
   All three Python classifiers now unwrap mapped/NAT64 addresses.
 
-Lower-severity hardening items are tracked as follow-ups (#57 resource-exhaustion
-caps, #58 artifact reference mode, #59 runtime-tool egress guard).
+Lower-severity hardening follow-ups are also fixed:
+
+- **#57 resource-exhaustion caps:** named byte caps on artifact/result/YAML reads
+  and truncated stdout/stderr capture, returning a clear error instead of
+  exhausting memory.
+- **#58 artifact reference safety:** reference-mode imports resolving outside the
+  project root are rejected by default (opt-in via `--allow-external-reference`);
+  list/inspect no longer leak full host paths.
+- **#59 runtime-tool egress guard:** registered `synth`-namespace tools now run
+  under the same cooperative egress guard applied at validation time.
 
 ### Changed
 

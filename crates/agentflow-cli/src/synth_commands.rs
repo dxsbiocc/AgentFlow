@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
+use std::io::{self, Read};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -13,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::os::unix::process::CommandExt;
 
 use agentflow_core::domain::ToolMaturity;
+use agentflow_core::runtime::PYTHON_EGRESS_GUARD_SITECUSTOMIZE;
 use agentflow_core::storage::{ProjectStore, ToolSpec};
 
 use crate::cli_args::SynthArgs;
@@ -21,6 +23,8 @@ use crate::{last_value, CliError};
 pub(crate) const DEFAULT_SYNTHESIZER: &str = "claude -p";
 const SYNTH_VERSION: &str = "0.1.0";
 pub(crate) const VALIDATION_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_VALIDATION_CAPTURE_BYTES: usize = 1024 * 1024;
+const MAX_VALIDATION_RESULT_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const CBIOPORTAL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 const SOURCE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const CBIOPORTAL_API_BASE: &str = "https://www.cbioportal.org/api";
@@ -34,53 +38,6 @@ const VALIDATION_PATH: &str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
 const PYTHON_SEATBELT_PROFILE: &str = r#"(version 1)
 (allow default)
 (deny network-outbound (remote ip "localhost:*"))"#;
-const PYTHON_EGRESS_GUARD_SITECUSTOMIZE: &str = r#"import ipaddress
-import socket
-
-_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
-
-def _blocked(ip):
-    addr = ipaddress.ip_address(ip)
-    if addr.version == 6:
-        if addr.ipv4_mapped is not None:
-            return _blocked(str(addr.ipv4_mapped))
-        if addr in _NAT64_PREFIX:
-            return _blocked(str(ipaddress.IPv4Address(int(addr) & 0xffffffff)))
-    if addr.is_private or addr.is_loopback or addr.is_link_local \
-       or addr.is_reserved or addr.is_multicast or addr.is_unspecified:
-        return True
-    if addr.version == 4 and addr in ipaddress.ip_network("100.64.0.0/10"):
-        return True
-    return False
-
-_real_getaddrinfo = socket.getaddrinfo
-
-def _guarded_getaddrinfo(host, *args, **kwargs):
-    results = _real_getaddrinfo(host, *args, **kwargs)
-    for result in results:
-        ip = result[4][0]
-        if _blocked(ip):
-            raise OSError(
-                "agentflow egress blocked: non-public address %s for host %s" % (ip, host)
-            )
-    return results
-
-socket.getaddrinfo = _guarded_getaddrinfo
-
-_real_connect = socket.socket.connect
-
-def _guarded_connect(self, address):
-    try:
-        host = address[0]
-        ipaddress.ip_address(host)
-        if _blocked(host):
-            raise OSError("agentflow egress blocked: non-public address %s" % host)
-    except ValueError:
-        pass
-    return _real_connect(self, address)
-
-socket.socket.connect = _guarded_connect
-"#;
 const PRIMARY_VALIDATION_GENE: &str = "TP53";
 const ALTERNATE_VALIDATION_GENE: &str = "EGFR";
 const MAX_SOURCE_PROBE_BYTES: usize = 65_536;
@@ -2309,6 +2266,26 @@ fn run_python_script(
     timeout: Duration,
     inputs: SynthValidationInputs<'_>,
 ) -> Result<ValidationOutput, CliError> {
+    run_python_script_with_caps(
+        script_path,
+        fixture,
+        workdir,
+        timeout,
+        inputs,
+        MAX_VALIDATION_CAPTURE_BYTES,
+        MAX_VALIDATION_RESULT_BYTES,
+    )
+}
+
+fn run_python_script_with_caps(
+    script_path: &Path,
+    fixture: Option<&Path>,
+    workdir: &Path,
+    timeout: Duration,
+    inputs: SynthValidationInputs<'_>,
+    max_capture_bytes: usize,
+    max_result_bytes: u64,
+) -> Result<ValidationOutput, CliError> {
     let (mut command, result_path) = python_command(script_path, workdir)?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     set_validation_domain_param_env(&mut command, inputs);
@@ -2323,35 +2300,112 @@ fn run_python_script(
         ))
     })?;
     let started = SystemTime::now();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CliError::Core("candidate stdout was not piped".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CliError::Core("candidate stderr was not piped".to_string()))?;
+    let stdout_handle =
+        thread::spawn(move || capture_validation_stream(stdout, max_capture_bytes, "stdout"));
+    let stderr_handle =
+        thread::spawn(move || capture_validation_stream(stderr, max_capture_bytes, "stderr"));
 
-    loop {
+    let (exit_code, timed_out) = loop {
         if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
-            let result_output = fs::read_to_string(&result_path).ok();
-            return Ok(ValidationOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                exit_code: output.status.code(),
-                timed_out: false,
-                result_output,
-            });
+            let status = child.wait()?;
+            break (status.code(), false);
         }
 
         if started.elapsed().unwrap_or_default() >= timeout {
             kill_child_process_group(&mut child);
-            let output = child.wait_with_output()?;
-            let result_output = fs::read_to_string(&result_path).ok();
-            return Ok(ValidationOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                exit_code: output.status.code(),
-                timed_out: true,
-                result_output,
-            });
+            let status = child.wait()?;
+            break (status.code(), true);
         }
 
         thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = join_validation_capture_thread(stdout_handle, "stdout")?;
+    let stderr = join_validation_capture_thread(stderr_handle, "stderr")?;
+    let result_output =
+        read_optional_text_file_with_byte_cap("validation result", &result_path, max_result_bytes)?;
+    Ok(ValidationOutput {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        exit_code,
+        timed_out,
+        result_output,
+    })
+}
+
+fn join_validation_capture_thread(
+    handle: thread::JoinHandle<io::Result<Vec<u8>>>,
+    stream_name: &str,
+) -> Result<Vec<u8>, CliError> {
+    handle
+        .join()
+        .map_err(|_| CliError::Core(format!("{stream_name} capture thread panicked")))?
+        .map_err(CliError::from)
+}
+
+fn capture_validation_stream<R: Read>(
+    mut reader: R,
+    max_bytes: usize,
+    stream_name: &str,
+) -> io::Result<Vec<u8>> {
+    let mut buffer = [0_u8; 8192];
+    let mut captured = Vec::new();
+    let mut truncated = false;
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(captured.len());
+        if remaining > 0 {
+            let keep = remaining.min(count);
+            captured.extend_from_slice(&buffer[..keep]);
+        }
+        if count > remaining {
+            truncated = true;
+        }
     }
+    if truncated {
+        captured.extend_from_slice(
+            format!("\n[agentflow] {stream_name} truncated after {max_bytes} bytes\n").as_bytes(),
+        );
+    }
+    Ok(captured)
+}
+
+fn read_optional_text_file_with_byte_cap(
+    kind: &str,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Option<String>, CliError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(CliError::from(error)),
+    };
+    if metadata.len() > max_bytes {
+        return Err(CliError::Core(format!(
+            "{kind} exceeds {max_bytes} byte cap at {}",
+            path.display()
+        )));
+    }
+    let mut text = String::new();
+    fs::File::open(path)?
+        .read_to_string(&mut text)
+        .map_err(|error| {
+            CliError::Core(format!(
+                "{kind} requires UTF-8 text at {}: {error}",
+                path.display()
+            ))
+        })?;
+    Ok(Some(text))
 }
 
 fn sandbox_exec_available() -> bool {
@@ -4476,6 +4530,104 @@ print(result, end="")
             .result_output
             .as_deref()
             .is_some_and(|result| result.contains("ENV_CLEARED_OK")));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn validation_stream_capture_helper_marks_stdout_and_stderr_truncation() {
+        let stdout =
+            capture_validation_stream(std::io::Cursor::new("OOOOOOOOOOOO"), 8, "stdout").unwrap();
+        let stderr =
+            capture_validation_stream(std::io::Cursor::new("EEEEEEEEEEEE"), 8, "stderr").unwrap();
+
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "OOOOOOOO\n[agentflow] stdout truncated after 8 bytes\n"
+        );
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "EEEEEEEE\n[agentflow] stderr truncated after 8 bytes\n"
+        );
+    }
+
+    #[test]
+    fn validation_capture_truncates_stdout_and_stderr_with_markers() {
+        let path = temp_project_path("validation-capture-cap");
+        init_project(&path);
+        let script = path.join("noisy.py");
+        fs::write(
+            &script,
+            r#"import sys
+from pathlib import Path
+
+Path(sys.argv[0]).exists()
+sys.stdout.write("O" * 24)
+sys.stderr.write("E" * 24)
+"#,
+        )
+        .unwrap();
+
+        let validation = run_python_script_with_caps(
+            &script,
+            None,
+            &path,
+            Duration::from_secs(10),
+            SynthValidationInputs {
+                gene: "TP53",
+                study: None,
+            },
+            8,
+            MAX_VALIDATION_RESULT_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(
+            validation.stdout,
+            "OOOOOOOO\n[agentflow] stdout truncated after 8 bytes\n"
+        );
+        assert!(validation
+            .stderr
+            .ends_with("\n[agentflow] stderr truncated after 8 bytes\n"));
+        assert!(
+            validation.stderr.len() <= 8 + "\n[agentflow] stderr truncated after 8 bytes\n".len()
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn validation_result_file_over_injected_cap_returns_clear_error() {
+        let path = temp_project_path("validation-result-cap");
+        init_project(&path);
+        let script = path.join("large_result.py");
+        fs::write(
+            &script,
+            r#"import os
+from pathlib import Path
+
+Path(os.environ["AGENTFLOW_OUTPUT_RESULT"]).write_text("R" * 24, encoding="utf-8")
+"#,
+        )
+        .unwrap();
+
+        let error = run_python_script_with_caps(
+            &script,
+            None,
+            &path,
+            Duration::from_secs(10),
+            SynthValidationInputs {
+                gene: "TP53",
+                study: None,
+            },
+            MAX_VALIDATION_CAPTURE_BYTES,
+            8,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .message()
+            .contains("validation result exceeds 8 byte cap"));
 
         let _ = fs::remove_dir_all(path);
     }

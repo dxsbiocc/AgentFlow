@@ -203,6 +203,7 @@ issue36 增量给 Python 工具运行时注入 `sitecustomize` guard，monkeypat
 - CGNAT `100.64.0.0/10`
 
 这能挡住最现实的合作层 prompt-injection 直连路径，尤其是直接连 metadata 或内网 IP。
+当前覆盖面是自动合成工具的 validation 路径，以及已注册 `namespace: synth` 工具的 runtime 执行；用户声明的非 synth 本地工具不被强制注入。
 
 但它不是反篡改沙箱。生成脚本拥有完整 Python 运行时，理论上可 un-patch、替换 socket 函数或走其他解释器 / 原生路径绕过。
 

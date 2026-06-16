@@ -9,7 +9,9 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "UNLICENSED"
+license = "MIT"
+description = "CLI-first local autonomous research runtime for scientific task graphs, with an auditable hypothesis → evidence → verdict control layer."
+repository = "https://github.com/dxsbiocc/AgentFlow"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -1,7 +1,7 @@
 # AgentFlow 能力与边界总览
 
 Status: Capability overview
-Scope: `docs/status/as1-*` 到 `as17.2-*`、Plan A、issue36、success-path、`docs/design/tool-evolution-engine-design.md`
+Scope: `docs/status/as1-*` 到 `as20-*`、Plan A、issue36（含部署级 egress 配方）、success-path、`docs/design/tool-evolution-engine-design.md`
 
 ## 1. AgentFlow 是什么
 
@@ -135,16 +135,15 @@ AS17.1 修复纯 LLM 猜 study id 的问题：先取 cBioPortal 真实 study 列
 
 AS17.2 进一步保证 cohort 选择质量：当存在 `pan_can_atlas` study 时，确定性偏好 profile 兼容的 pan-cancer atlas 版本，避免 LLM 合法但次优地选到 legacy study 导致验证超时。
 
-### 4.4 AS18：谱系 / 取代 / 治理门
+### 4.4 AS18 / AS19 / AS20：谱系 / 取代 / 采纳 / cohort 接线（已落地）
 
-AS18 还不是当前总览所依据文档中的落地阶段，但 RFC 已给出方向：
+进化引擎的闭环已全部落地在 `main`：**检测(AS16) → 验证(AS17) → 注册候选(AS20) → 人工采纳(AS18)**，并由 AS19 把 cohort 推断接进核心 run 循环。
 
-- 通过验证的泛化工具注册为新版本。
-- 旧特化工具不直接删除，而是标记 `superseded_by` / deprecated。
-- Methods & Tools 报告展示版本血统。
-- 可能影响在跑工具或晋升 verified 的行为走人工确认。
+- **AS18（谱系 / 取代 / 治理门）：** append-only `tool_superseded` 事件 + `supersede_tool`（校验两 ref、拒自我取代）；`agentflow tools supersede <old> --by <new>`。旧特化工具**不删除**，而在 `tool_select` 中降权保留（罚分 + `superseded_by:` 理由），successor 优先 → 谱系可追溯。Methods & Tools 报告展示版本血统。这是**人在环采纳门**。
+- **AS19（cohort 接线进核心）：** 核心 `CohortInferer` seam（Noop 默认，0 LLM / 0 网络），工具 param 通过声明式 `infer: cohort`（`ParamInferKind`）opt-in；引擎不硬编码领域字符串。cohort 被推断填入的 param 进 `inferred_param_names`，因此被 grade-cap 降级 —— 推断 cohort 的 run 上不去 `affirmed`。
+- **AS20（自动注册泛化候选）：** `promotable` 时确定性派生 `<name>_general`（cohort 提升为显式 `infer: cohort` 参数），以 `exploratory` 成熟度注册，append-only `generalization_candidate_registered` 事件，幂等。**治理红线：绝不自动 supersede** —— 只把 `tools supersede` 命令作为建议输出，采纳留给人工门。`ToolSpec::spec_hash()` 作为 stored-spec 哈希的单一真相源。
 
-换句话说，AS15–AS17.2 证明“看见矛盾、形成候选、验证能否泛化”；AS18 才负责“采纳、谱系、扬弃、取代”。
+换句话说，AS15–AS17.2 证明“看见矛盾、形成候选、验证能否泛化”；AS18–AS20 完成“注册候选、谱系、扬弃、取代”，且采纳始终是人工治理动作。
 
 ## 5. 成功路径：Plan A 与 affirmed 门槛
 
@@ -227,7 +226,7 @@ AgentFlow 当前边界应明确写出来：
 - **自动合成工具不能独立 affirm**：未验证工具和推断参数会触发 evidence cap。
 - **FundamentalGap 不是系统独断结论**：它是“我们没有找到能回答问题的可访问公开源”的诚实交接，需要人确认。
 - **OutputGroundingScorer 依赖 LLM 判断**：它是上游拒证 / 暴露 mismatch 的守门器；判决出口仍保持确定性。
-- **工具进化到 AS17.2 仍是验证门，不是采纳门**：`promotable` 只表示候选通过跨队列验证；注册新版本、取代旧工具、谱系记录、verified 晋升属于 AS18 治理。
+- **采纳是人工治理动作（AS18–AS20 已落地）**：`promotable` 触发 AS20 自动注册一个 `exploratory` 泛化候选，但**绝不自动取代**旧工具；注册新版本后的取代 / 谱系 / verified 晋升仍走 AS18 的人工 `tools supersede` 门。自治负责提出候选，人负责采纳。
 - **AS17.x cohort 验证首版偏 cBioPortal / study 参数场景**：它证明 spec 级 cohort 参数化路径，不等于所有领域工具都已可自动泛化。
 - **网络安全仍有部署级残留**：Python guard 和 seatbelt 是 defense-in-depth；反篡改对手、raw socket、原生扩展、替换解释器等威胁，需要容器 / VM / pf / Kubernetes NetworkPolicy / CNI egress allowlist 等 OS 级边界。
 - **issue36 的核心残留**：真正封堵 RFC1918 / metadata / 私网出网，应在容器或 VM 内运行工具，并使用默认拒绝的 egress policy，只放行明确公网 allowlist。部署级 recipe 已记录在 `docs/ops/egress-containment.md`，但采用和运维集成仍由部署方完成；合作层 guard 不能包装成强沙箱。
@@ -243,4 +242,4 @@ AgentFlow 当前边界应明确写出来：
 - `docs/ops/egress-containment.md`
 - `docs/design/tool-evolution-engine-design.md`
 
-如果未来实现 AS18，应同步更新本文件中“工具进化引擎”和“已知边界”两节，尤其是谱系、取代、specificity 轴和人在环采纳门。
+AS18 / AS19 / AS20 已落地并合并入 `main`（见 `docs/status/as18-*`、`as19-*`、`as20-*`），本文件“工具进化引擎”（§4.4）与“已知边界”（§7）两节已同步更新为采纳门 / cohort 接线 / 自动注册候选的现状。

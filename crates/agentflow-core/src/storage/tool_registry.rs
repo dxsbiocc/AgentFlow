@@ -71,6 +71,7 @@ pub struct ToolRuntimeSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutableToolSpec {
     pub tool_ref: String,
+    pub namespace: String,
     pub version: String,
     pub inputs: BTreeMap<String, ToolPortSpec>,
     pub params: BTreeMap<String, ToolParamSpec>,
@@ -1715,6 +1716,7 @@ fn executable_from_stored_json(
 
     let executable = ExecutableToolSpec {
         tool_ref: tool_ref.to_string(),
+        namespace: stored.namespace,
         version: version.to_string(),
         inputs,
         params,

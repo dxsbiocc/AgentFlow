@@ -6,10 +6,28 @@ use serde_yaml_ng::Value;
 
 use super::StorageError;
 
+pub(super) const MAX_YAML_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
+
 pub(super) fn parse_yaml<'de, T>(kind: &str, source_text: &'de str) -> Result<T, StorageError>
 where
     T: Deserialize<'de>,
 {
+    parse_yaml_with_byte_cap(kind, source_text, MAX_YAML_DOCUMENT_BYTES)
+}
+
+fn parse_yaml_with_byte_cap<'de, T>(
+    kind: &str,
+    source_text: &'de str,
+    max_bytes: usize,
+) -> Result<T, StorageError>
+where
+    T: Deserialize<'de>,
+{
+    if source_text.len() > max_bytes {
+        return Err(StorageError::InvalidInput(format!(
+            "{kind} YAML exceeds {max_bytes} byte cap"
+        )));
+    }
     serde_yaml_ng::from_str(source_text)
         .map_err(|error| StorageError::InvalidInput(format!("cannot parse {kind} YAML: {error}")))
 }
@@ -230,5 +248,38 @@ fn value_kind(value: &Value) -> &'static str {
         Value::Sequence(_) => "sequence",
         Value::Mapping(_) => "mapping",
         Value::Tagged(_) => "tagged value",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct MinimalYaml {
+        name: String,
+    }
+
+    #[test]
+    fn yaml_parse_rejects_source_over_injected_byte_cap() {
+        let source = "name: abc\n";
+
+        let error = parse_yaml_with_byte_cap::<MinimalYaml>("tool", source, 8).unwrap_err();
+
+        assert!(error.to_string().contains("tool YAML exceeds 8 byte cap"));
+    }
+
+    #[test]
+    fn yaml_parse_accepts_source_at_injected_byte_cap() {
+        let source = "name: abc\n";
+
+        let parsed = parse_yaml_with_byte_cap::<MinimalYaml>("tool", source, source.len()).unwrap();
+
+        assert_eq!(
+            parsed,
+            MinimalYaml {
+                name: "abc".to_string()
+            }
+        );
     }
 }

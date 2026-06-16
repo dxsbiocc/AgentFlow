@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -16,6 +18,60 @@ use crate::storage::{
     project_dir, ComputedArtifactRequest, ProjectStore, StorageError, StoredFlowStep,
     ToolRuntimeSpec,
 };
+
+pub const PYTHON_EGRESS_GUARD_SITECUSTOMIZE: &str = r#"import ipaddress
+import socket
+
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+
+def _blocked(ip):
+    addr = ipaddress.ip_address(ip)
+    if addr.version == 6:
+        if addr.ipv4_mapped is not None:
+            return _blocked(str(addr.ipv4_mapped))
+        if addr in _NAT64_PREFIX:
+            return _blocked(str(ipaddress.IPv4Address(int(addr) & 0xffffffff)))
+    if addr.is_private or addr.is_loopback or addr.is_link_local \
+       or addr.is_reserved or addr.is_multicast or addr.is_unspecified:
+        return True
+    if addr.version == 4 and addr in ipaddress.ip_network("100.64.0.0/10"):
+        return True
+    return False
+
+_real_getaddrinfo = socket.getaddrinfo
+
+def _guarded_getaddrinfo(host, *args, **kwargs):
+    results = _real_getaddrinfo(host, *args, **kwargs)
+    for result in results:
+        ip = result[4][0]
+        if _blocked(ip):
+            raise OSError(
+                "agentflow egress blocked: non-public address %s for host %s" % (ip, host)
+            )
+    return results
+
+socket.getaddrinfo = _guarded_getaddrinfo
+
+_real_connect = socket.socket.connect
+
+def _guarded_connect(self, address):
+    try:
+        host = address[0]
+        ipaddress.ip_address(host)
+        if _blocked(host):
+            raise OSError("agentflow egress blocked: non-public address %s" % host)
+    except ValueError:
+        pass
+    return _real_connect(self, address)
+
+socket.socket.connect = _guarded_connect
+"#;
+
+const SYNTH_TOOL_NAMESPACE: &str = "synth";
+const MAX_RUNTIME_CAPTURE_BYTES: usize = 1024 * 1024;
+const MAX_RUNTIME_ARTIFACT_TEXT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RUNTIME_ENVIRONMENT_YAML_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RUNTIME_LOG_READ_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowRunSummary {
@@ -691,8 +747,16 @@ impl ProjectStore {
 
         Ok(RunLogs {
             attempt_id,
-            stdout: fs::read_to_string(&stdout_path)?,
-            stderr: fs::read_to_string(&stderr_path)?,
+            stdout: read_text_file_with_byte_cap(
+                "stdout log",
+                &stdout_path,
+                MAX_RUNTIME_LOG_READ_BYTES,
+            )?,
+            stderr: read_text_file_with_byte_cap(
+                "stderr log",
+                &stderr_path,
+                MAX_RUNTIME_LOG_READ_BYTES,
+            )?,
             stdout_path,
             stderr_path,
         })
@@ -860,7 +924,16 @@ impl ProjectStore {
         let resolved_outputs = output_paths(&workdir, &outputs);
         fs::create_dir_all(resolved_outputs.root())?;
 
-        let prepared_command = prepare_runtime_command(&tool.runtime)?;
+        let mut prepared_command = prepare_runtime_command(&tool.runtime)?;
+        let synth_pythonpath = if tool.namespace == SYNTH_TOOL_NAMESPACE {
+            let guard_dir = install_runtime_python_egress_guard(&workdir)?;
+            // Cooperative defense-in-depth for generated synth tools. This is
+            // not an anti-tamper sandbox; deployment-level egress containment
+            // remains the hard boundary.
+            prepend_python_egress_guard_to_runtime_command(&mut prepared_command, &guard_dir)?
+        } else {
+            None
+        };
         materialize_workdir(
             &workdir,
             &prepared_command.argv(),
@@ -968,6 +1041,9 @@ impl ProjectStore {
                 &params_map,
                 resolved_outputs.as_map(),
             ));
+        if let Some(pythonpath) = synth_pythonpath {
+            command.env("PYTHONPATH", pythonpath);
+        }
         let output = run_local_command(command, tool.runtime.timeout_seconds);
 
         let (status, exit_code, error_message) = match output {
@@ -2104,9 +2180,13 @@ fn declared_environment_packages(runtime: &ToolRuntimeSpec) -> Result<Vec<String
     let Some(env_file) = runtime.env_file.as_deref() else {
         return Ok(Vec::new());
     };
-    Ok(extract_conda_dependency_packages(&fs::read_to_string(
-        env_file,
-    )?))
+    Ok(extract_conda_dependency_packages(
+        &read_text_file_with_byte_cap(
+            "environment YAML",
+            Path::new(env_file),
+            MAX_RUNTIME_ENVIRONMENT_YAML_BYTES,
+        )?,
+    ))
 }
 
 fn extract_conda_dependency_packages(text: &str) -> Vec<String> {
@@ -2266,6 +2346,54 @@ fn prepare_environment_probe(
     })
 }
 
+fn install_runtime_python_egress_guard(workdir: &Path) -> Result<PathBuf, StorageError> {
+    let guard_dir = runtime_python_egress_guard_dir(workdir);
+    fs::create_dir_all(&guard_dir)?;
+    fs::write(
+        guard_dir.join("sitecustomize.py"),
+        PYTHON_EGRESS_GUARD_SITECUSTOMIZE.as_bytes(),
+    )?;
+    Ok(guard_dir)
+}
+
+fn runtime_python_egress_guard_dir(workdir: &Path) -> PathBuf {
+    workdir.join("python-egress-guard")
+}
+
+fn prepend_python_egress_guard_to_runtime_command(
+    command: &mut PreparedRuntimeCommand,
+    guard_dir: &Path,
+) -> Result<Option<OsString>, StorageError> {
+    if is_env_executable(&command.executable) {
+        for arg in &mut command.args {
+            let Some(existing) = arg.strip_prefix("PYTHONPATH=") else {
+                continue;
+            };
+            let pythonpath = pythonpath_with_runtime_guard(guard_dir, Some(OsStr::new(existing)))?;
+            *arg = format!("PYTHONPATH={}", pythonpath.to_string_lossy());
+            return Ok(None);
+        }
+    }
+    pythonpath_with_runtime_guard(guard_dir, None).map(Some)
+}
+
+fn is_env_executable(executable: &str) -> bool {
+    Path::new(executable).file_name().and_then(OsStr::to_str) == Some("env")
+}
+
+fn pythonpath_with_runtime_guard(
+    guard_dir: &Path,
+    existing: Option<&OsStr>,
+) -> Result<OsString, StorageError> {
+    let mut paths = vec![guard_dir.to_path_buf()];
+    if let Some(existing) = existing {
+        paths.extend(std::env::split_paths(existing));
+    }
+    std::env::join_paths(paths).map_err(|error| {
+        StorageError::InvalidInput(format!("failed to build Python egress guard path: {error}"))
+    })
+}
+
 fn true_command() -> String {
     ["/usr/bin/true", "/bin/true"]
         .iter()
@@ -2280,44 +2408,100 @@ fn run_local_command(
 ) -> std::io::Result<LocalCommandOutput> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let Some(timeout_seconds) = timeout_seconds else {
-        let output = command.output()?;
-        return Ok(LocalCommandOutput {
-            status: output.status,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            timed_out: false,
-            timeout_seconds: None,
-        });
+        let child = command.spawn()?;
+        return wait_for_local_command_output(child, None);
     };
 
-    let timeout = Duration::from_secs(timeout_seconds);
-    let started = Instant::now();
     configure_timeout_process_group(&mut command);
-    let mut child = command.spawn()?;
+    let child = command.spawn()?;
+    wait_for_local_command_output(child, Some(timeout_seconds))
+}
+
+fn wait_for_local_command_output(
+    mut child: std::process::Child,
+    timeout_seconds: Option<u64>,
+) -> io::Result<LocalCommandOutput> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("child stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("child stderr was not piped"))?;
+    let stdout_handle = thread::spawn(move || {
+        capture_stream_with_byte_cap(stdout, MAX_RUNTIME_CAPTURE_BYTES, "stdout")
+    });
+    let stderr_handle = thread::spawn(move || {
+        capture_stream_with_byte_cap(stderr, MAX_RUNTIME_CAPTURE_BYTES, "stderr")
+    });
+
+    let (status, timed_out) = if let Some(timeout_seconds) = timeout_seconds {
+        let timeout = Duration::from_secs(timeout_seconds);
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                break (status, false);
+            }
+            if started.elapsed() >= timeout {
+                kill_timeout_process_group(&mut child);
+                break (child.wait()?, true);
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    } else {
+        (child.wait()?, false)
+    };
+
+    let stdout = join_capture_thread(stdout_handle, "stdout")?;
+    let stderr = join_capture_thread(stderr_handle, "stderr")?;
+    Ok(LocalCommandOutput {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+        timeout_seconds,
+    })
+}
+
+fn join_capture_thread(
+    handle: thread::JoinHandle<io::Result<Vec<u8>>>,
+    stream_name: &str,
+) -> io::Result<Vec<u8>> {
+    handle
+        .join()
+        .map_err(|_| io::Error::other(format!("{stream_name} capture thread panicked")))?
+}
+
+fn capture_stream_with_byte_cap<R: Read>(
+    reader: R,
+    max_bytes: usize,
+    stream_name: &str,
+) -> io::Result<Vec<u8>> {
+    let mut reader = BufReader::new(reader);
+    let mut buffer = [0_u8; 8192];
+    let mut captured = Vec::new();
+    let mut truncated = false;
     loop {
-        if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
-            return Ok(LocalCommandOutput {
-                status: output.status,
-                stdout: output.stdout,
-                stderr: output.stderr,
-                timed_out: false,
-                timeout_seconds: Some(timeout_seconds),
-            });
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
         }
-        if started.elapsed() >= timeout {
-            kill_timeout_process_group(&mut child);
-            let output = child.wait_with_output()?;
-            return Ok(LocalCommandOutput {
-                status: output.status,
-                stdout: output.stdout,
-                stderr: output.stderr,
-                timed_out: true,
-                timeout_seconds: Some(timeout_seconds),
-            });
+        let remaining = max_bytes.saturating_sub(captured.len());
+        if remaining > 0 {
+            let keep = remaining.min(count);
+            captured.extend_from_slice(&buffer[..keep]);
         }
-        thread::sleep(Duration::from_millis(25));
+        if count > remaining {
+            truncated = true;
+        }
     }
+    if truncated {
+        captured.extend_from_slice(
+            format!("\n[agentflow] {stream_name} truncated after {max_bytes} bytes\n").as_bytes(),
+        );
+    }
+    Ok(captured)
 }
 
 fn configure_timeout_process_group(command: &mut Command) {
@@ -2366,7 +2550,9 @@ fn validate_outputs(outputs: &OutputPaths) -> Result<(), StorageError> {
 
 fn write_runtime_error(stderr_path: &Path, error: &StorageError) -> String {
     let message = error.to_string();
-    let existing = fs::read_to_string(stderr_path).unwrap_or_default();
+    let existing =
+        read_text_file_with_byte_cap("stderr log", stderr_path, MAX_RUNTIME_LOG_READ_BYTES)
+            .unwrap_or_default();
     let updated = if existing.trim().is_empty() {
         format!("{message}\n")
     } else if existing.ends_with('\n') {
@@ -2376,6 +2562,71 @@ fn write_runtime_error(stderr_path: &Path, error: &StorageError) -> String {
     };
     let _ = fs::write(stderr_path, updated);
     message
+}
+
+fn read_text_file_with_byte_cap(
+    kind: &str,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<String, StorageError> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > max_bytes {
+        return Err(StorageError::InvalidInput(format!(
+            "{kind} exceeds {max_bytes} byte cap at {}",
+            path.display()
+        )));
+    }
+    let mut text = String::new();
+    BufReader::new(fs::File::open(path)?)
+        .read_to_string(&mut text)
+        .map_err(|error| {
+            StorageError::InvalidInput(format!(
+                "{kind} requires UTF-8 text at {}: {error}",
+                path.display()
+            ))
+        })?;
+    Ok(text)
+}
+
+fn read_trimmed_nonempty_lines_with_byte_cap(
+    kind: &str,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Vec<String>, StorageError> {
+    let file = fs::File::open(path).map_err(|error| {
+        StorageError::InvalidInput(format!(
+            "{kind} requires readable text at {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    let mut total_bytes = 0_u64;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let count = reader.read_line(&mut line).map_err(|error| {
+            StorageError::InvalidInput(format!(
+                "{kind} requires UTF-8 text at {}: {error}",
+                path.display()
+            ))
+        })?;
+        if count == 0 {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(count as u64);
+        if total_bytes > max_bytes {
+            return Err(StorageError::InvalidInput(format!(
+                "{kind} exceeds {max_bytes} byte cap at {}",
+                path.display()
+            )));
+        }
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            lines.push(trimmed.to_string());
+        }
+    }
+    Ok(lines)
 }
 
 fn validate_declared_inputs(
@@ -2416,17 +2667,11 @@ fn validate_port_file(
         return Ok(());
     }
 
-    let text = fs::read_to_string(path).map_err(|error| {
-        StorageError::InvalidInput(format!(
-            "{direction} {name} validator requires UTF-8 text at {}: {error}",
-            path.display()
-        ))
-    })?;
-    let lines = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
+    let lines = read_trimmed_nonempty_lines_with_byte_cap(
+        &format!("{direction} {name} validator"),
+        path,
+        MAX_RUNTIME_ARTIFACT_TEXT_BYTES,
+    )?;
 
     let has_header_validators =
         !port.required_columns.is_empty() || port.sample_id_column.is_some();
@@ -2510,17 +2755,11 @@ fn sample_ids_for_input(
     port: &crate::storage::ToolPortSpec,
     sample_id_column: &str,
 ) -> Result<BTreeSet<String>, StorageError> {
-    let text = fs::read_to_string(path).map_err(|error| {
-        StorageError::InvalidInput(format!(
-            "input {name} sample_id_column validator requires UTF-8 text at {}: {error}",
-            path.display()
-        ))
-    })?;
-    let lines = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
+    let lines = read_trimmed_nonempty_lines_with_byte_cap(
+        &format!("input {name} sample_id_column validator"),
+        path,
+        MAX_RUNTIME_ARTIFACT_TEXT_BYTES,
+    )?;
     let header = lines.first().ok_or_else(|| {
         StorageError::InvalidInput(format!(
             "input {name} is empty and cannot satisfy sample_id_column"
@@ -2775,6 +3014,78 @@ exec "$@"
         runner_path
     }
 
+    fn write_pythonpath_echo_script(path: &Path) -> PathBuf {
+        let script_path = path.join("pythonpath_echo.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+printf '%s\n' "$PYTHONPATH" > "$AGENTFLOW_OUTPUT_RESULT"
+printf '%s\n' "$PYTHONPATH"
+"#,
+        )
+        .unwrap();
+        make_executable(&script_path);
+        script_path
+    }
+
+    fn run_pythonpath_echo_flow(
+        namespace: &str,
+        test_name: &str,
+    ) -> (PathBuf, FlowRunSummary, RunLogs, PathBuf) {
+        let path = temp_project_path(test_name);
+        fs::create_dir_all(&path).unwrap();
+        let existing_pythonpath = path.join("existing-pythonpath");
+        fs::create_dir_all(&existing_pythonpath).unwrap();
+        let store = ProjectStore::init(&path, Some("Runtime Demo")).unwrap();
+        let script_path = write_pythonpath_echo_script(&path);
+        let script = script_path.display();
+        let pythonpath = existing_pythonpath.display();
+
+        register_tool(
+            &store,
+            format!(
+                r#"
+schema_version: agentflow.tool.v0
+namespace: {namespace}
+name: pythonpath_echo
+version: 0.1.0
+maturity: exploratory
+description: Echo PYTHONPATH for guard testing
+outputs:
+  result:
+    type: Text
+runtime:
+  backend: local
+  command:
+    - /usr/bin/env
+    - PYTHONPATH={pythonpath}
+    - /bin/sh
+    - {script}
+"#
+            ),
+        );
+
+        let flow = FlowDraft::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.flow.v0
+id: pythonpath_demo
+name: Pythonpath demo
+steps:
+  - id: echo
+    tool: {namespace}/pythonpath_echo
+    needs: []
+    outputs:
+      result: result
+"#
+        ))
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+        let summary = store.run_flow("pythonpath_demo").unwrap();
+        let logs = store.read_logs(&summary.attempts[0].attempt_id).unwrap();
+
+        (path, summary, logs, existing_pythonpath)
+    }
+
     fn register_tool(store: &ProjectStore, source: String) {
         let spec = ToolSpec::from_simple_yaml(&source).unwrap();
         store.register_tool(spec).unwrap();
@@ -2798,6 +3109,66 @@ exec "$@"
             parse_json_map(r#"{"gene":"TP53,EGFR:ALK","label":"quoted \"value\""}"#).unwrap();
         assert_eq!(parsed["gene"], "TP53,EGFR:ALK");
         assert_eq!(parsed["label"], "quoted \"value\"");
+    }
+
+    #[test]
+    fn capped_stream_capture_marks_truncation() {
+        let captured =
+            capture_stream_with_byte_cap(std::io::Cursor::new("abcdef"), 4, "stdout").unwrap();
+
+        assert_eq!(
+            String::from_utf8(captured).unwrap(),
+            "abcd\n[agentflow] stdout truncated after 4 bytes\n"
+        );
+    }
+
+    #[test]
+    fn validator_text_reader_rejects_file_over_injected_byte_cap() {
+        let path = temp_project_path("validator-byte-cap");
+        fs::create_dir_all(&path).unwrap();
+        let table = path.join("table.tsv");
+        fs::write(&table, "sample\tvalue\nA\t1\n").unwrap();
+
+        let error = read_trimmed_nonempty_lines_with_byte_cap("input table validator", &table, 8)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("input table validator exceeds 8 byte cap"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn synth_namespace_runtime_prepends_python_egress_guard_to_pythonpath() {
+        let (path, summary, logs, existing_pythonpath) =
+            run_pythonpath_echo_flow("synth", "synth-runtime-egress-guard");
+        let guard_dir = summary.attempts[0].workdir.join("python-egress-guard");
+        let pythonpath = std::ffi::OsString::from(logs.stdout.trim());
+        let paths = std::env::split_paths(&pythonpath).collect::<Vec<_>>();
+
+        assert_eq!(paths.first(), Some(&guard_dir));
+        assert_eq!(paths.get(1), Some(&existing_pythonpath));
+        assert_eq!(
+            fs::read_to_string(guard_dir.join("sitecustomize.py")).unwrap(),
+            PYTHON_EGRESS_GUARD_SITECUSTOMIZE
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn non_synth_runtime_does_not_inject_python_egress_guard() {
+        let (path, summary, logs, existing_pythonpath) =
+            run_pythonpath_echo_flow("marker", "local-runtime-no-egress-guard");
+        let guard_dir = summary.attempts[0].workdir.join("python-egress-guard");
+        let pythonpath = std::ffi::OsString::from(logs.stdout.trim());
+        let paths = std::env::split_paths(&pythonpath).collect::<Vec<_>>();
+
+        assert_eq!(paths.first(), Some(&existing_pythonpath));
+        assert!(!guard_dir.exists());
+
+        let _ = fs::remove_dir_all(path);
     }
 
     #[test]

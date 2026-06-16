@@ -47,6 +47,26 @@ scripts per task. Loop: **detect → validate → register candidate → human a
   `scripts/verify-egress-policy.sh`.
 - **Capability/invariant/security-boundary overview:** `docs/CAPABILITIES.md`.
 
+### Fixed — Security (pre-release audit, Opus 4.8 + Codex)
+
+A dual-engine pre-release audit confirmed the honesty/determinism invariants hold
+(verdict determinism, grade-cap, allowlist robustness, path safety) and surfaced
+three issues that defeated controls claimed to hold — all now fixed:
+
+- **HIGH — inline shell/interpreter validation bypass:** a hostile/auto-synthesized
+  tool YAML could pass `runtime.command` validation yet execute arbitrary shell via
+  an `env` wrapper or combined/long flags (`env sh -c`, `sh -ec`, `bash --noprofile -c`).
+  `is_inline_interpreter_command` now unwraps `env` and matches those forms.
+- **MEDIUM — probe subprocess proxy/env trust:** source-discovery probe subprocesses
+  inherited `HTTP(S)_PROXY` / `*_API_KEY` and exempted proxy hosts from private-IP
+  checks (SSRF to metadata via a hostile proxy). Now `env_clear()` + `ProxyHandler({})`.
+- **MEDIUM — DNS-pin missed IPv4-mapped / NAT64 IPv6:** `::ffff:169.254.169.254` and
+  `64:ff9b::/96` bypassed the private-IP classifiers via a hostile DNS AAAA answer.
+  All three Python classifiers now unwrap mapped/NAT64 addresses.
+
+Lower-severity hardening items are tracked as follow-ups (#57 resource-exhaustion
+caps, #58 artifact reference mode, #59 runtime-tool egress guard).
+
 ### Changed
 
 - `ToolSpec::spec_hash()` is now the single source of truth for the stored spec hash.

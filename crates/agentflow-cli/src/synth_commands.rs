@@ -37,8 +37,15 @@ const PYTHON_SEATBELT_PROFILE: &str = r#"(version 1)
 const PYTHON_EGRESS_GUARD_SITECUSTOMIZE: &str = r#"import ipaddress
 import socket
 
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+
 def _blocked(ip):
     addr = ipaddress.ip_address(ip)
+    if addr.version == 6:
+        if addr.ipv4_mapped is not None:
+            return _blocked(str(addr.ipv4_mapped))
+        if addr in _NAT64_PREFIX:
+            return _blocked(str(ipaddress.IPv4Address(int(addr) & 0xffffffff)))
     if addr.is_private or addr.is_loopback or addr.is_link_local \
        or addr.is_reserved or addr.is_multicast or addr.is_unspecified:
         return True
@@ -90,7 +97,6 @@ const CBIOPORTAL_DISCOVERY_FETCH_PY: &str = r#"import ipaddress
 import json
 import socket
 import sys
-from urllib.parse import urlsplit
 import urllib.request
 
 url = sys.argv[1]
@@ -98,9 +104,15 @@ timeout = float(sys.argv[2])
 request = urllib.request.Request(url, headers={"Accept": "application/json"})
 
 _real_getaddrinfo = socket.getaddrinfo
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 
 def _is_blocked_ip(ip_str):
     addr = ipaddress.ip_address(ip_str)
+    if addr.version == 6:
+        if addr.ipv4_mapped is not None:
+            return _is_blocked_ip(str(addr.ipv4_mapped))
+        if addr in _NAT64_PREFIX:
+            return _is_blocked_ip(str(ipaddress.IPv4Address(int(addr) & 0xffffffff)))
     if addr.is_private or addr.is_loopback or addr.is_link_local \
        or addr.is_reserved or addr.is_multicast or addr.is_unspecified:
         return True
@@ -109,25 +121,8 @@ def _is_blocked_ip(ip_str):
         return True
     return False
 
-def _configured_proxy_hosts():
-    hosts = set()
-    for scheme, value in urllib.request.getproxies().items():
-        if scheme == "no" or not value:
-            continue
-        target = value if "://" in value else "//" + value
-        hostname = urlsplit(target).hostname
-        if hostname:
-            hosts.add(hostname)
-    return hosts
-
-_PROXY_HOSTS = _configured_proxy_hosts()
-
 def _validating_getaddrinfo(host, *args, **kwargs):
     results = _real_getaddrinfo(host, *args, **kwargs)
-    # In proxy mode the proxy resolves the target host. Validate direct targets,
-    # but do not block the configured proxy itself for using loopback/private IPs.
-    if host in _PROXY_HOSTS:
-        return results
     for res in results:
         ip_str = res[4][0]
         if _is_blocked_ip(ip_str):
@@ -142,7 +137,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
 
-_opener = urllib.request.build_opener(_NoRedirect)
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 with _opener.open(request, timeout=timeout) as response:
     body = response.read().decode("utf-8")
 json.loads(body)
@@ -151,7 +146,6 @@ print(body, end="" if body.endswith("\n") else "\n")
 const SOURCE_PROBE_FETCH_PY: &str = r#"import ipaddress
 import socket
 import sys
-from urllib.parse import urlsplit
 import urllib.request
 
 url = sys.argv[1]
@@ -163,9 +157,15 @@ request = urllib.request.Request(
 )
 
 _real_getaddrinfo = socket.getaddrinfo
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 
 def _is_blocked_ip(ip_str):
     addr = ipaddress.ip_address(ip_str)
+    if addr.version == 6:
+        if addr.ipv4_mapped is not None:
+            return _is_blocked_ip(str(addr.ipv4_mapped))
+        if addr in _NAT64_PREFIX:
+            return _is_blocked_ip(str(ipaddress.IPv4Address(int(addr) & 0xffffffff)))
     if addr.is_private or addr.is_loopback or addr.is_link_local \
        or addr.is_reserved or addr.is_multicast or addr.is_unspecified:
         return True
@@ -174,25 +174,8 @@ def _is_blocked_ip(ip_str):
         return True
     return False
 
-def _configured_proxy_hosts():
-    hosts = set()
-    for scheme, value in urllib.request.getproxies().items():
-        if scheme == "no" or not value:
-            continue
-        target = value if "://" in value else "//" + value
-        hostname = urlsplit(target).hostname
-        if hostname:
-            hosts.add(hostname)
-    return hosts
-
-_PROXY_HOSTS = _configured_proxy_hosts()
-
 def _validating_getaddrinfo(host, *args, **kwargs):
     results = _real_getaddrinfo(host, *args, **kwargs)
-    # In proxy mode the proxy resolves the target host. Validate direct targets,
-    # but do not block the configured proxy itself for using loopback/private IPs.
-    if host in _PROXY_HOSTS:
-        return results
     for res in results:
         ip_str = res[4][0]
         if _is_blocked_ip(ip_str):
@@ -207,7 +190,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
 
-_opener = urllib.request.build_opener(_NoRedirect)
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 with _opener.open(request, timeout=timeout) as response:
     body = response.read(limit)
 text = body.decode("utf-8", errors="replace")
@@ -1575,17 +1558,42 @@ fn score_cbioportal_sample_list(sample_list: &JsonObject, study_id: &str) -> Opt
     Some(score)
 }
 
-pub(crate) fn fetch_cbioportal_json_with_python(url: &str, timeout: Duration) -> Option<String> {
+fn base_probe_fetch_command(script: &'static str) -> Command {
     let mut command = Command::new("/usr/bin/env");
     command
+        .env_clear()
+        .env("PATH", VALIDATION_PATH)
         .arg("python3")
         .arg("-c")
-        .arg(CBIOPORTAL_DISCOVERY_FETCH_PY)
+        .arg(script);
+    command
+}
+
+fn cbioportal_discovery_fetch_command(url: &str, timeout: Duration) -> Command {
+    let mut command = base_probe_fetch_command(CBIOPORTAL_DISCOVERY_FETCH_PY);
+    command
         .arg(url)
         .arg(timeout.as_secs_f64().to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_child_process_group(&mut command);
+    command
+}
+
+fn public_source_probe_fetch_command(url: &str, timeout: Duration) -> Command {
+    let mut command = base_probe_fetch_command(SOURCE_PROBE_FETCH_PY);
+    command
+        .arg(url)
+        .arg(timeout.as_secs_f64().to_string())
+        .arg(MAX_SOURCE_PROBE_BYTES.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_child_process_group(&mut command);
+    command
+}
+
+pub(crate) fn fetch_cbioportal_json_with_python(url: &str, timeout: Duration) -> Option<String> {
+    let mut command = cbioportal_discovery_fetch_command(url, timeout);
     let mut child = command.spawn().ok()?;
     let started = SystemTime::now();
 
@@ -1610,17 +1618,7 @@ pub(crate) fn fetch_cbioportal_json_with_python(url: &str, timeout: Duration) ->
 }
 
 fn fetch_public_source_probe_with_python(url: &str, timeout: Duration) -> Option<String> {
-    let mut command = Command::new("/usr/bin/env");
-    command
-        .arg("python3")
-        .arg("-c")
-        .arg(SOURCE_PROBE_FETCH_PY)
-        .arg(url)
-        .arg(timeout.as_secs_f64().to_string())
-        .arg(MAX_SOURCE_PROBE_BYTES.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_child_process_group(&mut command);
+    let mut command = public_source_probe_fetch_command(url, timeout);
     let mut child = command.spawn().ok()?;
     let started = SystemTime::now();
 
@@ -2919,6 +2917,85 @@ mod tests {
         fixture
     }
 
+    fn python_function_block(script: &str, function_name: &str) -> String {
+        let marker = format!("def {function_name}(");
+        let start = script.find(&marker).unwrap();
+        let end = script[start..]
+            .find("\n\n")
+            .map(|offset| start + offset)
+            .unwrap_or(script.len());
+        script[start..end].trim_end().to_string()
+    }
+
+    fn python_classifier_script(script: &str, function_name: &str) -> String {
+        let nat64_prefix = script
+            .lines()
+            .find(|line| line.contains("_NAT64_PREFIX"))
+            .unwrap();
+        format!(
+            "import ipaddress\n{nat64_prefix}\n{}\n",
+            python_function_block(script, function_name)
+        )
+    }
+
+    fn python_classifier_assertions(classifier: &str, function_name: &str) -> String {
+        format!(
+            r#"{classifier}
+cases = [
+    ("::ffff:169.254.169.254", True),
+    ("::ffff:10.0.0.1", True),
+    ("64:ff9b::a9fe:a9fe", True),
+    ("1.1.1.1", False),
+    ("2606:4700:4700::1111", False),
+]
+for ip, expected in cases:
+    actual = {function_name}(ip)
+    assert actual is expected, "%s expected %s got %s" % (ip, expected, actual)
+"#
+        )
+    }
+
+    fn run_offline_python_assertions(code: &str) {
+        let output = std::process::Command::new("/usr/bin/env")
+            .env_clear()
+            .env("PATH", VALIDATION_PATH)
+            .arg("python3")
+            .arg("-c")
+            .arg(code)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn assert_probe_fetch_command_env_is_clear(command: &Command) {
+        let debug = format!("{command:?}");
+        assert!(debug.contains("env -i"), "{debug}");
+
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            envs,
+            vec![("PATH".to_string(), Some(VALIDATION_PATH.to_string()))]
+        );
+        for (name, _) in envs {
+            let upper = name.to_ascii_uppercase();
+            assert!(!upper.contains("PROXY"), "{name}");
+            assert!(!upper.ends_with("_API_KEY"), "{name}");
+        }
+    }
+
     fn write_stub_synthesizer(path: &Path, name: &str, candidate: &str) -> PathBuf {
         let stub = path.join(name);
         fs::write(
@@ -3902,7 +3979,7 @@ steps:
         for script in [CBIOPORTAL_DISCOVERY_FETCH_PY, SOURCE_PROBE_FETCH_PY] {
             assert!(script.contains("HTTPRedirectHandler"));
             assert!(script.contains("redirect_request"));
-            assert!(script.contains("build_opener(_NoRedirect)"));
+            assert!(script.contains("build_opener(urllib.request.ProxyHandler({}), _NoRedirect)"));
             assert!(script.contains("_opener.open(request, timeout=timeout)"));
         }
     }
@@ -3918,22 +3995,56 @@ steps:
             assert!(script.contains("is_loopback"));
             assert!(script.contains("is_link_local"));
             assert!(script.contains("100.64.0.0/10"));
+            assert!(script.contains("ipv4_mapped"));
+            assert!(script.contains("64:ff9b::/96"));
             assert!(script.contains("raise RuntimeError"));
         }
     }
 
     #[test]
-    fn python_probe_scripts_skip_dns_pin_for_configured_proxy_hosts_only() {
+    fn probe_fetch_subprocess_commands_clear_environment() {
+        let cbioportal_command = cbioportal_discovery_fetch_command(
+            "https://www.cbioportal.org/api/studies",
+            Duration::from_secs(1),
+        );
+        let source_probe_command = public_source_probe_fetch_command(
+            "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE1",
+            Duration::from_secs(1),
+        );
+
+        assert_probe_fetch_command_env_is_clear(&cbioportal_command);
+        assert_probe_fetch_command_env_is_clear(&source_probe_command);
+    }
+
+    #[test]
+    fn python_probe_scripts_disable_environment_proxies() {
         for script in [CBIOPORTAL_DISCOVERY_FETCH_PY, SOURCE_PROBE_FETCH_PY] {
-            assert!(script.contains("getproxies"));
-            assert!(script.contains("urlsplit"));
-            assert!(script.contains("_configured_proxy_hosts"));
-            assert!(script.contains("_PROXY_HOSTS"));
-            assert!(script.contains("if host in _PROXY_HOSTS"));
+            assert!(script.contains("ProxyHandler({})"));
+            assert!(!script.contains("getproxies"));
+            assert!(!script.contains("_configured_proxy_hosts"));
+            assert!(!script.contains("_PROXY_HOSTS"));
+            assert!(!script.contains("if host in _PROXY_HOSTS"));
             assert!(script.contains("_is_blocked_ip"));
             assert!(script.contains("_validating_getaddrinfo"));
-            assert!(script.contains("build_opener(_NoRedirect)"));
+            assert!(script.contains("build_opener(urllib.request.ProxyHandler({}), _NoRedirect)"));
         }
+    }
+
+    #[test]
+    fn python_probe_classifiers_block_mapped_ipv6_and_nat64_private_targets() {
+        for script in [CBIOPORTAL_DISCOVERY_FETCH_PY, SOURCE_PROBE_FETCH_PY] {
+            let classifier = python_classifier_script(script, "_is_blocked_ip");
+            run_offline_python_assertions(&python_classifier_assertions(
+                &classifier,
+                "_is_blocked_ip",
+            ));
+        }
+    }
+
+    #[test]
+    fn python_egress_guard_classifier_blocks_mapped_ipv6_and_nat64_private_targets() {
+        let classifier = python_classifier_script(PYTHON_EGRESS_GUARD_SITECUSTOMIZE, "_blocked");
+        run_offline_python_assertions(&python_classifier_assertions(&classifier, "_blocked"));
     }
 
     #[test]
@@ -3955,6 +4066,8 @@ steps:
         assert!(PYTHON_EGRESS_GUARD_SITECUSTOMIZE.contains("is_private"));
         assert!(PYTHON_EGRESS_GUARD_SITECUSTOMIZE.contains("is_link_local"));
         assert!(PYTHON_EGRESS_GUARD_SITECUSTOMIZE.contains("100.64.0.0/10"));
+        assert!(PYTHON_EGRESS_GUARD_SITECUSTOMIZE.contains("ipv4_mapped"));
+        assert!(PYTHON_EGRESS_GUARD_SITECUSTOMIZE.contains("64:ff9b::/96"));
         assert!(PYTHON_EGRESS_GUARD_SITECUSTOMIZE.contains("agentflow egress blocked"));
     }
 

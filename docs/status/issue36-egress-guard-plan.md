@@ -104,6 +104,12 @@ socket.socket.connect = _connect
 4. 保留本 Python guard 作为 defense-in-depth：它能给合作脚本和非恶意 prompt-injection 失败
    提供更早、更可读的错误，但最终封堵必须由容器/VM/pf 等边界执行。
 
+部署级配方已独立成文：`docs/ops/egress-containment.md` 给出 Linux Docker
+`--network none`、Docker 受控网桥 + nftables allowlist、Linux network namespace +
+veth + nftables 三套最小 recipe，并配套 `scripts/verify-egress-policy.sh` 做只读
+烟测。issue #36 的范围应按"PR #49 已交付合作层 in-process guard；本文档化
+OS 边界封堵 recipe"收窄或关闭，但不要把合作层 guard 描述成反篡改沙箱。
+
 ## 不在本里程碑
 
 - 不做容器/VM/pf 集成(真封堵反篡改对手)——文档化为部署级方案。

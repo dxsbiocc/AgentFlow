@@ -207,6 +207,18 @@ issue36 增量给 Python 工具运行时注入 `sitecustomize` guard，monkeypat
 
 但它不是反篡改沙箱。生成脚本拥有完整 Python 运行时，理论上可 un-patch、替换 socket 函数或走其他解释器 / 原生路径绕过。
 
+### 6.6 部署级出网封堵配方
+
+issue36 的部署级残留已收敛为 `docs/ops/egress-containment.md`：在 Linux 部署环境中，
+通过 Docker `--network none`、Docker 受控网桥 + nftables allowlist、或 Linux network
+namespace + veth + nftables，把真正的 default-deny egress 策略下沉到 OS 边界。
+配方显式 DROP metadata `169.254.169.254`、RFC1918、link-local、loopback、CGNAT，
+并只放行明确公网 HTTPS 科学目标。`scripts/verify-egress-policy.sh` 可在隔离环境内做
+只读烟测；不在隔离环境时会退出 0，避免把开发机误判为失败。
+
+这层才是反篡改威胁模型下的真实 containment。Python in-process guard 仍保留为
+defense-in-depth 的早失败/可读错误层，但不能被包装成 anti-tamper 边界。
+
 ## 7. 已知边界与残留
 
 AgentFlow 当前边界应明确写出来：
@@ -218,7 +230,7 @@ AgentFlow 当前边界应明确写出来：
 - **工具进化到 AS17.2 仍是验证门，不是采纳门**：`promotable` 只表示候选通过跨队列验证；注册新版本、取代旧工具、谱系记录、verified 晋升属于 AS18 治理。
 - **AS17.x cohort 验证首版偏 cBioPortal / study 参数场景**：它证明 spec 级 cohort 参数化路径，不等于所有领域工具都已可自动泛化。
 - **网络安全仍有部署级残留**：Python guard 和 seatbelt 是 defense-in-depth；反篡改对手、raw socket、原生扩展、替换解释器等威胁，需要容器 / VM / pf / Kubernetes NetworkPolicy / CNI egress allowlist 等 OS 级边界。
-- **issue36 的核心残留**：真正封堵 RFC1918 / metadata / 私网出网，应在容器或 VM 内运行工具，并使用默认拒绝的 egress policy，只放行明确公网 allowlist。当前仓库文档只给出可达增量和部署配方，不把合作层 guard 包装成强沙箱。
+- **issue36 的核心残留**：真正封堵 RFC1918 / metadata / 私网出网，应在容器或 VM 内运行工具，并使用默认拒绝的 egress policy，只放行明确公网 allowlist。部署级 recipe 已记录在 `docs/ops/egress-containment.md`，但采用和运维集成仍由部署方完成；合作层 guard 不能包装成强沙箱。
 
 ## 8. 来源索引
 
@@ -228,6 +240,7 @@ AgentFlow 当前边界应明确写出来：
 - `docs/status/planA-local-survival-tool.md`
 - `docs/status/success-path-regression-plan.md`
 - `docs/status/issue36-egress-guard-plan.md`
+- `docs/ops/egress-containment.md`
 - `docs/design/tool-evolution-engine-design.md`
 
 如果未来实现 AS18，应同步更新本文件中“工具进化引擎”和“已知边界”两节，尤其是谱系、取代、specificity 轴和人在环采纳门。

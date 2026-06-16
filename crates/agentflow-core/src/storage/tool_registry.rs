@@ -677,21 +677,147 @@ impl ParsedExecutableSections {
 }
 
 fn is_inline_interpreter_command(command: &[String]) -> bool {
-    let Some(executable) = command.first() else {
+    let command = effective_command_argv(command);
+    let Some((executable, args)) = command.split_first() else {
         return false;
     };
-    let Some(flag) = command.get(1).map(String::as_str) else {
-        return false;
+    match executable_basename(executable) {
+        "sh" | "bash" | "zsh" | "fish" => shell_uses_inline_flag(args),
+        "python" | "python3" | "perl" | "ruby" | "node" => interpreter_uses_inline_flag(args),
+        _ => false,
+    }
+}
+
+fn effective_command_argv(command: &[String]) -> Vec<&str> {
+    let argv: Vec<&str> = command.iter().map(String::as_str).collect();
+    let Some(executable) = argv.first() else {
+        return Vec::new();
     };
-    let basename = Path::new(executable)
+    if executable_basename(executable) == "env" {
+        unwrap_env_command(&argv[1..])
+    } else {
+        argv
+    }
+}
+
+fn executable_basename(executable: &str) -> &str {
+    Path::new(executable)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(executable);
-    matches!(
-        (basename, flag),
-        ("sh" | "bash" | "zsh" | "fish", "-c" | "-lc")
-            | ("python" | "python3" | "perl" | "ruby" | "node", "-c" | "-e")
-    )
+        .unwrap_or(executable)
+}
+
+fn unwrap_env_command<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index];
+        if is_env_assignment(arg) {
+            index += 1;
+            continue;
+        }
+        match arg {
+            "--" => return command_after_env_assignments(&args[index + 1..]),
+            "-i" | "-0" | "-" | "--ignore-environment" | "--null" => {
+                index += 1;
+            }
+            "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0" => {
+                index = (index + 2).min(args.len());
+            }
+            "-S" | "--split-string" => {
+                let Some(split_command) = args.get(index + 1) else {
+                    return Vec::new();
+                };
+                return split_env_command(split_command, &args[index + 2..]);
+            }
+            _ if arg.starts_with("--split-string=") => {
+                let split_command = arg.trim_start_matches("--split-string=");
+                return split_env_command(split_command, &args[index + 1..]);
+            }
+            _ if arg.starts_with("--unset=")
+                || arg.starts_with("--chdir=")
+                || arg.starts_with("--argv0=") =>
+            {
+                index += 1;
+            }
+            _ if arg.starts_with("-S") && arg.len() > 2 => {
+                let split_command = arg.trim_start_matches("-S");
+                return split_env_command(split_command, &args[index + 1..]);
+            }
+            _ if (arg.starts_with("-u") || arg.starts_with("-C") || arg.starts_with("-a"))
+                && arg.len() > 2 =>
+            {
+                index += 1;
+            }
+            _ if arg.starts_with('-') => {
+                index += 1;
+            }
+            _ => return command_after_env_assignments(&args[index..]),
+        }
+    }
+    Vec::new()
+}
+
+fn split_env_command<'a>(split_command: &'a str, rest: &[&'a str]) -> Vec<&'a str> {
+    let mut command: Vec<&str> = split_command.split_whitespace().collect();
+    command.extend_from_slice(rest);
+    command_after_env_assignments(&command)
+}
+
+fn command_after_env_assignments<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut index = 0;
+    while index < args.len() && is_env_assignment(args[index]) {
+        index += 1;
+    }
+    args[index..].to_vec()
+}
+
+fn is_env_assignment(arg: &str) -> bool {
+    let Some((name, _)) = arg.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first != '_' && !first.is_ascii_alphabetic() {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn shell_uses_inline_flag(args: &[&str]) -> bool {
+    for &arg in args {
+        if arg == "--" {
+            return false;
+        }
+        if arg.starts_with("--") {
+            continue;
+        }
+        if arg.starts_with('-') {
+            if arg.contains('c') {
+                return true;
+            }
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+fn interpreter_uses_inline_flag(args: &[&str]) -> bool {
+    for &arg in args {
+        if arg == "--" {
+            return false;
+        }
+        if arg == "-c" || arg == "-e" {
+            return true;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        return false;
+    }
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1842,6 +1968,10 @@ runtime:
         ))
     }
 
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
     #[test]
     fn parses_v0_simple_yaml_metadata() {
         let spec = ToolSpec::from_simple_yaml(&sample_tool("0.1.0")).unwrap();
@@ -2564,6 +2694,37 @@ runtime:
     }
 
     #[test]
+    fn blocks_inline_interpreter_bypass_variants() {
+        for command in [
+            argv(&["/usr/bin/env", "sh", "-c", "echo unsafe"]),
+            argv(&["/usr/bin/env", "python3", "-c", "print('unsafe')"]),
+            argv(&["/bin/sh", "-ec", "echo unsafe"]),
+            argv(&["/bin/bash", "--noprofile", "-c", "echo unsafe"]),
+            argv(&["/usr/bin/env", "-S", "bash", "-c", "echo unsafe"]),
+            argv(&["/usr/bin/env", "VAR=1", "sh", "-c", "echo unsafe"]),
+        ] {
+            assert!(
+                is_inline_interpreter_command(&command),
+                "expected inline command to be blocked: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_interpreters_running_script_files_and_normal_executables() {
+        for command in [
+            argv(&["/usr/bin/env", "python3", "script.py"]),
+            argv(&["/usr/bin/python3", "script.py"]),
+            argv(&["/bin/mytool", "arg1"]),
+        ] {
+            assert!(
+                !is_inline_interpreter_command(&command),
+                "expected command to be allowed: {command:?}"
+            );
+        }
+    }
+
+    #[test]
     fn registers_lists_and_inspects_tool() {
         let path = temp_project_path("register-list-inspect");
         let store = ProjectStore::init(&path, Some("Tools")).unwrap();
@@ -2803,6 +2964,29 @@ runtime:
         assert_eq!(migrations::checksum(&tcga_json), "ba5f8753e95845de");
         let marker_payload: StoredToolSpecJson = serde_json::from_str(&marker_json).unwrap();
         assert_eq!(marker_payload.name, "marker_survival_scan");
+    }
+
+    #[test]
+    fn registers_existing_example_tool_yamls() {
+        let examples_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("examples/tools");
+        let path = temp_project_path("register-example-tools");
+        let store = ProjectStore::init(&path, Some("Tools")).unwrap();
+
+        for file_name in [
+            "local_survival_assoc.tool.yaml",
+            "marker_survival_scan.tool.yaml",
+            "tcga_survival_assoc.tool.yaml",
+        ] {
+            store
+                .register_tool(example_tool_spec(&examples_root, file_name))
+                .unwrap();
+        }
+
+        assert_eq!(store.list_tools().unwrap().len(), 3);
+
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]

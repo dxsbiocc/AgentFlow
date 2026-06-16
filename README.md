@@ -20,7 +20,9 @@ for the control-layer architecture (engines, control constitution A1–A4, miles
 and [launch-readiness-2026-05-29.md](docs/status/launch-readiness-2026-05-29.md) for the
 runtime-slice launch status.
 
-See [launch-readiness-2026-05-29.md](docs/status/launch-readiness-2026-05-29.md) for the launch-facing status, known gaps, and residual risks.
+See [launch-readiness-2026-05-29.md](docs/status/launch-readiness-2026-05-29.md) for the launch-facing status, known gaps, and residual risks. For a consolidated capability / honesty-invariant / security-boundary overview, see [docs/CAPABILITIES.md](docs/CAPABILITIES.md); for the security policy and threat model, [SECURITY.md](SECURITY.md); for the change history, [CHANGELOG.md](CHANGELOG.md).
+
+Licensed under the [MIT License](LICENSE).
 
 ## Quick Start
 
@@ -133,17 +135,17 @@ agentflow trace revert <checkpoint-id> --path "$AF_DEMO"  # roll back auto-appli
 
 - Default-on autonomy: autonomous apply is **off by default** and only runs when the operator passes `agent run --apply`; there is no always-on/unattended autonomous mode
 - Autonomous dependency wiring: applied steps are added without inferred `needs` edges; cross-step graph wiring, multi-flow orchestration, and auto-forage (deepen → fetch evidence) are not yet wired into the loop
-- Tool promotion pipeline and capability tagging: tool matching uses description/port-type/maturity heuristics, not a curated capability index or exploratory→verified promotion flow
+- Curated capability index: tool matching uses description/port-type/maturity heuristics rather than a curated capability index (note: a **tool evolution engine** now detects generalization candidates, validates them cross-cohort, and auto-registers a generalized `exploratory` candidate for human adoption — see [docs/CAPABILITIES.md](docs/CAPABILITIES.md) §4)
 - Implicit environment creation, solving, or package installation during `run`
 - Full lockfile normalization, dependency solving, package-manager-specific diff semantics, or environment garbage collection
 - Remote or isolated execution backends such as Docker, Singularity, or SLURM
 - Parallel scheduler execution or cancellation controls
 - Rich semantic validators such as file signatures, domain-specific QC policies, and pluggable validator registries
-- Full graph-branch lifecycle such as delete, merge, rollback, supersede, or decision-node management
+- Full graph-branch lifecycle such as delete, merge, rollback, or decision-node management (tool-level `supersede` lineage **is** supported — see `agentflow tools supersede`)
 - Cache eviction policy beyond explicit `--all` and `--older-than-seconds` pruning
 - JSON/HTML report export or persisted report artifacts
 - Full-text retrieval, citation graphs, Unpaywall resolution, or non-PubMed literature sources (forage currently covers PubMed metadata/abstracts via an external script)
-- Security sandboxing, container isolation, redaction policy, or resource quotas
+- Anti-tamper sandboxing, container isolation, redaction policy, or resource quotas. A **cooperative** in-process egress guard (blocks private/loopback/metadata/CGNAT for synthesized Python tools) and a DNS-pinned allowlist on the source-discovery probe path **are** in place; true anti-tamper containment is deployment-level (container/netns/nftables) and documented in [docs/ops/egress-containment.md](docs/ops/egress-containment.md). See [SECURITY.md](SECURITY.md) for the threat model.
 
 ## Verification Commands
 

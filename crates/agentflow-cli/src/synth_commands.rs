@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,46 @@ const VALIDATION_PATH: &str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
 const PYTHON_SEATBELT_PROFILE: &str = r#"(version 1)
 (allow default)
 (deny network-outbound (remote ip "localhost:*"))"#;
+const PYTHON_EGRESS_GUARD_SITECUSTOMIZE: &str = r#"import ipaddress
+import socket
+
+def _blocked(ip):
+    addr = ipaddress.ip_address(ip)
+    if addr.is_private or addr.is_loopback or addr.is_link_local \
+       or addr.is_reserved or addr.is_multicast or addr.is_unspecified:
+        return True
+    if addr.version == 4 and addr in ipaddress.ip_network("100.64.0.0/10"):
+        return True
+    return False
+
+_real_getaddrinfo = socket.getaddrinfo
+
+def _guarded_getaddrinfo(host, *args, **kwargs):
+    results = _real_getaddrinfo(host, *args, **kwargs)
+    for result in results:
+        ip = result[4][0]
+        if _blocked(ip):
+            raise OSError(
+                "agentflow egress blocked: non-public address %s for host %s" % (ip, host)
+            )
+    return results
+
+socket.getaddrinfo = _guarded_getaddrinfo
+
+_real_connect = socket.socket.connect
+
+def _guarded_connect(self, address):
+    try:
+        host = address[0]
+        ipaddress.ip_address(host)
+        if _blocked(host):
+            raise OSError("agentflow egress blocked: non-public address %s" % host)
+    except ValueError:
+        pass
+    return _real_connect(self, address)
+
+socket.socket.connect = _guarded_connect
+"#;
 const PRIMARY_VALIDATION_GENE: &str = "TP53";
 const ALTERNATE_VALIDATION_GENE: &str = "EGFR";
 const MAX_SOURCE_PROBE_BYTES: usize = 65_536;
@@ -2270,7 +2311,7 @@ fn run_python_script(
     timeout: Duration,
     inputs: SynthValidationInputs<'_>,
 ) -> Result<ValidationOutput, CliError> {
-    let (mut command, result_path) = python_command(script_path, workdir);
+    let (mut command, result_path) = python_command(script_path, workdir)?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     set_validation_domain_param_env(&mut command, inputs);
     if let Some(fixture) = fixture {
@@ -2338,8 +2379,10 @@ fn sandbox_exec_usable() -> bool {
     })
 }
 
-fn python_command(script_path: &Path, workdir: &Path) -> (Command, PathBuf) {
+fn python_command(script_path: &Path, workdir: &Path) -> Result<(Command, PathBuf), CliError> {
     let result_path = workdir.join("result.txt");
+    let guard_dir = install_python_egress_guard(workdir)?;
+    let pythonpath = pythonpath_with_egress_guard(&guard_dir)?;
     let sandboxed = sandbox_exec_usable();
     let mut command = if sandboxed {
         let mut command = Command::new("/usr/bin/sandbox-exec");
@@ -2361,7 +2404,7 @@ fn python_command(script_path: &Path, workdir: &Path) -> (Command, PathBuf) {
     command
         .env_clear()
         .env("PATH", VALIDATION_PATH)
-        .env("PYTHONPATH", cbioportal_pythonpath_value())
+        .env("PYTHONPATH", pythonpath)
         .env("AGENTFLOW_WORKDIR", workdir)
         .env("AGENTFLOW_OUTPUT_RESULT", &result_path)
         .env("AGENTFLOW_OUTPUT_REPORT", &result_path)
@@ -2374,7 +2417,29 @@ fn python_command(script_path: &Path, workdir: &Path) -> (Command, PathBuf) {
         // allowlisted public hosts working while loopback stays blocked.
         command.env("no_proxy", "*").env("NO_PROXY", "*");
     }
-    (command, result_path)
+    Ok((command, result_path))
+}
+
+fn install_python_egress_guard(workdir: &Path) -> Result<PathBuf, CliError> {
+    let guard_dir = python_egress_guard_dir(workdir);
+    fs::create_dir_all(&guard_dir)?;
+    fs::write(
+        guard_dir.join("sitecustomize.py"),
+        PYTHON_EGRESS_GUARD_SITECUSTOMIZE.as_bytes(),
+    )?;
+    Ok(guard_dir)
+}
+
+fn python_egress_guard_dir(workdir: &Path) -> PathBuf {
+    workdir.join("python-egress-guard")
+}
+
+fn pythonpath_with_egress_guard(guard_dir: &Path) -> Result<OsString, CliError> {
+    std::env::join_paths([
+        guard_dir.to_path_buf(),
+        PathBuf::from(cbioportal_pythonpath_value()),
+    ])
+    .map_err(|error| CliError::Core(format!("failed to build Python egress guard path: {error}")))
 }
 
 fn set_validation_domain_param_env(command: &mut Command, inputs: SynthValidationInputs<'_>) {
@@ -3881,6 +3946,97 @@ steps:
         assert!(PYTHON_SEATBELT_PROFILE.starts_with("(version 1)\n"));
         assert!(!PYTHON_SEATBELT_PROFILE.contains("127.0.0.1:*"));
         assert!(!PYTHON_SEATBELT_PROFILE.contains("169.254.169.254:*"));
+    }
+
+    #[test]
+    fn python_egress_guard_sitecustomize_contains_dns_and_literal_ip_blocks() {
+        assert!(PYTHON_EGRESS_GUARD_SITECUSTOMIZE.contains("getaddrinfo"));
+        assert!(PYTHON_EGRESS_GUARD_SITECUSTOMIZE.contains("connect"));
+        assert!(PYTHON_EGRESS_GUARD_SITECUSTOMIZE.contains("is_private"));
+        assert!(PYTHON_EGRESS_GUARD_SITECUSTOMIZE.contains("is_link_local"));
+        assert!(PYTHON_EGRESS_GUARD_SITECUSTOMIZE.contains("100.64.0.0/10"));
+        assert!(PYTHON_EGRESS_GUARD_SITECUSTOMIZE.contains("agentflow egress blocked"));
+    }
+
+    #[test]
+    fn python_command_prepends_egress_guard_dir_to_pythonpath() {
+        let path = temp_project_path("python-egress-guard-path");
+        fs::create_dir_all(&path).unwrap();
+        let script = path.join("noop.py");
+        fs::write(&script, "print('ok')\n").unwrap();
+
+        let (command, _result_path) = python_command(&script, &path).unwrap();
+        let pythonpath = command
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == "PYTHONPATH").then(|| value.expect("PYTHONPATH should be set").to_owned())
+            })
+            .expect("PYTHONPATH should be present");
+        let paths = std::env::split_paths(&pythonpath).collect::<Vec<_>>();
+
+        assert_eq!(paths.first(), Some(&python_egress_guard_dir(&path)));
+        assert_eq!(
+            paths.get(1),
+            Some(&PathBuf::from(cbioportal_pythonpath_value()))
+        );
+        assert!(python_egress_guard_dir(&path)
+            .join("sitecustomize.py")
+            .exists());
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn python_egress_guard_blocks_private_and_loopback_without_network() {
+        let path = temp_project_path("python-egress-guard-behavior");
+        fs::create_dir_all(&path).unwrap();
+        let script = path.join("guard_behavior.py");
+        fs::write(
+            &script,
+            r#"import sitecustomize
+import socket
+
+def expect_blocked(label, action):
+    try:
+        action()
+    except OSError as error:
+        if "agentflow egress blocked" not in str(error):
+            raise SystemExit(f"{label}: wrong error {error!r}")
+        print(f"{label}=blocked")
+        return
+    raise SystemExit(f"{label}: allowed")
+
+expect_blocked(
+    "metadata",
+    lambda: socket.socket().connect(("169.254.169.254", 80)),
+)
+expect_blocked(
+    "loopback_dns",
+    lambda: socket.getaddrinfo("localhost", 80),
+)
+print(f"public_blocked={sitecustomize._blocked('1.1.1.1')}")
+"#,
+        )
+        .unwrap();
+
+        let validation = run_python_script(
+            &script,
+            None,
+            &path,
+            Duration::from_secs(10),
+            SynthValidationInputs {
+                gene: "TP53",
+                study: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(validation.exit_code, Some(0), "{validation:?}");
+        assert!(validation.stdout.contains("metadata=blocked"));
+        assert!(validation.stdout.contains("loopback_dns=blocked"));
+        assert!(validation.stdout.contains("public_blocked=False"));
+
+        let _ = fs::remove_dir_all(path);
     }
 
     #[cfg(target_os = "macos")]

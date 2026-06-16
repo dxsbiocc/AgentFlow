@@ -285,6 +285,8 @@ pub(crate) struct ImportArgs {
     pub(crate) artifact_type: Vec<String>,
     #[arg(long, value_name = "reference|copy")]
     pub(crate) mode: Vec<String>,
+    #[arg(long)]
+    pub(crate) allow_external_reference: bool,
     #[command(flatten)]
     pub(crate) project: PathOnlyArgs,
 }

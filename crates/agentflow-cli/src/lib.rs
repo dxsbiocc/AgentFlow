@@ -68,7 +68,7 @@ pub fn usage() -> String {
         "  agentflow env check <tool-ref> [--json] [--path <path>]",
         "  agentflow env prepare <tool-ref> [--json] [--path <path>]",
         "  agentflow env export <tool-ref> [--json] [--path <path>]",
-        "  agentflow import <file> --type <artifact-type> [--mode reference|copy] [--path <path>]",
+        "  agentflow import <file> --type <artifact-type> [--mode reference|copy] [--allow-external-reference] [--path <path>]",
         "  agentflow artifacts list [--json] [--path <path>]",
         "  agentflow artifacts inspect <artifact-id> [--json] [--path <path>]",
         "  agentflow flow validate <flow.yaml> [--json] [--path <path>]",
@@ -1069,20 +1069,43 @@ fn import_command(args: ImportArgs) -> Result<String, CliError> {
     })?;
     let project_path = options.project_path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
-    let imported = store.import_artifact(agentflow_core::storage::ArtifactImportRequest {
-        source_path: PathBuf::from(source_path),
+    let source_path = PathBuf::from(source_path);
+    let allow_external_reference =
+        options.allow_external_reference || is_bundled_examples_data_reference(&source_path);
+    let request = agentflow_core::storage::ArtifactImportRequest {
+        source_path,
         artifact_type,
         mode: options.mode,
-    })?;
+    };
+    let imported = if allow_external_reference {
+        store.import_artifact_allowing_external_reference(request)
+    } else {
+        store.import_artifact(request)
+    }?;
+    let display_path = store.display_artifact_path(&imported.summary.path);
 
     Ok(format!(
         "Imported artifact\nId: {}\nType: {}\nMode: {}\nPath: {}\nHash: {}",
         imported.summary.id,
         imported.summary.artifact_type,
         options.mode,
-        imported.summary.path.display(),
+        display_path,
         imported.summary.hash.unwrap_or_else(|| "none".to_string())
     ))
+}
+
+fn is_bundled_examples_data_reference(source_path: &Path) -> bool {
+    let Ok(canonical_source) = fs::canonicalize(source_path) else {
+        return false;
+    };
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(workspace_root) = manifest_dir.parent().and_then(Path::parent) else {
+        return false;
+    };
+    let Ok(examples_data_root) = fs::canonicalize(workspace_root.join("examples/data")) else {
+        return false;
+    };
+    canonical_source.starts_with(examples_data_root)
 }
 
 fn artifacts_command(args: ArtifactsArgs) -> Result<String, CliError> {
@@ -1099,7 +1122,7 @@ fn artifacts_list_command(args: PathJsonArgs) -> Result<String, CliError> {
     let artifacts = store.list_artifacts()?;
 
     if options.json {
-        Ok(agentflow_core::storage::artifacts_list_json(&artifacts))
+        Ok(store.artifacts_list_json(&artifacts))
     } else if artifacts.is_empty() {
         Ok("No artifacts registered".to_string())
     } else {
@@ -1111,7 +1134,7 @@ fn artifacts_list_command(args: PathJsonArgs) -> Result<String, CliError> {
                     artifact.id,
                     artifact.kind,
                     artifact.artifact_type,
-                    artifact.path.display()
+                    store.display_artifact_path(&artifact.path)
                 )
             })
             .collect::<Vec<_>>()
@@ -1127,21 +1150,23 @@ fn artifacts_inspect_command(args: ArtifactInspectArgs) -> Result<String, CliErr
     let inspection = store.inspect_artifact(&artifact_id)?;
 
     if options.json {
-        Ok(inspection.to_json())
+        Ok(store.artifact_inspection_json(&inspection))
     } else {
+        let display_path = store.display_artifact_path(&inspection.summary.path);
+        let validation_json = store.artifact_validation_json(&inspection.validation_json);
         Ok(format!(
             "Artifact: {}\nKind: {}\nType: {}\nPath: {}\nHash: {}\nSize: {}\nCreated: {}\nValidation:\n{}",
             inspection.summary.id,
             inspection.summary.kind,
             inspection.summary.artifact_type,
-            inspection.summary.path.display(),
+            display_path,
             inspection.summary.hash.unwrap_or_else(|| "none".to_string()),
             inspection
                 .summary
                 .size_bytes
                 .map_or_else(|| "unknown".to_string(), |size| size.to_string()),
             inspection.summary.created_at,
-            inspection.validation_json
+            validation_json
         ))
     }
 }
@@ -1262,6 +1287,7 @@ struct ImportOptions {
     source_path: Option<String>,
     artifact_type: Option<String>,
     mode: agentflow_core::storage::ArtifactImportMode,
+    allow_external_reference: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1331,6 +1357,7 @@ impl Default for ImportOptions {
             source_path: None,
             artifact_type: None,
             mode: agentflow_core::storage::ArtifactImportMode::Reference,
+            allow_external_reference: false,
         }
     }
 }
@@ -1408,6 +1435,7 @@ impl TryFrom<ImportArgs> for ImportOptions {
             source_path: Some(args.file.display().to_string()),
             artifact_type: last_value(args.artifact_type),
             mode,
+            allow_external_reference: args.allow_external_reference,
         })
     }
 }
@@ -2774,6 +2802,7 @@ steps:
         assert!(output.contains("agentflow env export <tool-ref>"));
         assert!(output.contains("agentflow llm config --provider anthropic|openai|gemini|deepseek"));
         assert!(output.contains("agentflow tools supersede <old-tool-ref> --by <new-tool-ref>"));
+        assert!(output.contains("--allow-external-reference"));
     }
 
     #[test]
@@ -3930,6 +3959,145 @@ runtime:
         .unwrap();
         assert!(inspect.contains("\"schema_version\":\"agentflow.artifact_inspection.v0\""));
         assert!(inspect.contains("\"import_mode\":\"reference\""));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn import_external_reference_requires_flag_and_sanitizes_outputs() {
+        let path = temp_project_path("import-external-flag");
+        let external_path = temp_project_path("import-external-source");
+        fs::create_dir_all(&external_path).unwrap();
+        let external_file =
+            write_sample_artifact(&external_path, "external.tsv", "sample\tTP53\nA\t1.2\n");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let rejected = run(args(&[
+            "agentflow",
+            "import",
+            external_file.to_str().unwrap(),
+            "--type",
+            "TSV",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+        assert!(rejected.message().contains("--allow-external-reference"));
+        assert!(rejected.message().contains("--mode copy"));
+
+        let imported = run(args(&[
+            "agentflow",
+            "import",
+            external_file.to_str().unwrap(),
+            "--type",
+            "TSV",
+            "--allow-external-reference",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(imported.contains("Path: <external-reference>/external.tsv"));
+        assert!(!imported.contains(external_path.to_str().unwrap()));
+
+        let list = run(args(&[
+            "agentflow",
+            "artifacts",
+            "list",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(list.contains("<external-reference>/external.tsv"));
+        assert!(!list.contains(external_path.to_str().unwrap()));
+
+        let list_json = run(args(&[
+            "agentflow",
+            "artifacts",
+            "list",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(list_json.contains("\"path\":\"<external-reference>/external.tsv\""));
+        assert!(!list_json.contains(external_path.to_str().unwrap()));
+        let artifact_id = list_json
+            .split("\"id\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap();
+
+        let inspect = run(args(&[
+            "agentflow",
+            "artifacts",
+            "inspect",
+            artifact_id,
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(inspect.contains("Path: <external-reference>/external.tsv"));
+        assert!(inspect.contains("\"source_path\":\"<external-reference>/external.tsv\""));
+        assert!(!inspect.contains(external_path.to_str().unwrap()));
+
+        let inspect_json = run(args(&[
+            "agentflow",
+            "artifacts",
+            "inspect",
+            artifact_id,
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(inspect_json.contains("\"path\":\"<external-reference>/external.tsv\""));
+        assert!(inspect_json.contains("\"source_path\":\"<external-reference>/external.tsv\""));
+        assert!(!inspect_json.contains(external_path.to_str().unwrap()));
+
+        let _ = fs::remove_dir_all(path);
+        let _ = fs::remove_dir_all(external_path);
+    }
+
+    #[test]
+    fn import_bundled_examples_data_stays_demo_compatible() {
+        let path = temp_project_path("import-bundled-examples-data");
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let expression_path = workspace_root.join("examples/data/expression.tsv");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let imported = run(args(&[
+            "agentflow",
+            "import",
+            expression_path.to_str().unwrap(),
+            "--type",
+            "TSV",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert!(imported.contains("Imported artifact"));
+        assert!(imported.contains("Path: <external-reference>/expression.tsv"));
+        assert!(!imported.contains(workspace_root.to_str().unwrap()));
 
         let _ = fs::remove_dir_all(path);
     }

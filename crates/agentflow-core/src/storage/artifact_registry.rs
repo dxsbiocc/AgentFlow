@@ -87,6 +87,21 @@ impl ProjectStore {
         &self,
         request: ArtifactImportRequest,
     ) -> Result<ArtifactInspection, StorageError> {
+        self.import_artifact_with_external_reference_policy(request, false)
+    }
+
+    pub fn import_artifact_allowing_external_reference(
+        &self,
+        request: ArtifactImportRequest,
+    ) -> Result<ArtifactInspection, StorageError> {
+        self.import_artifact_with_external_reference_policy(request, true)
+    }
+
+    fn import_artifact_with_external_reference_policy(
+        &self,
+        request: ArtifactImportRequest,
+        allow_external_reference: bool,
+    ) -> Result<ArtifactInspection, StorageError> {
         validate_artifact_type(&request.artifact_type)?;
 
         let source_path = request.source_path.as_path();
@@ -104,6 +119,10 @@ impl ProjectStore {
         }
 
         let canonical_source = fs::canonicalize(source_path)?;
+        if request.mode == ArtifactImportMode::Reference && !allow_external_reference {
+            validate_reference_source_is_project_internal(&canonical_source, self.root_path())?;
+        }
+
         let id = format!("artifact_{}", now_unix_nanos());
         let stored_path = match request.mode {
             ArtifactImportMode::Reference => canonical_source.clone(),
@@ -169,6 +188,22 @@ impl ProjectStore {
         self.touch_project()?;
 
         self.inspect_artifact(&id)
+    }
+
+    pub fn artifacts_list_json(&self, artifacts: &[ArtifactSummary]) -> String {
+        artifacts_list_json_for_project(artifacts, self.root_path())
+    }
+
+    pub fn artifact_inspection_json(&self, inspection: &ArtifactInspection) -> String {
+        artifact_inspection_json_for_project(inspection, self.root_path())
+    }
+
+    pub fn artifact_validation_json(&self, validation_json: &str) -> String {
+        artifact_validation_json_for_project(validation_json, self.root_path())
+    }
+
+    pub fn display_artifact_path(&self, path: &Path) -> String {
+        display_artifact_path_for_project(path, self.root_path())
     }
 
     pub fn list_artifacts(&self) -> Result<Vec<ArtifactSummary>, StorageError> {
@@ -318,6 +353,17 @@ pub fn artifacts_list_json(artifacts: &[ArtifactSummary]) -> String {
     .expect("artifact list serializes to JSON")
 }
 
+fn artifacts_list_json_for_project(artifacts: &[ArtifactSummary], project_root: &Path) -> String {
+    serde_json::to_string(&ArtifactsListJson {
+        schema_version: agentflow_schemas::ARTIFACT_LIST_JSON_SCHEMA_V0.to_string(),
+        artifacts: artifacts
+            .iter()
+            .map(|artifact| artifact_summary_json_value_for_project(artifact, project_root))
+            .collect(),
+    })
+    .expect("artifact list serializes to JSON")
+}
+
 fn artifact_inspection_json(inspection: &ArtifactInspection) -> String {
     serde_json::to_string(&ArtifactInspectionJson {
         schema_version: agentflow_schemas::ARTIFACT_INSPECTION_JSON_SCHEMA_V0.to_string(),
@@ -326,6 +372,26 @@ fn artifact_inspection_json(inspection: &ArtifactInspection) -> String {
             .expect("stored artifact validation JSON is valid"),
     })
     .expect("artifact inspection serializes to JSON")
+}
+
+fn artifact_inspection_json_for_project(
+    inspection: &ArtifactInspection,
+    project_root: &Path,
+) -> String {
+    serde_json::to_string(&ArtifactInspectionProjectJson {
+        schema_version: agentflow_schemas::ARTIFACT_INSPECTION_JSON_SCHEMA_V0.to_string(),
+        artifact: artifact_summary_json_value_for_project(&inspection.summary, project_root),
+        validation: sanitized_validation_json_value(&inspection.validation_json, project_root),
+    })
+    .expect("artifact inspection serializes to JSON")
+}
+
+fn artifact_validation_json_for_project(validation_json: &str, project_root: &Path) -> String {
+    serde_json::to_string(&sanitized_validation_json_value(
+        validation_json,
+        project_root,
+    ))
+    .expect("artifact validation serializes to JSON")
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -339,6 +405,13 @@ struct ArtifactInspectionJson {
     schema_version: String,
     artifact: ArtifactSummaryJson,
     validation: ArtifactValidationJson,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactInspectionProjectJson {
+    schema_version: String,
+    artifact: ArtifactSummaryJson,
+    validation: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,6 +459,23 @@ fn artifact_summary_json_value(artifact: &ArtifactSummary) -> ArtifactSummaryJso
         kind: artifact.kind.clone(),
         artifact_type: artifact.artifact_type.clone(),
         path: artifact.path.display().to_string(),
+        hash: artifact.hash.clone(),
+        size_bytes: artifact.size_bytes,
+        source_step_id: artifact.source_step_id.clone(),
+        source_run_id: artifact.source_run_id.clone(),
+        created_at: artifact.created_at,
+    }
+}
+
+fn artifact_summary_json_value_for_project(
+    artifact: &ArtifactSummary,
+    project_root: &Path,
+) -> ArtifactSummaryJson {
+    ArtifactSummaryJson {
+        id: artifact.id.clone(),
+        kind: artifact.kind.clone(),
+        artifact_type: artifact.artifact_type.clone(),
+        path: display_artifact_path_for_project(&artifact.path, project_root),
         hash: artifact.hash.clone(),
         size_bytes: artifact.size_bytes,
         source_step_id: artifact.source_step_id.clone(),
@@ -463,6 +553,70 @@ fn computed_validation_json(
         stored_path: stored_path.display().to_string(),
     })
     .expect("artifact computed validation serializes to JSON")
+}
+
+fn validate_reference_source_is_project_internal(
+    canonical_source: &Path,
+    project_root: &Path,
+) -> Result<(), StorageError> {
+    let canonical_project_root = fs::canonicalize(project_root)?;
+    if canonical_source.starts_with(&canonical_project_root) {
+        return Ok(());
+    }
+
+    Err(StorageError::InvalidInput(format!(
+        "artifact reference resolves outside the project root: {}. Use --allow-external-reference to permit an external reference explicitly, or use --mode copy to copy the file into the project.",
+        external_reference_display(canonical_source)
+    )))
+}
+
+fn sanitized_validation_json_value(
+    validation_json: &str,
+    project_root: &Path,
+) -> serde_json::Value {
+    let mut value: serde_json::Value =
+        serde_json::from_str(validation_json).expect("stored artifact validation JSON is valid");
+    if let Some(object) = value.as_object_mut() {
+        for key in ["source_path", "stored_path"] {
+            if let Some(path_value) = object.get_mut(key) {
+                if let Some(path) = path_value.as_str() {
+                    *path_value = serde_json::Value::String(display_artifact_path_for_project(
+                        path,
+                        project_root,
+                    ));
+                }
+            }
+        }
+    }
+    value
+}
+
+fn display_artifact_path_for_project(path: impl AsRef<Path>, project_root: &Path) -> String {
+    let path = path.as_ref();
+    let display_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let display_root =
+        fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+
+    if let Ok(relative_path) = display_path.strip_prefix(&display_root) {
+        return if relative_path.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            relative_path.display().to_string()
+        };
+    }
+
+    if display_path.is_absolute() {
+        external_reference_display(&display_path)
+    } else {
+        display_path.display().to_string()
+    }
+}
+
+fn external_reference_display(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || "<external-reference>".to_string(),
+        |file_name| format!("<external-reference>/{}", file_name.to_string_lossy()),
+    )
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -597,6 +751,81 @@ mod tests {
     }
 
     #[test]
+    fn reference_import_rejects_external_path_by_default() {
+        let path = temp_project_path("reference-external-reject");
+        let external_path = temp_project_path("reference-external-source");
+        fs::create_dir_all(&external_path).unwrap();
+        let source_path = write_input(&external_path, "external.tsv");
+        let store = ProjectStore::init(&path, Some("Artifacts")).unwrap();
+
+        let err = store
+            .import_artifact(ArtifactImportRequest {
+                source_path,
+                artifact_type: "TSV".to_string(),
+                mode: ArtifactImportMode::Reference,
+            })
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("external reference"));
+        assert!(message.contains("--allow-external-reference"));
+        assert!(message.contains("--mode copy"));
+
+        let _ = fs::remove_dir_all(path);
+        let _ = fs::remove_dir_all(external_path);
+    }
+
+    #[test]
+    fn reference_import_allows_external_path_with_explicit_opt_in() {
+        let path = temp_project_path("reference-external-allow");
+        let external_path = temp_project_path("reference-external-allowed-source");
+        fs::create_dir_all(&external_path).unwrap();
+        let source_path = write_input(&external_path, "external.tsv");
+        let canonical_source = fs::canonicalize(&source_path).unwrap();
+        let store = ProjectStore::init(&path, Some("Artifacts")).unwrap();
+
+        let imported = store
+            .import_artifact_allowing_external_reference(ArtifactImportRequest {
+                source_path,
+                artifact_type: "TSV".to_string(),
+                mode: ArtifactImportMode::Reference,
+            })
+            .unwrap();
+
+        assert_eq!(imported.summary.path, canonical_source);
+
+        let _ = fs::remove_dir_all(path);
+        let _ = fs::remove_dir_all(external_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reference_import_rejects_project_symlink_to_external_target() {
+        use std::os::unix::fs::symlink;
+
+        let path = temp_project_path("reference-symlink-external");
+        let external_path = temp_project_path("reference-symlink-target");
+        fs::create_dir_all(&external_path).unwrap();
+        let source_path = write_input(&external_path, "target.tsv");
+        let store = ProjectStore::init(&path, Some("Artifacts")).unwrap();
+        let link_path = path.join("linked.tsv");
+        symlink(&source_path, &link_path).unwrap();
+
+        let err = store
+            .import_artifact(ArtifactImportRequest {
+                source_path: link_path,
+                artifact_type: "TSV".to_string(),
+                mode: ArtifactImportMode::Reference,
+            })
+            .unwrap_err();
+
+        assert!(err.to_string().contains("external reference"));
+
+        let _ = fs::remove_dir_all(path);
+        let _ = fs::remove_dir_all(external_path);
+    }
+
+    #[test]
     fn copy_import_places_file_under_project_artifacts() {
         let path = temp_project_path("copy");
         let store = ProjectStore::init(&path, Some("Artifacts")).unwrap();
@@ -637,6 +866,64 @@ mod tests {
         assert!(err.to_string().contains("does not exist"));
 
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn artifact_project_json_relativizes_internal_paths() {
+        let path = temp_project_path("json-internal-relative");
+        let store = ProjectStore::init(&path, Some("Artifacts")).unwrap();
+        let source_path = write_input(&path, "expression.tsv");
+        let imported = store
+            .import_artifact(ArtifactImportRequest {
+                source_path,
+                artifact_type: "TSV".to_string(),
+                mode: ArtifactImportMode::Reference,
+            })
+            .unwrap();
+
+        let list_json = store.artifacts_list_json(&store.list_artifacts().unwrap());
+        let inspect_json = store.artifact_inspection_json(&imported);
+
+        let project_root = fs::canonicalize(&path).unwrap().display().to_string();
+        assert!(list_json.contains("\"path\":\"expression.tsv\""));
+        assert!(inspect_json.contains("\"path\":\"expression.tsv\""));
+        assert!(inspect_json.contains("\"source_path\":\"expression.tsv\""));
+        assert!(!list_json.contains(&project_root));
+        assert!(!inspect_json.contains(&project_root));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn artifact_project_json_desensitizes_external_paths() {
+        let path = temp_project_path("json-external-redacted");
+        let external_path = temp_project_path("json-external-source");
+        fs::create_dir_all(&external_path).unwrap();
+        let source_path = write_input(&external_path, "external.tsv");
+        let store = ProjectStore::init(&path, Some("Artifacts")).unwrap();
+        let imported = store
+            .import_artifact_allowing_external_reference(ArtifactImportRequest {
+                source_path,
+                artifact_type: "TSV".to_string(),
+                mode: ArtifactImportMode::Reference,
+            })
+            .unwrap();
+
+        let list_json = store.artifacts_list_json(&store.list_artifacts().unwrap());
+        let inspect_json = store.artifact_inspection_json(&imported);
+
+        let external_root = fs::canonicalize(&external_path)
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(list_json.contains("\"path\":\"<external-reference>/external.tsv\""));
+        assert!(inspect_json.contains("\"path\":\"<external-reference>/external.tsv\""));
+        assert!(inspect_json.contains("\"source_path\":\"<external-reference>/external.tsv\""));
+        assert!(!list_json.contains(&external_root));
+        assert!(!inspect_json.contains(&external_root));
+
+        let _ = fs::remove_dir_all(path);
+        let _ = fs::remove_dir_all(external_path);
     }
 
     #[test]

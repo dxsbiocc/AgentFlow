@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,10 +14,13 @@ use agentflow_core::branch::{
     BranchAction, BranchCandidate, BranchDecision, BranchPolicy, CandidateKind, RuleBasedSelector,
     SelectionMode,
 };
+use agentflow_core::domain::ToolMaturity;
 use agentflow_core::forage::{AccessStatus, ForageObservation};
 use agentflow_core::handoff::{DecisionPoint, DecisionStatus};
-use agentflow_core::storage::ExecutableToolSpec;
-use agentflow_core::storage::ProjectStore;
+use agentflow_core::storage::{
+    EventRecord, ExecutableToolSpec, ParamInferKind, ProjectStore, StorageError, ToolParamSpec,
+    ToolPortSpec, ToolRuntimeSpec, ToolSpec,
+};
 use agentflow_core::trace_guard::{Checkpoint, DriftReport, RevertRecord};
 
 use crate::cli_args::*;
@@ -317,7 +321,7 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
             (false, false) => store.run_cycle_with_apply_config(config)?,
         }
     };
-    let generalization_validations = if report.generalization_candidates.is_empty() {
+    let mut generalization_validations = if report.generalization_candidates.is_empty() {
         Vec::new()
     } else {
         let validation_gene_inferer = LlmParamInferer {
@@ -349,6 +353,7 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
             &runtime_validator,
         )
     };
+    register_generalization_candidates(&store, &mut generalization_validations)?;
 
     if options.project.json {
         Ok(format_agent_run_json(
@@ -1182,6 +1187,52 @@ impl GeneralizationValidationVerdict {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeneralizationCandidateRegistrationStatus {
+    Registered,
+    AlreadyRegistered,
+}
+
+impl GeneralizationCandidateRegistrationStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Registered => "registered",
+            Self::AlreadyRegistered => "already_registered",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneralizationCandidateRegistration {
+    generalized_tool_ref: String,
+    cohort_param: String,
+    spec_hash: String,
+    status: GeneralizationCandidateRegistrationStatus,
+    supersede_command: String,
+}
+
+impl GeneralizationCandidateRegistration {
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"generalized_tool_ref\":\"{}\",",
+                "\"cohort_param\":\"{}\",",
+                "\"maturity\":\"exploratory\",",
+                "\"spec_hash\":\"{}\",",
+                "\"status\":\"{}\",",
+                "\"supersede_command\":\"{}\"",
+                "}}"
+            ),
+            escape_json(&self.generalized_tool_ref),
+            escape_json(&self.cohort_param),
+            escape_json(&self.spec_hash),
+            self.status.as_str(),
+            escape_json(&self.supersede_command)
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GeneralizationValidation {
     tool_ref: String,
@@ -1193,6 +1244,7 @@ struct GeneralizationValidation {
     failure_cohort: Option<String>,
     reason: String,
     evidence: String,
+    registration: Option<GeneralizationCandidateRegistration>,
 }
 
 impl GeneralizationValidation {
@@ -1208,10 +1260,16 @@ impl GeneralizationValidation {
             failure_cohort: None,
             evidence: String::new(),
             reason,
+            registration: None,
         }
     }
 
     fn to_json(&self) -> String {
+        let registration = self
+            .registration
+            .as_ref()
+            .map(GeneralizationCandidateRegistration::to_json)
+            .unwrap_or_else(|| "null".to_string());
         format!(
             concat!(
                 "{{",
@@ -1223,7 +1281,8 @@ impl GeneralizationValidation {
                 "\"inferred_cohort\":{},",
                 "\"failure_cohort\":{},",
                 "\"reason\":\"{}\",",
-                "\"evidence\":\"{}\"",
+                "\"evidence\":\"{}\",",
+                "\"registration\":{}",
                 "}}"
             ),
             escape_json(&self.tool_ref),
@@ -1234,7 +1293,8 @@ impl GeneralizationValidation {
             json_string_or_null(self.inferred_cohort.as_deref()),
             json_string_or_null(self.failure_cohort.as_deref()),
             escape_json(&self.reason),
-            escape_json(&self.evidence)
+            escape_json(&self.evidence),
+            registration
         )
     }
 }
@@ -1354,6 +1414,7 @@ fn validate_generalization_candidate(
                         original_evidence.summary,
                         inferred_evidence.summary
                     ),
+                    registration: None,
                 },
                 Err(reason) => GeneralizationValidation {
                     tool_ref: candidate.tool_ref.clone(),
@@ -1365,6 +1426,7 @@ fn validate_generalization_candidate(
                     failure_cohort: Some(inferred_cohort),
                     reason,
                     evidence: String::new(),
+                    registration: None,
                 },
             }
         }
@@ -1378,8 +1440,357 @@ fn validate_generalization_candidate(
             failure_cohort: Some(variation.original_cohort),
             reason,
             evidence: String::new(),
+            registration: None,
         },
     }
+}
+
+fn register_generalization_candidates(
+    store: &ProjectStore,
+    validations: &mut [GeneralizationValidation],
+) -> Result<(), CliError> {
+    for validation in validations {
+        if validation.verdict != GeneralizationValidationVerdict::Promotable {
+            continue;
+        }
+        validation.registration = Some(register_generalization_candidate(store, validation)?);
+    }
+    Ok(())
+}
+
+fn register_generalization_candidate(
+    store: &ProjectStore,
+    validation: &GeneralizationValidation,
+) -> Result<GeneralizationCandidateRegistration, CliError> {
+    let source_tool = source_tool_spec_for_generalization(store, &validation.tool_ref)?;
+    let source_executable = store.executable_tool(&validation.tool_ref)?;
+    let script_text = resolve_runtime_python_script(store.root_path(), &source_executable)
+        .and_then(|path| std::fs::read_to_string(path).ok());
+    let (generalized_spec, cohort_param) =
+        derive_generalized_tool_spec(validation, &source_tool, script_text.as_deref());
+    let generalized_tool_ref = generalized_spec.tool_ref();
+    let candidate_spec_hash = generalized_spec.spec_hash();
+    let supersede_command = supersede_recommendation_command(validation, &generalized_tool_ref);
+
+    match store.inspect_tool(&generalized_tool_ref) {
+        Ok(existing) if existing.spec_hash == candidate_spec_hash => {
+            return Ok(GeneralizationCandidateRegistration {
+                generalized_tool_ref,
+                cohort_param,
+                spec_hash: existing.spec_hash,
+                status: GeneralizationCandidateRegistrationStatus::AlreadyRegistered,
+                supersede_command,
+            });
+        }
+        Ok(_) | Err(StorageError::NotFound(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let registration = store.register_tool(generalized_spec)?;
+    let candidate = GeneralizationCandidateRegistration {
+        generalized_tool_ref,
+        cohort_param,
+        spec_hash: registration.spec_hash,
+        status: GeneralizationCandidateRegistrationStatus::Registered,
+        supersede_command,
+    };
+    store.append_event(EventRecord {
+        flow_id: None,
+        step_id: None,
+        run_id: None,
+        event_type: "generalization_candidate_registered".to_string(),
+        payload_json: generalization_candidate_registered_event_json(validation, &candidate),
+    })?;
+    Ok(candidate)
+}
+
+fn source_tool_spec_for_generalization(
+    store: &ProjectStore,
+    tool_ref: &str,
+) -> Result<ToolSpec, CliError> {
+    let inspection = store.inspect_tool(tool_ref)?;
+    let source_text = json_string_field(&inspection.spec_json, "source_text")
+        .filter(|source| !source.trim().is_empty())
+        .ok_or_else(|| {
+            CliError::Core(format!(
+                "tool {tool_ref} does not expose simple YAML source_text for generalization"
+            ))
+        })?;
+    ToolSpec::from_simple_yaml(&source_text).map_err(Into::into)
+}
+
+fn derive_generalized_tool_spec(
+    validation: &GeneralizationValidation,
+    source_tool: &ToolSpec,
+    script_text: Option<&str>,
+) -> (ToolSpec, String) {
+    let cohort_param = explicit_cohort_param_name(source_tool, script_text);
+    let mut params = source_tool.params.clone();
+    params.insert(
+        cohort_param.clone(),
+        ToolParamSpec {
+            type_name: "string".to_string(),
+            required: true,
+            enum_values: None,
+            pattern: None,
+            // The generalized candidate's cohort is the parameterized axis, so
+            // declare it cohort-inferable: an autonomous run can fill it via the
+            // AS19 CohortInferer seam (which keeps the evidence grade-capped).
+            infer: Some(ParamInferKind::Cohort),
+        },
+    );
+
+    let mut spec = ToolSpec {
+        schema_version: agentflow_schemas::TOOL_SCHEMA_V0.to_string(),
+        namespace: source_tool.namespace.clone(),
+        name: format!("{}_general", source_tool.name),
+        version: "0.1.0".to_string(),
+        maturity: ToolMaturity::Exploratory,
+        description: format!(
+            "Cohort-parameterized generalization candidate for {}.",
+            validation.tool_ref
+        ),
+        validator_profile: source_tool.validator_profile.clone(),
+        inputs: source_tool.inputs.clone(),
+        params,
+        outputs: source_tool.outputs.clone(),
+        runtime: source_tool.runtime.clone(),
+        source_text: String::new(),
+    };
+    spec.source_text = render_tool_spec_simple_yaml(&spec);
+    (spec, cohort_param)
+}
+
+fn explicit_cohort_param_name(source_tool: &ToolSpec, script_text: Option<&str>) -> String {
+    if source_tool.params.contains_key("cohort") {
+        return "cohort".to_string();
+    }
+    if let Some(name) = source_tool
+        .params
+        .keys()
+        .find(|name| is_cohort_param_name(name.as_str()))
+    {
+        return name.clone();
+    }
+    let runtime_text = source_tool.runtime.command.join(" ");
+    if script_text.is_some_and(|text| text_mentions_agentflow_param(text, "study"))
+        || text_mentions_agentflow_param(&runtime_text, "study")
+    {
+        return "study".to_string();
+    }
+    "cohort".to_string()
+}
+
+fn text_mentions_agentflow_param(text: &str, param: &str) -> bool {
+    text.to_ascii_lowercase()
+        .contains(&format!("agentflow_param_{param}"))
+}
+
+fn supersede_recommendation_command(
+    validation: &GeneralizationValidation,
+    generalized_tool_ref: &str,
+) -> String {
+    let reason = if validation.evidence.trim().is_empty() {
+        "generalization validation promotable".to_string()
+    } else {
+        format!(
+            "generalization validation promotable: {}",
+            validation.evidence
+        )
+    };
+    format!(
+        "agentflow tools supersede {} --by {} --reason {}",
+        validation.tool_ref,
+        generalized_tool_ref,
+        shell_double_quoted_arg(&reason)
+    )
+}
+
+fn shell_double_quoted_arg(value: &str) -> String {
+    let mut output = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' | '\\' | '$' | '`' => {
+                output.push('\\');
+                output.push(ch);
+            }
+            _ => output.push(ch),
+        }
+    }
+    output.push('"');
+    output
+}
+
+fn generalization_candidate_registered_event_json(
+    validation: &GeneralizationValidation,
+    registration: &GeneralizationCandidateRegistration,
+) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"schema_version\":\"agentflow.generalization_candidate_registered.v0\",",
+            "\"source_tool_ref\":\"{}\",",
+            "\"generalized_tool_ref\":\"{}\",",
+            "\"cohort_param\":\"{}\",",
+            "\"maturity\":\"exploratory\",",
+            "\"spec_hash\":\"{}\",",
+            "\"validation\":{{",
+            "\"hypothesis_id\":\"{}\",",
+            "\"parameter\":\"{}\",",
+            "\"verdict\":\"{}\",",
+            "\"original_cohort\":{},",
+            "\"inferred_cohort\":{},",
+            "\"evidence\":\"{}\"",
+            "}}",
+            "}}"
+        ),
+        escape_json(&validation.tool_ref),
+        escape_json(&registration.generalized_tool_ref),
+        escape_json(&registration.cohort_param),
+        escape_json(&registration.spec_hash),
+        escape_json(&validation.hypothesis_id),
+        escape_json(&validation.parameter),
+        validation.verdict.as_str(),
+        json_string_or_null(validation.original_cohort.as_deref()),
+        json_string_or_null(validation.inferred_cohort.as_deref()),
+        escape_json(&validation.evidence)
+    )
+}
+
+fn render_tool_spec_simple_yaml(spec: &ToolSpec) -> String {
+    let mut output = String::new();
+    output.push_str("schema_version: agentflow.tool.v0\n");
+    output.push_str(&format!(
+        "namespace: {}\n",
+        yaml_single_quoted(&spec.namespace)
+    ));
+    output.push_str(&format!("name: {}\n", yaml_single_quoted(&spec.name)));
+    output.push_str(&format!("version: {}\n", yaml_single_quoted(&spec.version)));
+    output.push_str(&format!("maturity: {}\n", spec.maturity.as_str()));
+    output.push_str(&format!(
+        "description: {}\n",
+        yaml_single_quoted(&spec.description)
+    ));
+    if let Some(validator_profile) = &spec.validator_profile {
+        output.push_str(&format!(
+            "validator_profile: {}\n",
+            yaml_single_quoted(validator_profile)
+        ));
+    }
+    push_port_yaml_section(&mut output, "inputs", &spec.inputs);
+    push_param_yaml_section(&mut output, &spec.params);
+    push_port_yaml_section(&mut output, "outputs", &spec.outputs);
+    push_runtime_yaml_section(&mut output, &spec.runtime);
+    output
+}
+
+fn push_port_yaml_section(
+    output: &mut String,
+    section: &str,
+    ports: &BTreeMap<String, ToolPortSpec>,
+) {
+    if ports.is_empty() {
+        return;
+    }
+    output.push_str(&format!("{section}:\n"));
+    for (name, port) in ports {
+        output.push_str(&format!("  {}:\n", yaml_key(name)));
+        output.push_str(&format!(
+            "    type: {}\n",
+            yaml_single_quoted(&port.type_name)
+        ));
+        output.push_str(&format!("    required: {}\n", port.required));
+        if let Some(observer) = &port.observer {
+            output.push_str(&format!("    observer: {}\n", yaml_single_quoted(observer)));
+        }
+        if let Some(profile) = &port.profile {
+            output.push_str(&format!("    profile: {}\n", yaml_single_quoted(profile)));
+        }
+        if let Some(min_rows) = port.min_rows {
+            output.push_str(&format!("    min_rows: {min_rows}\n"));
+        }
+        if !port.required_columns.is_empty() {
+            output.push_str("    required_columns:\n");
+            for column in &port.required_columns {
+                output.push_str(&format!("      - {}\n", yaml_single_quoted(column)));
+            }
+        }
+        if let Some(sample_id_column) = &port.sample_id_column {
+            output.push_str(&format!(
+                "    sample_id_column: {}\n",
+                yaml_single_quoted(sample_id_column)
+            ));
+        }
+    }
+}
+
+fn push_param_yaml_section(output: &mut String, params: &BTreeMap<String, ToolParamSpec>) {
+    if params.is_empty() {
+        return;
+    }
+    output.push_str("params:\n");
+    for (name, param) in params {
+        output.push_str(&format!("  {}:\n", yaml_key(name)));
+        output.push_str(&format!(
+            "    type: {}\n",
+            yaml_single_quoted(&param.type_name)
+        ));
+        output.push_str(&format!("    required: {}\n", param.required));
+        if let Some(enum_values) = &param.enum_values {
+            output.push_str("    enum:\n");
+            for value in enum_values {
+                output.push_str(&format!("      - {}\n", yaml_single_quoted(value)));
+            }
+        }
+        if let Some(pattern) = &param.pattern {
+            output.push_str(&format!("    pattern: {}\n", yaml_single_quoted(pattern)));
+        }
+    }
+}
+
+fn push_runtime_yaml_section(output: &mut String, runtime: &ToolRuntimeSpec) {
+    output.push_str("runtime:\n");
+    output.push_str(&format!(
+        "  backend: {}\n",
+        yaml_single_quoted(&runtime.backend)
+    ));
+    output.push_str("  command:\n");
+    for arg in &runtime.command {
+        output.push_str(&format!("    - {}\n", yaml_single_quoted(arg)));
+    }
+    if let Some(timeout_seconds) = runtime.timeout_seconds {
+        output.push_str(&format!("  timeout_seconds: {timeout_seconds}\n"));
+    }
+    if let Some(env_name) = &runtime.env_name {
+        output.push_str(&format!("  env_name: {}\n", yaml_single_quoted(env_name)));
+    }
+    if let Some(env_prefix) = &runtime.env_prefix {
+        output.push_str(&format!(
+            "  env_prefix: {}\n",
+            yaml_single_quoted(env_prefix)
+        ));
+    }
+    if let Some(env_file) = &runtime.env_file {
+        output.push_str(&format!("  env_file: {}\n", yaml_single_quoted(env_file)));
+    }
+    if let Some(runner) = &runtime.runner {
+        output.push_str(&format!("  runner: {}\n", yaml_single_quoted(runner)));
+    }
+}
+
+fn yaml_key(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        value.to_string()
+    } else {
+        yaml_single_quoted(value)
+    }
+}
+
+fn yaml_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn identify_cohort_variation_point(
@@ -2055,24 +2466,34 @@ fn format_generalization_candidates(candidates: &[GeneralizationCandidate]) -> S
 fn format_generalization_validations(validations: &[GeneralizationValidation]) -> String {
     validations
         .iter()
-        .map(|validation| match validation.verdict {
-            GeneralizationValidationVerdict::Promotable => format!(
-                "🧪 泛化验证: {} — cohort 参数化 [promotable: {}]",
-                validation.tool_ref, validation.evidence
-            ),
-            GeneralizationValidationVerdict::Rejected => format!(
-                "🧪 泛化验证: {} — cohort 参数化 [rejected: {} ✗ {}]",
-                validation.tool_ref,
-                validation
-                    .failure_cohort
-                    .as_deref()
-                    .unwrap_or("unknown cohort"),
-                validation.reason
-            ),
-            GeneralizationValidationVerdict::Skipped => format!(
-                "🧪 泛化验证: {} — cohort 参数化 [skipped: {}]",
-                validation.tool_ref, validation.reason
-            ),
+        .map(|validation| {
+            let line = match validation.verdict {
+                GeneralizationValidationVerdict::Promotable => format!(
+                    "🧪 泛化验证: {} — cohort 参数化 [promotable: {}]",
+                    validation.tool_ref, validation.evidence
+                ),
+                GeneralizationValidationVerdict::Rejected => format!(
+                    "🧪 泛化验证: {} — cohort 参数化 [rejected: {} ✗ {}]",
+                    validation.tool_ref,
+                    validation
+                        .failure_cohort
+                        .as_deref()
+                        .unwrap_or("unknown cohort"),
+                    validation.reason
+                ),
+                GeneralizationValidationVerdict::Skipped => format!(
+                    "🧪 泛化验证: {} — cohort 参数化 [skipped: {}]",
+                    validation.tool_ref, validation.reason
+                ),
+            };
+            if let Some(registration) = &validation.registration {
+                format!(
+                    "{}\n   ↳ 已注册泛化候选 {} (exploratory)。如经审阅认可，运行: {}",
+                    line, registration.generalized_tool_ref, registration.supersede_command
+                )
+            } else {
+                line
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -3428,6 +3849,135 @@ EOF
     }
 
     #[test]
+    fn promotable_generalization_registers_exploratory_candidate_idempotently_without_superseding()
+    {
+        let path = temp_project_path("generalization-candidate-registers");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis_with_statement(
+            &store,
+            "GENE_STUB expression is associated with survival in a target cohort",
+        );
+        let tool_ref = register_study_runtime_tool(&store, &path, "original_study_fixture");
+        let runtime = StubGeneralizationRuntimeValidator::passing();
+        let mut validations = generalization_validation_pass(
+            &store,
+            &[generalization_candidate(&tool_ref, &hypothesis_id)],
+            &StubGeneInferer::new("GENE_STUB"),
+            &StubCohortInferer::new(Some("inferred_study_fixture")),
+            &runtime,
+        );
+
+        register_generalization_candidates(&store, &mut validations).unwrap();
+
+        let registration = validations[0].registration.as_ref().unwrap();
+        assert_eq!(
+            registration.generalized_tool_ref,
+            "analysis/study_runtime_general"
+        );
+        assert_eq!(registration.cohort_param, "study");
+        assert_eq!(
+            registration.status,
+            GeneralizationCandidateRegistrationStatus::Registered
+        );
+        assert!(registration.supersede_command.contains(
+            "agentflow tools supersede analysis/study_runtime --by analysis/study_runtime_general --reason "
+        ));
+
+        let inspection = store
+            .inspect_tool("analysis/study_runtime_general")
+            .unwrap();
+        assert_eq!(inspection.summary.name, "study_runtime_general");
+        assert_eq!(inspection.summary.namespace, "analysis");
+        assert_eq!(inspection.summary.maturity, "exploratory");
+        assert!(inspection.spec_hash.len() >= 16);
+        let generalized = store
+            .executable_tool("analysis/study_runtime_general")
+            .unwrap();
+        let source = store.executable_tool(&tool_ref).unwrap();
+        assert_eq!(generalized.runtime, source.runtime);
+        let cohort_param = generalized.params.get("study").unwrap();
+        assert_eq!(cohort_param.type_name, "string");
+        assert!(cohort_param.required);
+
+        for specialized in [
+            "original_study_fixture",
+            "inferred_study_fixture",
+            "GENE_STUB",
+            "stomach adenocarcinoma",
+            "breast carcinoma",
+        ] {
+            assert!(
+                !inspection
+                    .spec_json
+                    .to_ascii_lowercase()
+                    .contains(&specialized.to_ascii_lowercase()),
+                "derived spec leaked specialized word {specialized}: {}",
+                inspection.spec_json
+            );
+        }
+        assert!(store.list_supersessions().unwrap().is_empty());
+
+        let mut second_validations = generalization_validation_pass(
+            &store,
+            &[generalization_candidate(&tool_ref, &hypothesis_id)],
+            &StubGeneInferer::new("GENE_STUB"),
+            &StubCohortInferer::new(Some("inferred_study_fixture")),
+            &runtime,
+        );
+        register_generalization_candidates(&store, &mut second_validations).unwrap();
+
+        let second_registration = second_validations[0].registration.as_ref().unwrap();
+        assert_eq!(
+            second_registration.status,
+            GeneralizationCandidateRegistrationStatus::AlreadyRegistered
+        );
+        assert_eq!(second_registration.spec_hash, inspection.spec_hash);
+        assert!(store.list_supersessions().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn promotable_output_recommends_supersede_command_without_superseding() {
+        let path = temp_project_path("generalization-candidate-output");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis_with_statement(
+            &store,
+            "GENE_STUB expression is associated with survival in a target cohort",
+        );
+        let tool_ref = register_study_runtime_tool(&store, &path, "original_study_fixture");
+        let mut validations = generalization_validation_pass(
+            &store,
+            &[generalization_candidate(&tool_ref, &hypothesis_id)],
+            &StubGeneInferer::new("GENE_STUB"),
+            &StubCohortInferer::new(Some("inferred_study_fixture")),
+            &StubGeneralizationRuntimeValidator::passing(),
+        );
+
+        register_generalization_candidates(&store, &mut validations).unwrap();
+        let human = format_generalization_validations(&validations);
+
+        assert!(human.contains("promotable"));
+        assert!(human.contains(
+            "agentflow tools supersede analysis/study_runtime --by analysis/study_runtime_general"
+        ));
+        let json = format_agent_run_json(
+            &cycle_report_with_generalization_candidate(generalization_candidate(
+                &tool_ref,
+                &hypothesis_id,
+            )),
+            None,
+            &validations,
+        );
+        assert!(json.contains("\"registration\":{"));
+        assert!(json.contains("\"generalized_tool_ref\":\"analysis/study_runtime_general\""));
+        assert!(json.contains("\"supersede_command\":\"agentflow tools supersede analysis/study_runtime --by analysis/study_runtime_general"));
+        assert!(store.list_supersessions().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn generalization_validation_rejects_when_inferred_cohort_runtime_fails() {
         let path = temp_project_path("generalization-validation-rejected");
         let store = init_project(&path);
@@ -3464,6 +4014,71 @@ EOF
             .contains("rejected: inferred_study_fixture ✗ candidate failed runtime gate"));
 
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn rejected_and_skipped_generalizations_do_not_register_candidates_or_recommend_supersede() {
+        let rejected_path = temp_project_path("generalization-candidate-rejected-noop");
+        let rejected_store = init_project(&rejected_path);
+        let rejected_hypothesis_id = record_hypothesis_with_statement(
+            &rejected_store,
+            "GENE_STUB expression is associated with survival in a target cohort",
+        );
+        let rejected_tool_ref =
+            register_study_runtime_tool(&rejected_store, &rejected_path, "original_study_fixture");
+        let mut rejected = generalization_validation_pass(
+            &rejected_store,
+            &[generalization_candidate(
+                &rejected_tool_ref,
+                &rejected_hypothesis_id,
+            )],
+            &StubGeneInferer::new("GENE_STUB"),
+            &StubCohortInferer::new(Some("inferred_study_fixture")),
+            &StubGeneralizationRuntimeValidator::failing(
+                "inferred_study_fixture",
+                "candidate failed runtime gate",
+            ),
+        );
+
+        register_generalization_candidates(&rejected_store, &mut rejected).unwrap();
+
+        assert!(rejected[0].registration.is_none());
+        assert!(rejected_store
+            .inspect_tool("analysis/study_runtime_general")
+            .is_err());
+        assert!(!format_generalization_validations(&rejected).contains("tools supersede"));
+        assert!(rejected_store.list_supersessions().unwrap().is_empty());
+
+        let skipped_path = temp_project_path("generalization-candidate-skipped-noop");
+        let skipped_store = init_project(&skipped_path);
+        let skipped_hypothesis_id = record_hypothesis_with_statement(
+            &skipped_store,
+            "GENE_STUB expression is associated with survival in a target cohort",
+        );
+        let skipped_tool_ref =
+            register_study_runtime_tool(&skipped_store, &skipped_path, "original_study_fixture");
+        let mut skipped = generalization_validation_pass(
+            &skipped_store,
+            &[generalization_candidate(
+                &skipped_tool_ref,
+                &skipped_hypothesis_id,
+            )],
+            &StubGeneInferer::new("GENE_STUB"),
+            &StubCohortInferer::new(None),
+            &StubGeneralizationRuntimeValidator::passing(),
+        );
+
+        register_generalization_candidates(&skipped_store, &mut skipped).unwrap();
+
+        assert!(skipped[0].registration.is_none());
+        assert!(skipped_store
+            .inspect_tool("analysis/study_runtime_general")
+            .is_err());
+        assert!(!format_generalization_validations(&skipped).contains("tools supersede"));
+        assert!(skipped_store.list_supersessions().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(rejected_path);
+        let _ = std::fs::remove_dir_all(skipped_path);
     }
 
     #[test]

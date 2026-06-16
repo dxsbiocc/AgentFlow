@@ -157,6 +157,13 @@ impl ToolSpec {
         format!("{}/{}", self.namespace, self.name)
     }
 
+    /// Canonical spec hash, identical to what `register_tool` persists. Use this
+    /// instead of re-deriving the stored JSON elsewhere, so the hash stays
+    /// correct as the stored representation evolves.
+    pub fn spec_hash(&self) -> String {
+        migrations::checksum(&self.stored_json())
+    }
+
     fn tool_id(&self) -> String {
         tool_id(&self.namespace, &self.name)
     }

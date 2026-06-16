@@ -9,6 +9,7 @@ const SCORE_KEYWORD_NAME: i32 = 4;
 const SCORE_KEYWORD_DESCRIPTION: i32 = 2;
 const SCORE_MATURITY_VERIFIED: i32 = 3;
 const SCORE_MATURITY_WRAPPED: i32 = 1;
+const SCORE_SUPERSEDED_PENALTY: i32 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fit {
@@ -133,6 +134,11 @@ impl ProjectStore {
             } else {
                 Fit::Low
             };
+
+            if let Some(supersession) = &summary.superseded_by {
+                score -= SCORE_SUPERSEDED_PENALTY;
+                reasons.push(format!("superseded_by:{}", supersession.successor_tool_ref));
+            }
 
             candidates.push(ToolCandidate {
                 tool_ref,
@@ -494,6 +500,59 @@ runtime:
         assert_eq!(candidates[1].tool_ref, "tie/z_tool");
         assert_eq!(candidates[0].score, candidates[1].score);
         assert_eq!(candidates[0].fit, Fit::High);
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn match_tools_keeps_superseded_tool_but_orders_successor_first() {
+        let (path, store) = init_store("superseded-order");
+        register_tool(
+            &store,
+            &tool_yaml(
+                "lineage",
+                "a_specialized_scan",
+                "verified",
+                "Build marker report",
+                &one_required_input("expression_table", "ExpressionTable"),
+                no_params(),
+                markdown_output(),
+            ),
+        );
+        register_tool(
+            &store,
+            &tool_yaml(
+                "lineage",
+                "z_general_scan",
+                "verified",
+                "Build marker report",
+                &one_required_input("expression_table", "ExpressionTable"),
+                no_params(),
+                markdown_output(),
+            ),
+        );
+        store
+            .supersede_tool(
+                "lineage/a_specialized_scan",
+                "lineage/z_general_scan",
+                Some("verified generalized replacement"),
+            )
+            .unwrap();
+
+        let candidates = store
+            .match_tools(&CapabilityQuery {
+                desired_output_type: Some("Markdown".to_string()),
+                available_input_types: vec!["ExpressionTable".to_string()],
+                keywords: vec!["marker".to_string()],
+            })
+            .unwrap();
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].tool_ref, "lineage/z_general_scan");
+        assert_eq!(candidates[1].tool_ref, "lineage/a_specialized_scan");
+        assert_eq!(candidates[1].fit, Fit::High);
+        assert!(candidates[1].reason.contains("superseded"));
+        assert!(candidates[1].reason.contains("lineage/z_general_scan"));
 
         let _ = fs::remove_dir_all(path);
     }

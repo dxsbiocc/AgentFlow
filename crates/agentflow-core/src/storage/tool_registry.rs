@@ -13,6 +13,7 @@ use super::yaml;
 
 const DEFAULT_NAMESPACE: &str = "local";
 const SIMPLE_YAML_SOURCE_FORMAT: &str = "agentflow.tool.v0.simple_yaml";
+const TOOL_SUPERSEDED_EVENT: &str = "tool_superseded";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
@@ -688,6 +689,7 @@ pub struct ToolSummary {
     pub name: String,
     pub latest_version: String,
     pub maturity: String,
+    pub superseded_by: Option<ToolSupersession>,
 }
 
 impl ToolSummary {
@@ -705,6 +707,7 @@ pub struct ToolInspection {
     pub spec_json: String,
     pub spec_hash: String,
     pub created_at: i64,
+    pub superseded_by: Option<ToolSupersession>,
 }
 
 impl ToolInspection {
@@ -717,6 +720,7 @@ impl ToolInspection {
                 name: self.summary.name.clone(),
                 latest_version: self.summary.latest_version.clone(),
                 maturity: self.summary.maturity.clone(),
+                superseded_by: self.superseded_by.clone().map(Into::into),
             },
             version: ToolInspectionVersionJson {
                 id: self.version_id.clone(),
@@ -747,6 +751,8 @@ struct ToolInspectionToolJson {
     name: String,
     latest_version: String,
     maturity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<ToolSupersessionJson>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -757,6 +763,44 @@ struct ToolInspectionVersionJson {
     spec_hash: String,
     created_at: i64,
     spec: StoredToolSpecJson,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSupersession {
+    pub superseded_tool_ref: String,
+    pub successor_tool_ref: String,
+    pub reason: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolSupersededPayload {
+    superseded_tool_ref: String,
+    successor_tool_ref: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    created_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolSupersessionJson {
+    superseded_tool_ref: String,
+    successor_tool_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    created_at: i64,
+}
+
+impl From<ToolSupersession> for ToolSupersessionJson {
+    fn from(value: ToolSupersession) -> Self {
+        Self {
+            superseded_tool_ref: value.superseded_tool_ref,
+            successor_tool_ref: value.successor_tool_ref,
+            reason: value.reason,
+            created_at: value.created_at,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -853,6 +897,7 @@ impl ProjectStore {
                 name: row.get(2)?,
                 latest_version: row.get(3)?,
                 maturity: row.get(4)?,
+                superseded_by: None,
             })
         })?;
 
@@ -860,13 +905,18 @@ impl ProjectStore {
         for row in rows {
             tools.push(row?);
         }
+        drop(stmt);
+
+        for tool in &mut tools {
+            tool.superseded_by = self.latest_tool_supersession_for_ref(&tool.tool_ref())?;
+        }
         Ok(tools)
     }
 
     pub fn inspect_tool(&self, tool_ref: &str) -> Result<ToolInspection, StorageError> {
         let parsed = ParsedToolRef::parse(tool_ref)?;
         let id = tool_id(&parsed.namespace, &parsed.name);
-        let summary = self
+        let mut summary = self
             .connection()
             .query_row(
                 "SELECT id, namespace, name, latest_version, maturity
@@ -880,11 +930,14 @@ impl ProjectStore {
                         name: row.get(2)?,
                         latest_version: row.get(3)?,
                         maturity: row.get(4)?,
+                        superseded_by: None,
                     })
                 },
             )
             .optional()?
             .ok_or_else(|| StorageError::NotFound(format!("tool {tool_ref}")))?;
+        let superseded_by = self.latest_tool_supersession_for_ref(&summary.tool_ref())?;
+        summary.superseded_by = superseded_by.clone();
 
         let version = parsed
             .version
@@ -918,6 +971,7 @@ impl ProjectStore {
             spec_json,
             spec_hash,
             created_at,
+            superseded_by,
         })
     }
 
@@ -929,6 +983,135 @@ impl ProjectStore {
             &inspection.spec_json,
         )
     }
+
+    pub fn supersede_tool(
+        &self,
+        superseded_tool_ref: &str,
+        successor_tool_ref: &str,
+        reason: Option<&str>,
+    ) -> Result<ToolSupersession, StorageError> {
+        let superseded = self.inspect_tool(superseded_tool_ref)?;
+        let successor = self.inspect_tool(successor_tool_ref)?;
+        let superseded_tool_ref = superseded.summary.tool_ref();
+        let successor_tool_ref = successor.summary.tool_ref();
+        if superseded_tool_ref == successor_tool_ref {
+            return Err(StorageError::InvalidInput(
+                "a tool cannot supersede itself".to_string(),
+            ));
+        }
+        let reason = normalize_supersession_reason(reason)?;
+        let created_at = now_unix_seconds();
+        let supersession = ToolSupersession {
+            superseded_tool_ref,
+            successor_tool_ref,
+            reason,
+            created_at,
+        };
+
+        self.append_event(EventRecord {
+            flow_id: None,
+            step_id: None,
+            run_id: None,
+            event_type: TOOL_SUPERSEDED_EVENT.to_string(),
+            payload_json: serde_json::to_string(&ToolSupersededPayload {
+                superseded_tool_ref: supersession.superseded_tool_ref.clone(),
+                successor_tool_ref: supersession.successor_tool_ref.clone(),
+                reason: supersession.reason.clone(),
+                created_at: supersession.created_at,
+            })
+            .expect("tool superseded payload serializes to JSON"),
+        })?;
+        self.touch_project()?;
+
+        Ok(supersession)
+    }
+
+    pub fn tool_supersession(
+        &self,
+        tool_ref: &str,
+    ) -> Result<Option<ToolSupersession>, StorageError> {
+        let parsed = ParsedToolRef::parse(tool_ref)?;
+        let normalized_ref = format!("{}/{}", parsed.namespace, parsed.name);
+        self.latest_tool_supersession_for_ref(&normalized_ref)
+    }
+
+    pub fn list_supersessions(&self) -> Result<Vec<ToolSupersession>, StorageError> {
+        let mut stmt = self.connection().prepare(
+            "SELECT payload_json, created_at
+             FROM events
+             WHERE event_type = ?1
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![TOOL_SUPERSEDED_EVENT], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        let mut supersessions = Vec::new();
+        for row in rows {
+            let (payload_json, event_created_at) = row?;
+            supersessions.push(tool_supersession_from_event(
+                &payload_json,
+                event_created_at,
+            )?);
+        }
+        Ok(supersessions)
+    }
+
+    fn latest_tool_supersession_for_ref(
+        &self,
+        tool_ref: &str,
+    ) -> Result<Option<ToolSupersession>, StorageError> {
+        let mut stmt = self.connection().prepare(
+            "SELECT payload_json, created_at
+             FROM events
+             WHERE event_type = ?1
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![TOOL_SUPERSEDED_EVENT], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        for row in rows {
+            let (payload_json, event_created_at) = row?;
+            let supersession = tool_supersession_from_event(&payload_json, event_created_at)?;
+            if supersession.superseded_tool_ref == tool_ref {
+                return Ok(Some(supersession));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+fn normalize_supersession_reason(reason: Option<&str>) -> Result<Option<String>, StorageError> {
+    let Some(reason) = reason.map(str::trim).filter(|reason| !reason.is_empty()) else {
+        return Ok(None);
+    };
+    if reason.contains('\n') || reason.contains('\0') {
+        return Err(StorageError::InvalidInput(
+            "supersession reason must be single-line text".to_string(),
+        ));
+    }
+    Ok(Some(reason.to_string()))
+}
+
+fn tool_supersession_from_event(
+    payload_json: &str,
+    event_created_at: i64,
+) -> Result<ToolSupersession, StorageError> {
+    let payload: ToolSupersededPayload = serde_json::from_str(payload_json).map_err(|err| {
+        StorageError::InvalidInput(format!("tool superseded payload JSON is invalid: {err}"))
+    })?;
+    Ok(ToolSupersession {
+        superseded_tool_ref: payload.superseded_tool_ref,
+        successor_tool_ref: payload.successor_tool_ref,
+        reason: payload.reason,
+        created_at: if payload.created_at == 0 {
+            event_created_at
+        } else {
+            payload.created_at
+        },
+    })
 }
 
 struct ParsedToolRef {
@@ -1587,6 +1770,30 @@ inputs:
 params:
   gene:
     type: string
+    required: true
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#
+        )
+    }
+
+    fn named_tool(name: &str, description: &str) -> String {
+        format!(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: {name}
+version: 0.1.0
+maturity: verified
+description: "{description}"
+inputs:
+  expression_table:
+    type: TSV
     required: true
 outputs:
   report:
@@ -2361,6 +2568,122 @@ runtime:
     }
 
     #[test]
+    fn supersede_tool_records_event_and_surfaces_status_without_deleting_old_tool() {
+        let path = temp_project_path("supersede");
+        let store = ProjectStore::init(&path, Some("Tools")).unwrap();
+        store
+            .register_tool(ToolSpec::from_simple_yaml(&sample_tool("0.1.0")).unwrap())
+            .unwrap();
+        store
+            .register_tool(
+                ToolSpec::from_simple_yaml(&named_tool(
+                    "general_survival_scan",
+                    "General survival scan",
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let supersession = store
+            .supersede_tool(
+                "marker/marker_survival_scan",
+                "marker/general_survival_scan",
+                Some("validated generalized workflow"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            supersession.superseded_tool_ref,
+            "marker/marker_survival_scan"
+        );
+        assert_eq!(
+            supersession.successor_tool_ref,
+            "marker/general_survival_scan"
+        );
+        assert_eq!(
+            supersession.reason.as_deref(),
+            Some("validated generalized workflow")
+        );
+
+        let queried = store
+            .tool_supersession("marker/marker_survival_scan")
+            .unwrap()
+            .unwrap();
+        assert_eq!(queried, supersession);
+        assert!(store
+            .tool_supersession("marker/general_survival_scan")
+            .unwrap()
+            .is_none());
+
+        let tools = store.list_tools().unwrap();
+        let old_summary = tools
+            .iter()
+            .find(|tool| tool.tool_ref() == "marker/marker_survival_scan")
+            .unwrap();
+        assert_eq!(
+            old_summary
+                .superseded_by
+                .as_ref()
+                .map(|entry| entry.successor_tool_ref.as_str()),
+            Some("marker/general_survival_scan")
+        );
+
+        let inspection = store.inspect_tool("marker/marker_survival_scan").unwrap();
+        assert!(inspection.spec_json.contains("marker_survival_scan"));
+        assert_eq!(
+            inspection
+                .superseded_by
+                .as_ref()
+                .map(|entry| entry.successor_tool_ref.as_str()),
+            Some("marker/general_survival_scan")
+        );
+        assert!(inspection
+            .to_json()
+            .contains("\"superseded_by\":{\"superseded_tool_ref\":\"marker/marker_survival_scan\",\"successor_tool_ref\":\"marker/general_survival_scan\""));
+
+        let event_count: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'tool_superseded'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn supersede_tool_rejects_missing_refs_and_self_supersession() {
+        let path = temp_project_path("supersede-invalid");
+        let store = ProjectStore::init(&path, Some("Tools")).unwrap();
+        store
+            .register_tool(ToolSpec::from_simple_yaml(&sample_tool("0.1.0")).unwrap())
+            .unwrap();
+
+        let missing = store
+            .supersede_tool(
+                "marker/missing_scan",
+                "marker/marker_survival_scan",
+                Some("missing old"),
+            )
+            .unwrap_err();
+        assert!(matches!(missing, StorageError::NotFound(_)));
+
+        let self_ref = store
+            .supersede_tool(
+                "marker/marker_survival_scan",
+                "marker/marker_survival_scan",
+                Some("same tool"),
+            )
+            .unwrap_err();
+        assert!(matches!(self_ref, StorageError::InvalidInput(_)));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn executable_tool_round_trips_runtime_argv_with_json_punctuation() {
         let path = temp_project_path("runtime-command-roundtrip");
         let store = ProjectStore::init(&path, Some("Tools")).unwrap();
@@ -2575,6 +2898,7 @@ runtime:
                 name: "scan".to_string(),
                 latest_version: "0.1.0".to_string(),
                 maturity: "wrapped".to_string(),
+                superseded_by: None,
             },
             version_id: "tool_version:marker/scan@0.1.0".to_string(),
             version: "0.1.0".to_string(),
@@ -2582,6 +2906,7 @@ runtime:
             spec_hash: "abc123".to_string(),
             created_at: 7,
             spec_json: "{\"schema_version\":\"agentflow.tool.v0\",\"namespace\":\"marker\",\"name\":\"scan\",\"version\":\"0.1.0\",\"maturity\":\"wrapped\",\"description\":\"Scan\",\"validator_profile\":null,\"input_types\":{},\"required_inputs\":[],\"input_profiles\":{},\"param_types\":{},\"required_params\":[],\"output_types\":{},\"output_observers\":{},\"input_min_rows\":{},\"input_required_columns\":{},\"input_sample_id_columns\":{},\"output_min_rows\":{},\"output_required_columns\":{},\"runtime_backend\":\"local\",\"runtime_command\":[\"/bin/echo\"],\"runtime_timeout_seconds\":null,\"runtime_env_name\":null,\"runtime_env_prefix\":null,\"runtime_env_file\":null,\"runtime_runner\":null,\"source_format\":\"agentflow.tool.v0.simple_yaml\",\"source_text\":\"source\"}".to_string(),
+            superseded_by: None,
         };
 
         assert_eq!(

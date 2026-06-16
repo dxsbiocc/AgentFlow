@@ -147,6 +147,7 @@ pub(crate) struct ToolsArgs {
 #[derive(Debug, Subcommand)]
 pub(crate) enum ToolsCommand {
     Register(ToolsRegisterArgs),
+    Supersede(ToolsSupersedeArgs),
     List(PathJsonArgs),
     Inspect(ToolsInspectArgs),
     Match(ToolsMatchArgs),
@@ -160,6 +161,18 @@ pub(crate) struct ToolsRegisterArgs {
     pub(crate) tool_yaml: PathBuf,
     #[command(flatten)]
     pub(crate) project: PathOnlyArgs,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ToolsSupersedeArgs {
+    #[arg(value_name = "old-tool-ref")]
+    pub(crate) old_tool_ref: String,
+    #[arg(long = "by", value_name = "new-tool-ref")]
+    pub(crate) successor_tool_ref: String,
+    #[arg(long, value_name = "text")]
+    pub(crate) reason: Vec<String>,
+    #[command(flatten)]
+    pub(crate) project: PathJsonArgs,
 }
 
 #[derive(Debug, Args)]

@@ -22,6 +22,6 @@ pub use project_store::{
 pub use schema::{DEFERRED_TABLES, V0_TABLES};
 pub(crate) use tool_registry::validate_param_value;
 pub use tool_registry::{
-    ExecutableToolSpec, ToolInspection, ToolParamSpec, ToolPortSpec, ToolRegistration,
-    ToolRuntimeSpec, ToolSpec, ToolSummary, ToolSupersession,
+    ExecutableToolSpec, ParamInferKind, ToolInspection, ToolParamSpec, ToolPortSpec,
+    ToolRegistration, ToolRuntimeSpec, ToolSpec, ToolSummary, ToolSupersession,
 };

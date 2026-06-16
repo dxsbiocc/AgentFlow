@@ -20,8 +20,8 @@ use crate::handoff::{
 };
 use crate::hypothesis::{HypothesisRequest, HypothesisStatus};
 use crate::storage::{
-    validate_param_value, ArtifactSummary, EventRecord, FlowDraft, FlowStepDraft, ProjectStore,
-    StorageError, ToolParamSpec,
+    validate_param_value, ArtifactSummary, EventRecord, FlowDraft, FlowStepDraft, ParamInferKind,
+    ProjectStore, StorageError, ToolParamSpec,
 };
 use crate::tool_select::{extract_stored_string_field, CapabilityQuery, Fit, ToolCandidate};
 
@@ -99,6 +99,19 @@ pub struct NoopParamInferer;
 
 impl ParamInferer for NoopParamInferer {
     fn infer(&self, _hypothesis_statement: &str, _param_name: &str) -> Option<String> {
+        None
+    }
+}
+
+pub trait CohortInferer {
+    fn infer_cohort(&self, hypothesis_statement: &str) -> Option<String>;
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct NoopCohortInferer;
+
+impl CohortInferer for NoopCohortInferer {
+    fn infer_cohort(&self, _hypothesis_statement: &str) -> Option<String> {
         None
     }
 }
@@ -334,6 +347,15 @@ struct ApplyCycleOutputs<'a> {
     grounding: &'a dyn OutputGroundingScorer,
 }
 
+struct RunCycleServices<'a> {
+    inferer: &'a dyn ParamInferer,
+    scorer: &'a dyn RelevanceScorer,
+    synthesizer: &'a dyn ToolSynthesizer,
+    grounding: &'a dyn OutputGroundingScorer,
+    cohort_inferer: &'a dyn CohortInferer,
+    auto_synth: bool,
+}
+
 struct StanceAssessmentOutputs<'a> {
     apply_failures: &'a mut Vec<ApplyFailure>,
     generalization_candidates: &'a mut Vec<GeneralizationCandidate>,
@@ -426,11 +448,14 @@ impl ProjectStore {
     ) -> Result<CycleReport, StorageError> {
         self.run_cycle_inner(
             config,
-            inferer,
-            scorer,
-            &NoopToolSynthesizer,
-            &NoopOutputGroundingScorer,
-            false,
+            RunCycleServices {
+                inferer,
+                scorer,
+                synthesizer: &NoopToolSynthesizer,
+                grounding: &NoopOutputGroundingScorer,
+                cohort_inferer: &NoopCohortInferer,
+                auto_synth: false,
+            },
         )
     }
 
@@ -441,13 +466,33 @@ impl ProjectStore {
         scorer: &dyn RelevanceScorer,
         grounding: &dyn OutputGroundingScorer,
     ) -> Result<CycleReport, StorageError> {
-        self.run_cycle_inner(
+        self.run_cycle_with_scorer_grounded_cohort(
             config,
             inferer,
             scorer,
-            &NoopToolSynthesizer,
             grounding,
-            false,
+            &NoopCohortInferer,
+        )
+    }
+
+    pub fn run_cycle_with_scorer_grounded_cohort(
+        &self,
+        config: ApplyConfig,
+        inferer: &dyn ParamInferer,
+        scorer: &dyn RelevanceScorer,
+        grounding: &dyn OutputGroundingScorer,
+        cohort_inferer: &dyn CohortInferer,
+    ) -> Result<CycleReport, StorageError> {
+        self.run_cycle_inner(
+            config,
+            RunCycleServices {
+                inferer,
+                scorer,
+                synthesizer: &NoopToolSynthesizer,
+                grounding,
+                cohort_inferer,
+                auto_synth: false,
+            },
         )
     }
 
@@ -460,11 +505,14 @@ impl ProjectStore {
     ) -> Result<CycleReport, StorageError> {
         self.run_cycle_inner(
             config,
-            inferer,
-            scorer,
-            synthesizer,
-            &NoopOutputGroundingScorer,
-            true,
+            RunCycleServices {
+                inferer,
+                scorer,
+                synthesizer,
+                grounding: &NoopOutputGroundingScorer,
+                cohort_inferer: &NoopCohortInferer,
+                auto_synth: true,
+            },
         )
     }
 
@@ -476,7 +524,36 @@ impl ProjectStore {
         synthesizer: &dyn ToolSynthesizer,
         grounding: &dyn OutputGroundingScorer,
     ) -> Result<CycleReport, StorageError> {
-        self.run_cycle_inner(config, inferer, scorer, synthesizer, grounding, true)
+        self.run_cycle_with_synth_grounded_cohort(
+            config,
+            inferer,
+            scorer,
+            synthesizer,
+            grounding,
+            &NoopCohortInferer,
+        )
+    }
+
+    pub fn run_cycle_with_synth_grounded_cohort(
+        &self,
+        config: ApplyConfig,
+        inferer: &dyn ParamInferer,
+        scorer: &dyn RelevanceScorer,
+        synthesizer: &dyn ToolSynthesizer,
+        grounding: &dyn OutputGroundingScorer,
+        cohort_inferer: &dyn CohortInferer,
+    ) -> Result<CycleReport, StorageError> {
+        self.run_cycle_inner(
+            config,
+            RunCycleServices {
+                inferer,
+                scorer,
+                synthesizer,
+                grounding,
+                cohort_inferer,
+                auto_synth: true,
+            },
+        )
     }
 
     fn maybe_spawn_mechanism_child(
@@ -512,12 +589,16 @@ impl ProjectStore {
     fn run_cycle_inner(
         &self,
         config: ApplyConfig,
-        inferer: &dyn ParamInferer,
-        scorer: &dyn RelevanceScorer,
-        synthesizer: &dyn ToolSynthesizer,
-        grounding: &dyn OutputGroundingScorer,
-        auto_synth: bool,
+        services: RunCycleServices<'_>,
     ) -> Result<CycleReport, StorageError> {
+        let RunCycleServices {
+            inferer,
+            scorer,
+            synthesizer,
+            grounding,
+            cohort_inferer,
+            auto_synth,
+        } = services;
         let checkpoint = self.create_checkpoint("agent_cycle")?;
         let engine = RuleBasedEngine;
         let policy = DefaultPolicy;
@@ -632,6 +713,7 @@ impl ProjectStore {
                         &available,
                         inferer,
                         &cycle_scorer,
+                        cohort_inferer,
                     )?;
                     let mut auto_synth_tool_ref = None;
                     let mut synthesized_capability_need = None;
@@ -671,6 +753,7 @@ impl ProjectStore {
                                     &proposal.decision,
                                     &available,
                                     inferer,
+                                    cohort_inferer,
                                 )?
                             {
                                 proposal.matched_tool = Some(tool_ref.clone());
@@ -710,6 +793,7 @@ impl ProjectStore {
                                             &proposal.decision,
                                             &available,
                                             inferer,
+                                            cohort_inferer,
                                         ) {
                                             Ok((step, synthesized_inferred_params)) => {
                                                 proposal.matched_tool = Some(tool_ref.clone());
@@ -1123,6 +1207,7 @@ impl ProjectStore {
         available: &[(String, String)],
         inferer: &dyn ParamInferer,
         scorer: &dyn RelevanceScorer,
+        cohort_inferer: &dyn CohortInferer,
     ) -> Result<(EnrichedProposal, Vec<String>), StorageError> {
         let query = CapabilityQuery {
             desired_output_type: None,
@@ -1157,6 +1242,7 @@ impl ProjectStore {
             &mut drafted_step,
             &decision.candidate.statement,
             inferer,
+            cohort_inferer,
             &executable.params,
         );
         if candidate.tool_ref.starts_with("synth/") {
@@ -1190,6 +1276,7 @@ impl ProjectStore {
         decision: &BranchDecision,
         available: &[(String, String)],
         inferer: &dyn ParamInferer,
+        cohort_inferer: &dyn CohortInferer,
     ) -> Result<(ProposedStep, Vec<String>), StorageError> {
         let executable = self.executable_tool(tool_ref)?;
         let mut drafted_step = self.draft_step_for(tool_ref, available)?;
@@ -1197,6 +1284,7 @@ impl ProjectStore {
             &mut drafted_step,
             &decision.candidate.statement,
             inferer,
+            cohort_inferer,
             &executable.params,
         );
         infer_synthesized_domain_params(
@@ -1220,6 +1308,7 @@ impl ProjectStore {
         decision: &BranchDecision,
         available: &[(String, String)],
         inferer: &dyn ParamInferer,
+        cohort_inferer: &dyn CohortInferer,
     ) -> Result<Option<(String, ProposedStep, Vec<String>)>, StorageError> {
         let statement = normalized_space(&decision.candidate.statement);
         if statement.is_empty() {
@@ -1237,7 +1326,7 @@ impl ProjectStore {
                 continue;
             }
             if let Ok((step, inferred_param_names)) =
-                self.draft_synthesized_step(&tool_ref, decision, available, inferer)
+                self.draft_synthesized_step(&tool_ref, decision, available, inferer, cohort_inferer)
             {
                 return Ok(Some((tool_ref, step, inferred_param_names)));
             }
@@ -1995,6 +2084,7 @@ fn infer_replace_params(
     step: &mut ProposedStep,
     hypothesis_statement: &str,
     inferer: &dyn ParamInferer,
+    cohort_inferer: &dyn CohortInferer,
     param_specs: &BTreeMap<String, ToolParamSpec>,
 ) -> Vec<String> {
     let mut inferred_param_names = Vec::new();
@@ -2004,21 +2094,44 @@ fn infer_replace_params(
             continue;
         }
 
-        let Some(inferred) = inferer.infer(hypothesis_statement, param_name) else {
+        let spec = param_specs.get(param_name);
+        let inferred =
+            valid_inferred_param_value(inferer.infer(hypothesis_statement, param_name), spec)
+                .or_else(|| {
+                    (spec.and_then(|spec| spec.infer) == Some(ParamInferKind::Cohort)).then(
+                        || {
+                            valid_inferred_param_value(
+                                cohort_inferer.infer_cohort(hypothesis_statement),
+                                spec,
+                            )
+                        },
+                    )?
+                });
+        let Some(inferred) = inferred else {
             continue;
         };
-        let trimmed = inferred.trim();
-        if !trimmed.is_empty() {
-            if let Some(spec) = param_specs.get(param_name) {
-                if validate_param_value(spec, trimmed).is_err() {
-                    continue;
-                }
-            }
-            *param_value = trimmed.to_string();
-            inferred_param_names.push(param_name.clone());
-        }
+
+        *param_value = inferred;
+        inferred_param_names.push(param_name.clone());
     }
     inferred_param_names
+}
+
+fn valid_inferred_param_value(
+    inferred: Option<String>,
+    spec: Option<&ToolParamSpec>,
+) -> Option<String> {
+    let inferred = inferred?;
+    let trimmed = inferred.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(spec) = spec {
+        if validate_param_value(spec, trimmed).is_err() {
+            return None;
+        }
+    }
+    Some(trimmed.to_string())
 }
 
 fn infer_synthesized_domain_params(
@@ -2593,10 +2706,10 @@ mod tests {
     use crate::tool_select::{Fit, ToolCandidate};
 
     use super::{
-        proposal_keywords, AppliedAction, ApplyConfig, ApplyFailure, CycleOutcome,
-        NoopOutputGroundingScorer, NoopParamInferer, NoopRelevanceScorer, NoopToolSynthesizer,
-        OutputGroundingScorer, ParamInferer, RelevanceScorer, StanceAssessmentOutputs,
-        ToolSynthesisOutcome, ToolSynthesizer,
+        proposal_keywords, AppliedAction, ApplyConfig, ApplyFailure, CohortInferer, CycleOutcome,
+        NoopCohortInferer, NoopOutputGroundingScorer, NoopParamInferer, NoopRelevanceScorer,
+        NoopToolSynthesizer, OutputGroundingScorer, ParamInferer, RelevanceScorer,
+        StanceAssessmentOutputs, ToolSynthesisOutcome, ToolSynthesizer,
     };
 
     fn temp_project_path(test_name: &str) -> PathBuf {
@@ -3118,6 +3231,61 @@ runtime:
         store.register_tool(spec).unwrap();
     }
 
+    fn write_auto_run_segment_marker_script(root: &std::path::Path) -> PathBuf {
+        let script_path = root.join("auto_run_segment_marker.sh");
+        std::fs::write(
+            &script_path,
+            r#"cat "$AGENTFLOW_INPUT_EXPRESSION_TABLE" >/dev/null
+printf '# Marker report\nSegment: %s\nscore: 0.61\n' "$AGENTFLOW_PARAM_SEGMENT" > "$AGENTFLOW_OUTPUT_MARKER_REPORT"
+"#,
+        )
+        .unwrap();
+        script_path
+    }
+
+    fn register_segment_marker_tool(
+        store: &ProjectStore,
+        script_path: &std::path::Path,
+        infer_hint: bool,
+    ) {
+        let command = script_path.display();
+        let infer_yaml = if infer_hint {
+            "    infer: cohort\n"
+        } else {
+            ""
+        };
+        let spec = ToolSpec::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: marker_deepen
+version: 0.1.0
+maturity: verified
+description: Marker evidence deepening report for target segment validation
+inputs:
+  expression_table:
+    type: ExpressionTable
+    required: true
+params:
+  segment:
+    type: string
+    required: true
+    pattern: "^[a-z0-9_]+$"
+{infer_yaml}outputs:
+  marker_report:
+    type: Markdown
+    observer: marker_report
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {command}
+"#
+        ))
+        .unwrap();
+        store.register_tool(spec).unwrap();
+    }
+
     fn register_io_compatible_marker_peer(store: &ProjectStore) {
         let spec = ToolSpec::from_simple_yaml(
             r#"
@@ -3215,6 +3383,24 @@ description: Fingerprint order fixture
             assert!(hypothesis_statement.contains("THRSP"));
             assert_eq!(param_name, "gene");
             Some("THRSP".to_string())
+        }
+    }
+
+    struct StubCohortInferer {
+        value: Option<String>,
+    }
+
+    impl StubCohortInferer {
+        fn new(value: Option<&str>) -> Self {
+            Self {
+                value: value.map(ToOwned::to_owned),
+            }
+        }
+    }
+
+    impl CohortInferer for StubCohortInferer {
+        fn infer_cohort(&self, _hypothesis_statement: &str) -> Option<String> {
+            self.value.clone()
         }
     }
 
@@ -6321,6 +6507,196 @@ steps:
                 .unwrap(),
             vec![("gene".to_string(), "THRSP".to_string())]
         );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn noop_cohort_inferer_keeps_declared_cohort_replace_param() {
+        let (path, store) = init_project("cohort-infer-noop");
+        let script = write_auto_run_segment_marker_script(&path);
+        register_segment_marker_tool(&store, &script, true);
+        import_expression_artifact(&store, &path);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker evidence for target segment requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is below the decision margin.",
+        );
+
+        let report = store
+            .run_cycle_with_scorer_grounded_cohort(
+                ApplyConfig::default(),
+                &NoopParamInferer,
+                &NoopRelevanceScorer,
+                &NoopOutputGroundingScorer,
+                &NoopCohortInferer,
+            )
+            .unwrap();
+
+        let step = report.branch_proposals[0].drafted_step.as_ref().unwrap();
+        assert_eq!(
+            step.params,
+            vec![("segment".to_string(), "REPLACE_segment".to_string())]
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn cohort_inferer_fills_only_declared_infer_param() {
+        let (declared_path, declared_store) = init_project("cohort-infer-declared");
+        let declared_script = write_auto_run_segment_marker_script(&declared_path);
+        register_segment_marker_tool(&declared_store, &declared_script, true);
+        import_expression_artifact(&declared_store, &declared_path);
+        let declared_hypothesis_id = record_hypothesis(
+            &declared_store,
+            "Marker evidence for target segment requires deeper pathway validation",
+        );
+        link_evidence(
+            &declared_store,
+            &declared_hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is below the decision margin.",
+        );
+
+        let declared_report = declared_store
+            .run_cycle_with_scorer_grounded_cohort(
+                ApplyConfig::default(),
+                &NoopParamInferer,
+                &NoopRelevanceScorer,
+                &NoopOutputGroundingScorer,
+                &StubCohortInferer::new(Some("fixture_segment")),
+            )
+            .unwrap();
+        assert_eq!(
+            declared_report.branch_proposals[0]
+                .drafted_step
+                .as_ref()
+                .unwrap()
+                .params,
+            vec![("segment".to_string(), "fixture_segment".to_string())]
+        );
+
+        let (plain_path, plain_store) = init_project("cohort-infer-undeclared");
+        let plain_script = write_auto_run_segment_marker_script(&plain_path);
+        register_segment_marker_tool(&plain_store, &plain_script, false);
+        import_expression_artifact(&plain_store, &plain_path);
+        let plain_hypothesis_id = record_hypothesis(
+            &plain_store,
+            "Marker evidence for target segment requires deeper pathway validation",
+        );
+        link_evidence(
+            &plain_store,
+            &plain_hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is below the decision margin.",
+        );
+
+        let plain_report = plain_store
+            .run_cycle_with_scorer_grounded_cohort(
+                ApplyConfig::default(),
+                &NoopParamInferer,
+                &NoopRelevanceScorer,
+                &NoopOutputGroundingScorer,
+                &StubCohortInferer::new(Some("fixture_segment")),
+            )
+            .unwrap();
+        assert_eq!(
+            plain_report.branch_proposals[0]
+                .drafted_step
+                .as_ref()
+                .unwrap()
+                .params,
+            vec![("segment".to_string(), "REPLACE_segment".to_string())]
+        );
+
+        let _ = std::fs::remove_dir_all(declared_path);
+        let _ = std::fs::remove_dir_all(plain_path);
+    }
+
+    #[test]
+    fn cohort_inferred_marker_caps_verified_observation_to_inferred_and_cannot_affirm() {
+        let (path, store) = init_project("cohort-inferred-marker-grade-cap");
+        let script = write_auto_run_segment_marker_script(&path);
+        register_segment_marker_tool(&store, &script, true);
+        import_expression_artifact(&store, &path);
+        let hypothesis_id = record_hypothesis(
+            &store,
+            "Marker evidence for target segment requires deeper pathway validation",
+        );
+        link_evidence(
+            &store,
+            &hypothesis_id,
+            EvidenceGrade::LiteratureSupported,
+            Stance::Supports,
+            "Literature support alone is below the decision margin.",
+        );
+
+        let report = store
+            .run_cycle_with_scorer_grounded_cohort(
+                ApplyConfig {
+                    apply: true,
+                    auto_run: true,
+                    flow: None,
+                    max_apply: 5,
+                    propose_synth: false,
+                },
+                &NoopParamInferer,
+                &NoopRelevanceScorer,
+                &NoopOutputGroundingScorer,
+                &StubCohortInferer::new(Some("fixture_segment")),
+            )
+            .unwrap();
+        let flow_id = format!("auto_{hypothesis_id}");
+        assert_eq!(event_count(&store, "agent.params_inferred"), 1);
+        assert_eq!(
+            store
+                .inferred_params_for_step(&flow_id, "step_marker_deepen")
+                .unwrap(),
+            vec![("segment".to_string(), "fixture_segment".to_string())]
+        );
+
+        let observation_id = report
+            .applied
+            .iter()
+            .find_map(|action| match action {
+                AppliedAction::StepRun {
+                    observation_id: Some(observation_id),
+                    ..
+                } => Some(observation_id.clone()),
+                _ => None,
+            })
+            .expect("auto-run should produce an observation");
+        let linked = store
+            .link_evidence(EvidenceLinkRequest {
+                hypothesis_id: hypothesis_id.clone(),
+                observation_id: Some(observation_id),
+                source: None,
+                grade: EvidenceGrade::Observed,
+                stance: Stance::Supports,
+                note:
+                    "Verified local output should be capped because its segment param was inferred."
+                        .to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(linked.grade, EvidenceGrade::Inferred);
+        let verdict = store
+            .render_verdict(&hypothesis_id, &RuleBasedEngine, Some(gate()))
+            .unwrap();
+        assert!(matches!(
+            verdict.verdict,
+            Verdict::Inconclusive(InconclusiveKind::Provisional { .. })
+        ));
+        assert_ne!(verdict.verdict, Verdict::Affirmed);
 
         let _ = std::fs::remove_dir_all(path);
     }

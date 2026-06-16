@@ -48,6 +48,13 @@ pub struct ToolParamSpec {
     pub required: bool,
     pub enum_values: Option<Vec<String>>,
     pub pattern: Option<String>,
+    pub infer: Option<ParamInferKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParamInferKind {
+    Cohort,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +192,7 @@ impl ToolSpec {
             required_params,
             param_enum_values: param_enum_values_map(&self.params),
             param_patterns: param_patterns_map(&self.params),
+            param_infer: param_infer_map(&self.params),
             output_types: port_type_map(&self.outputs),
             output_observers: observer_map(&self.outputs),
             input_min_rows: min_rows_map(&self.inputs),
@@ -230,6 +238,8 @@ struct StoredToolSpecJson {
     param_enum_values: BTreeMap<String, Vec<String>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     param_patterns: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    param_infer: BTreeMap<String, ParamInferKind>,
     #[serde(default)]
     output_types: BTreeMap<String, String>,
     #[serde(default)]
@@ -485,6 +495,8 @@ struct RawToolParamSpec {
     enum_values: Vec<String>,
     #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
     pattern: Option<String>,
+    #[serde(default)]
+    infer: Option<ParamInferKind>,
 }
 
 impl RawToolParamSpec {
@@ -494,6 +506,7 @@ impl RawToolParamSpec {
             required: self.required,
             enum_values: (!self.enum_values.is_empty()).then_some(self.enum_values),
             pattern: self.pattern,
+            infer: self.infer,
         }
     }
 }
@@ -1532,6 +1545,7 @@ fn executable_from_stored_json(
             let required = required_params.contains(&name);
             let enum_values = stored.param_enum_values.get(&name).cloned();
             let pattern = stored.param_patterns.get(&name).cloned();
+            let infer = stored.param_infer.get(&name).copied();
             (
                 name,
                 ToolParamSpec {
@@ -1539,6 +1553,7 @@ fn executable_from_stored_json(
                     required,
                     enum_values,
                     pattern,
+                    infer,
                 },
             )
         })
@@ -1744,6 +1759,12 @@ fn param_patterns_map(map: &BTreeMap<String, ToolParamSpec>) -> BTreeMap<String,
                 .as_ref()
                 .map(|pattern| (name.clone(), pattern.clone()))
         })
+        .collect()
+}
+
+fn param_infer_map(map: &BTreeMap<String, ToolParamSpec>) -> BTreeMap<String, ParamInferKind> {
+    map.iter()
+        .filter_map(|(name, param)| param.infer.map(|infer| (name.clone(), infer)))
         .collect()
 }
 
@@ -2844,12 +2865,63 @@ runtime:
     }
 
     #[test]
+    fn parses_optional_param_infer_hint_and_executable_tool_preserves_it() {
+        let spec = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: inferred_segment_scan
+version: 0.1.0
+maturity: verified
+description: Scan with a declaratively inferred segment param
+params:
+  segment:
+    type: string
+    required: true
+    infer: cohort
+  mode:
+    type: string
+    required: false
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.params.get("segment").unwrap().infer,
+            Some(ParamInferKind::Cohort)
+        );
+        assert_eq!(spec.params.get("mode").unwrap().infer, None);
+
+        let path = temp_project_path("param-infer-hint");
+        let store = ProjectStore::init(&path, Some("Tools")).unwrap();
+        store.register_tool(spec).unwrap();
+        let executable = store
+            .executable_tool("marker/inferred_segment_scan")
+            .unwrap();
+        assert_eq!(
+            executable.params.get("segment").unwrap().infer,
+            Some(ParamInferKind::Cohort)
+        );
+        assert_eq!(executable.params.get("mode").unwrap().infer, None);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn validate_param_value_checks_type_enum_and_pattern() {
         let int_param = ToolParamSpec {
             type_name: "int".to_string(),
             required: true,
             enum_values: None,
             pattern: None,
+            infer: None,
         };
         assert!(validate_param_value(&int_param, "42").is_ok());
         assert!(validate_param_value(&int_param, "4.2")
@@ -2861,6 +2933,7 @@ runtime:
             required: true,
             enum_values: Some(vec!["fast".to_string(), "careful".to_string()]),
             pattern: None,
+            infer: None,
         };
         assert!(validate_param_value(&enum_param, "fast").is_ok());
         assert!(validate_param_value(&enum_param, "slow")
@@ -2872,6 +2945,7 @@ runtime:
             required: true,
             enum_values: None,
             pattern: Some("^[A-Z0-9-]+$".to_string()),
+            infer: None,
         };
         assert!(validate_param_value(&pattern_param, "TP53").is_ok());
         assert!(validate_param_value(&pattern_param, "TP53!")

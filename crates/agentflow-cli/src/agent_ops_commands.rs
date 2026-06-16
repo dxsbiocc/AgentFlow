@@ -3,9 +3,10 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentflow_core::agent::{
-    AppliedAction, ApplyConfig, CycleReport, EnrichedProposal, GeneralizationCandidate,
-    NoopOutputGroundingScorer, NoopParamInferer, NoopRelevanceScorer, OutputGroundingScorer,
-    ParamInferer, RelevanceScorer, ToolSynthesisOutcome, ToolSynthesizer,
+    AppliedAction, ApplyConfig, CohortInferer, CycleReport, EnrichedProposal,
+    GeneralizationCandidate, NoopCohortInferer, NoopOutputGroundingScorer, NoopParamInferer,
+    NoopRelevanceScorer, OutputGroundingScorer, ParamInferer, RelevanceScorer,
+    ToolSynthesisOutcome, ToolSynthesizer,
 };
 use agentflow_core::argument::{EvidenceLink, Stance, VerdictSummary, VerdictTag};
 use agentflow_core::branch::{
@@ -222,6 +223,10 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
             store: &store,
             synthesizer: &synthesizer,
         };
+        let cohort = LlmCohortInferer {
+            store: &store,
+            synthesizer: &synthesizer,
+        };
         let tool_synthesizer = LlmToolSynthesizer {
             store: &store,
             synthesizer: &synthesizer,
@@ -229,6 +234,7 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
         let noop_inferer = NoopParamInferer;
         let noop_scorer = NoopRelevanceScorer;
         let noop_grounding = NoopOutputGroundingScorer;
+        let noop_cohort = NoopCohortInferer;
         let inferer: &dyn ParamInferer = if options.infer_params {
             &inferer
         } else {
@@ -244,12 +250,18 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
         } else {
             &noop_grounding
         };
-        store.run_cycle_with_synth_grounded(
+        let cohort_inferer: &dyn CohortInferer = if options.semantic_match {
+            &cohort
+        } else {
+            &noop_cohort
+        };
+        store.run_cycle_with_synth_grounded_cohort(
             config,
             inferer,
             scorer,
             &tool_synthesizer,
             grounding,
+            cohort_inferer,
         )?
     } else {
         match (options.infer_params, options.semantic_match) {
@@ -266,7 +278,13 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
                     store: &store,
                     synthesizer: &synthesizer,
                 };
-                store.run_cycle_with_scorer_grounded(config, &inferer, &scorer, &grounding)?
+                let cohort = LlmCohortInferer {
+                    store: &store,
+                    synthesizer: &synthesizer,
+                };
+                store.run_cycle_with_scorer_grounded_cohort(
+                    config, &inferer, &scorer, &grounding, &cohort,
+                )?
             }
             (true, false) => {
                 let inferer = LlmParamInferer {
@@ -284,11 +302,16 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
                     store: &store,
                     synthesizer: &synthesizer,
                 };
-                store.run_cycle_with_scorer_grounded(
+                let cohort = LlmCohortInferer {
+                    store: &store,
+                    synthesizer: &synthesizer,
+                };
+                store.run_cycle_with_scorer_grounded_cohort(
                     config,
                     &NoopParamInferer,
                     &scorer,
                     &grounding,
+                    &cohort,
                 )?
             }
             (false, false) => store.run_cycle_with_apply_config(config)?,
@@ -692,25 +715,13 @@ impl OutputGroundingScorer for LlmOutputGroundingScorer<'_> {
     }
 }
 
-trait CohortInferer {
-    fn infer_cohort_study(&self, hypothesis_statement: &str) -> Option<String>;
-}
-
-struct NoopCohortInferer;
-
-impl CohortInferer for NoopCohortInferer {
-    fn infer_cohort_study(&self, _hypothesis_statement: &str) -> Option<String> {
-        None
-    }
-}
-
 struct LlmCohortInferer<'a> {
     store: &'a ProjectStore,
     synthesizer: &'a str,
 }
 
 impl CohortInferer for LlmCohortInferer<'_> {
-    fn infer_cohort_study(&self, hypothesis_statement: &str) -> Option<String> {
+    fn infer_cohort(&self, hypothesis_statement: &str) -> Option<String> {
         infer_grounded_cohort_study(
             hypothesis_statement,
             |url| {
@@ -1310,7 +1321,7 @@ fn validate_generalization_candidate(
     let Ok(hypothesis) = store.inspect_hypothesis(&candidate.hypothesis_id) else {
         return GeneralizationValidation::skipped(candidate, "hypothesis 未读取");
     };
-    let Some(inferred_cohort) = cohort_inferer.infer_cohort_study(&hypothesis.statement) else {
+    let Some(inferred_cohort) = cohort_inferer.infer_cohort(&hypothesis.statement) else {
         return GeneralizationValidation::skipped(candidate, "cohort 未推断");
     };
     let Some(gene) = gene_inferer.infer(&hypothesis.statement, "gene") else {
@@ -2954,7 +2965,7 @@ runtime:
     }
 
     impl CohortInferer for StubCohortInferer {
-        fn infer_cohort_study(&self, _hypothesis_statement: &str) -> Option<String> {
+        fn infer_cohort(&self, _hypothesis_statement: &str) -> Option<String> {
             self.study.clone()
         }
     }

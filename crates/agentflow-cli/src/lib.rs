@@ -58,6 +58,7 @@ pub fn usage() -> String {
         "  agentflow status [--json] [--path <path>]",
         "  agentflow doctor [--path <path>]",
         "  agentflow tools register <tool.yaml> [--path <path>]",
+        "  agentflow tools supersede <old-tool-ref> --by <new-tool-ref> [--reason <text>] [--json] [--path <path>]",
         "  agentflow tools list [--json] [--path <path>]",
         "  agentflow tools inspect <tool-ref> [--json] [--path <path>]",
         "  agentflow tools match [--output <type>] [--input <type>]... [--keyword <kw>]... [--json] [--path <path>]",
@@ -780,6 +781,7 @@ fn doctor_command(args: PathJsonArgs) -> Result<String, CliError> {
 fn tools_command(args: ToolsArgs) -> Result<String, CliError> {
     match args.command {
         ToolsCommand::Register(args) => tools_register_command(args),
+        ToolsCommand::Supersede(args) => tools_supersede_command(args),
         ToolsCommand::List(args) => tools_list_command(args),
         ToolsCommand::Inspect(args) => tools_inspect_command(args),
         ToolsCommand::Match(args) => tools_match_command(args),
@@ -805,6 +807,23 @@ fn tools_register_command(args: ToolsRegisterArgs) -> Result<String, CliError> {
         "{action} tool\nRef: {}\nVersion: {}\nSpec hash: {}",
         registration.tool_ref, registration.version, registration.spec_hash
     ))
+}
+
+fn tools_supersede_command(args: ToolsSupersedeArgs) -> Result<String, CliError> {
+    let old_tool_ref = args.old_tool_ref;
+    let successor_tool_ref = args.successor_tool_ref;
+    let reason = last_value(args.reason);
+    let options = ProjectOptions::from(args.project);
+    let path = options.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&path)?;
+    let supersession =
+        store.supersede_tool(&old_tool_ref, &successor_tool_ref, reason.as_deref())?;
+
+    if options.json {
+        Ok(tool_supersession_command_json(&supersession))
+    } else {
+        Ok(format_tool_supersession(&supersession))
+    }
 }
 
 fn resolve_tool_runtime_paths(
@@ -863,12 +882,19 @@ fn tools_list_command(args: PathJsonArgs) -> Result<String, CliError> {
         Ok(tools
             .iter()
             .map(|tool| {
+                let status = tool
+                    .superseded_by
+                    .as_ref()
+                    .map(|supersession| {
+                        format!(" superseded_by {}", supersession.successor_tool_ref)
+                    })
+                    .unwrap_or_default();
                 format!(
                     "{}@{} [{}]",
                     tool.tool_ref(),
                     tool.latest_version,
                     tool.maturity
-                )
+                ) + &status
             })
             .collect::<Vec<_>>()
             .join("\n"))
@@ -885,12 +911,24 @@ fn tools_inspect_command(args: ToolsInspectArgs) -> Result<String, CliError> {
     if options.json {
         Ok(inspection.to_json())
     } else {
+        let superseded = inspection
+            .superseded_by
+            .as_ref()
+            .map(|supersession| {
+                format!(
+                    "\nSuperseded by: {}\nReason: {}",
+                    supersession.successor_tool_ref,
+                    supersession.reason.as_deref().unwrap_or("none")
+                )
+            })
+            .unwrap_or_default();
         Ok(format!(
-            "Tool: {}\nLatest version: {}\nSelected version: {}\nMaturity: {}\nSpec hash: {}\nCreated: {}\nStored spec JSON:\n{}",
+            "Tool: {}\nLatest version: {}\nSelected version: {}\nMaturity: {}{}\nSpec hash: {}\nCreated: {}\nStored spec JSON:\n{}",
             inspection.summary.tool_ref(),
             inspection.summary.latest_version,
             inspection.version,
             inspection.summary.maturity,
+            superseded,
             inspection.spec_hash,
             inspection.created_at,
             inspection.spec_json
@@ -1662,10 +1700,30 @@ fn branch_comparisons_json(
     )
 }
 
+fn format_tool_supersession(supersession: &agentflow_core::storage::ToolSupersession) -> String {
+    format!(
+        "Superseded tool\nOld: {}\nSuccessor: {}\nReason: {}\nCreated: {}",
+        supersession.superseded_tool_ref,
+        supersession.successor_tool_ref,
+        supersession.reason.as_deref().unwrap_or("none"),
+        supersession.created_at
+    )
+}
+
 fn tools_list_json(tools: &[agentflow_core::storage::ToolSummary]) -> String {
     let items = tools
         .iter()
         .map(|tool| {
+            let superseded_by = tool
+                .superseded_by
+                .as_ref()
+                .map(|supersession| {
+                    format!(
+                        ",\"superseded_by\":{}",
+                        tool_supersession_status_json(supersession)
+                    )
+                })
+                .unwrap_or_default();
             format!(
                 concat!(
                     "{{",
@@ -1674,13 +1732,15 @@ fn tools_list_json(tools: &[agentflow_core::storage::ToolSummary]) -> String {
                     "\"name\":\"{}\",",
                     "\"latest_version\":\"{}\",",
                     "\"maturity\":\"{}\"",
+                    "{}",
                     "}}"
                 ),
                 escape_json(&tool.tool_ref()),
                 escape_json(&tool.namespace),
                 escape_json(&tool.name),
                 escape_json(&tool.latest_version),
-                escape_json(&tool.maturity)
+                escape_json(&tool.maturity),
+                superseded_by
             )
         })
         .collect::<Vec<_>>()
@@ -1690,6 +1750,45 @@ fn tools_list_json(tools: &[agentflow_core::storage::ToolSummary]) -> String {
         "{{\"schema_version\":\"{}\",\"tools\":[{}]}}",
         agentflow_schemas::TOOL_LIST_JSON_SCHEMA_V0,
         items
+    )
+}
+
+fn tool_supersession_command_json(
+    supersession: &agentflow_core::storage::ToolSupersession,
+) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"schema_version\":\"agentflow.tool_superseded.v0\",",
+            "\"superseded_tool_ref\":\"{}\",",
+            "\"successor_tool_ref\":\"{}\",",
+            "\"reason\":{},",
+            "\"created_at\":{}",
+            "}}"
+        ),
+        escape_json(&supersession.superseded_tool_ref),
+        escape_json(&supersession.successor_tool_ref),
+        optional_json_string(supersession.reason.as_deref()),
+        supersession.created_at
+    )
+}
+
+fn tool_supersession_status_json(
+    supersession: &agentflow_core::storage::ToolSupersession,
+) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"superseded_tool_ref\":\"{}\",",
+            "\"successor_tool_ref\":\"{}\",",
+            "\"reason\":{},",
+            "\"created_at\":{}",
+            "}}"
+        ),
+        escape_json(&supersession.superseded_tool_ref),
+        escape_json(&supersession.successor_tool_ref),
+        optional_json_string(supersession.reason.as_deref()),
+        supersession.created_at
     )
 }
 
@@ -2419,6 +2518,34 @@ runtime:
         spec_path
     }
 
+    fn write_successor_tool(path: &std::path::Path) -> PathBuf {
+        let spec_path = path.join("general_survival_scan.tool.yaml");
+        fs::write(
+            &spec_path,
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: general_survival_scan
+version: 0.1.0
+maturity: verified
+description: General survival scan
+inputs:
+  expression_table:
+    type: TSV
+    required: true
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+"#,
+        )
+        .unwrap();
+        spec_path
+    }
+
     fn write_executable_sample_tool(path: &std::path::Path) -> PathBuf {
         let script_path = path.join("marker_survival_scan.sh");
         fs::write(
@@ -2646,6 +2773,7 @@ steps:
         assert!(output.contains("agentflow env prepare <tool-ref>"));
         assert!(output.contains("agentflow env export <tool-ref>"));
         assert!(output.contains("agentflow llm config --provider anthropic|openai|gemini|deepseek"));
+        assert!(output.contains("agentflow tools supersede <old-tool-ref> --by <new-tool-ref>"));
     }
 
     #[test]
@@ -3032,6 +3160,126 @@ PY
         .unwrap();
         assert!(inspect.contains("\"schema_version\":\"agentflow.tool_inspection.v0\""));
         assert!(inspect.contains("\"version\":\"0.1.0\""));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn tools_supersede_records_lineage_and_surfaces_status() {
+        let path = temp_project_path("tools-supersede");
+        run(args(&[
+            "agentflow",
+            "init",
+            "--name",
+            "Demo",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let old_spec_path = write_sample_tool(&path);
+        let successor_spec_path = write_successor_tool(&path);
+        run(args(&[
+            "agentflow",
+            "tools",
+            "register",
+            old_spec_path.to_str().unwrap(),
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        run(args(&[
+            "agentflow",
+            "tools",
+            "register",
+            successor_spec_path.to_str().unwrap(),
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        let supersede = run(args(&[
+            "agentflow",
+            "tools",
+            "supersede",
+            "marker/marker_survival_scan",
+            "--by",
+            "marker/general_survival_scan",
+            "--reason",
+            "validated generalized workflow",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(supersede.contains("\"schema_version\":\"agentflow.tool_superseded.v0\""));
+        assert!(supersede.contains("\"superseded_tool_ref\":\"marker/marker_survival_scan\""));
+        assert!(supersede.contains("\"successor_tool_ref\":\"marker/general_survival_scan\""));
+        assert!(supersede.contains("\"reason\":\"validated generalized workflow\""));
+
+        let list = run(args(&[
+            "agentflow",
+            "tools",
+            "list",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(list.contains(
+            "marker/marker_survival_scan@0.1.0 [wrapped] superseded_by marker/general_survival_scan"
+        ));
+        assert!(list.contains("marker/general_survival_scan@0.1.0 [verified]"));
+
+        let list_json = run(args(&[
+            "agentflow",
+            "tools",
+            "list",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(list_json.contains(
+            "\"superseded_by\":{\"superseded_tool_ref\":\"marker/marker_survival_scan\",\"successor_tool_ref\":\"marker/general_survival_scan\""
+        ));
+
+        let inspect = run(args(&[
+            "agentflow",
+            "tools",
+            "inspect",
+            "marker/marker_survival_scan",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(inspect.contains("Superseded by: marker/general_survival_scan"));
+        assert!(inspect.contains("Reason: validated generalized workflow"));
+
+        let inspect_json = run(args(&[
+            "agentflow",
+            "tools",
+            "inspect",
+            "marker/marker_survival_scan",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(inspect_json.contains("\"superseded_by\":{\"superseded_tool_ref\""));
+
+        let missing = run(args(&[
+            "agentflow",
+            "tools",
+            "supersede",
+            "marker/missing_scan",
+            "--by",
+            "marker/general_survival_scan",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+        assert!(missing
+            .message()
+            .contains("not found: tool marker/missing_scan"));
 
         let _ = fs::remove_dir_all(path);
     }

@@ -731,6 +731,15 @@ fn write_methods_and_tools(
 ) -> Result<(), StorageError> {
     let mut tools = store.list_tools()?;
     tools.sort_by_key(|tool| tool.tool_ref());
+    let mut superseded_by_successor = BTreeMap::<String, Vec<String>>::new();
+    for tool in &tools {
+        if let Some(supersession) = &tool.superseded_by {
+            superseded_by_successor
+                .entry(supersession.successor_tool_ref.clone())
+                .or_default()
+                .push(supersession.superseded_tool_ref.clone());
+        }
+    }
 
     writeln!(markdown, "## Methods & Tools ({})", tools.len()).unwrap();
     writeln!(markdown).unwrap();
@@ -762,11 +771,15 @@ fn write_methods_and_tools(
         } else {
             "预置/外部工具"
         };
+        let lineage = format_tool_lineage(
+            inspection.superseded_by.as_ref(),
+            superseded_by_successor.get(&tool_ref),
+        );
 
         writeln!(
             markdown,
-            "- `{}` [{}]: {}",
-            tool_ref, inspection.summary.maturity, description
+            "- `{}` [{}]: {}{}",
+            tool_ref, inspection.summary.maturity, description, lineage
         )
         .unwrap();
         writeln!(markdown, "  - runtime: {runtime_command}").unwrap();
@@ -774,6 +787,27 @@ fn write_methods_and_tools(
     }
 
     Ok(())
+}
+
+fn format_tool_lineage(
+    superseded_by: Option<&crate::storage::ToolSupersession>,
+    supersedes: Option<&Vec<String>>,
+) -> String {
+    let mut labels = Vec::new();
+    if let Some(supersession) = superseded_by {
+        labels.push(format!(
+            "superseded_by `{}`",
+            supersession.successor_tool_ref
+        ));
+    }
+    if let Some(superseded_refs) = supersedes.filter(|refs| !refs.is_empty()) {
+        labels.push(format!("supersedes `{}`", superseded_refs.join("`, `")));
+    }
+    if labels.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", labels.join("; "))
+    }
 }
 
 /// Minimal projection of a stored tool spec for the Methods & Tools report
@@ -1217,6 +1251,71 @@ runtime:
         assert!(report.contains("  - runtime: /bin/echo synth"));
         assert!(report
             .contains("  - provenance: 自主合成工具(runtime-gate 已验证)；源码见 runtime 路径"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn generate_research_report_markdown_renders_tool_supersession_lineage() {
+        let path = temp_project_path("research-tool-lineage");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Research Tool Lineage")).unwrap();
+        register_tool(
+            &store,
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: marker_survival_scan
+version: 0.1.0
+maturity: wrapped
+description: Scan one marker against survival table
+outputs:
+  marker_report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+    - old
+"#
+            .to_string(),
+        );
+        register_tool(
+            &store,
+            r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: generalized_survival_scan
+version: 0.1.0
+maturity: verified
+description: Scan generalized marker cohorts against survival table
+outputs:
+  marker_report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+    - new
+"#
+            .to_string(),
+        );
+        store
+            .supersede_tool(
+                "marker/marker_survival_scan",
+                "marker/generalized_survival_scan",
+                Some("validated generalized cohort scan"),
+            )
+            .unwrap();
+
+        let report = store.generate_research_report_markdown().unwrap();
+
+        assert!(report.contains(
+            "- `marker/marker_survival_scan` [wrapped]: Scan one marker against survival table — superseded_by `marker/generalized_survival_scan`"
+        ));
+        assert!(report.contains(
+            "- `marker/generalized_survival_scan` [verified]: Scan generalized marker cohorts against survival table — supersedes `marker/marker_survival_scan`"
+        ));
 
         let _ = fs::remove_dir_all(path);
     }

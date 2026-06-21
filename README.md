@@ -13,7 +13,10 @@ Posture as of 2026-06-01:
   raises decision points). Autonomous apply is available **opt-in and OFF by default** via
   `agent run --apply`: applies only inside a brake-gated, capped, revertable safe envelope,
   and never auto-affirms a strong verdict — those always hand off to the user.
-- Repo-local and Rust-workspace driven; no packaged binary release yet.
+- Repo-local and Rust-workspace driven. Tagged releases also ship prebuilt
+  `agentflow` binaries (Linux x86_64, macOS arm64/x86_64) on the
+  [Releases page](https://github.com/dxsbiocc/AgentFlow/releases); build from
+  source with `cargo build --release -p agentflow-cli` otherwise.
 
 See [docs/agentflow-agent-control-layer-design.md](docs/agentflow-agent-control-layer-design.md)
 for the control-layer architecture (engines, control constitution A1–A4, milestones H1–H7b),

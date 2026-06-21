@@ -1,0 +1,74 @@
+name: Release
+
+# Builds the `agentflow` CLI binary for each supported platform and attaches the
+# archives + checksums to the GitHub Release for a `v*` tag. Can also be run
+# manually (workflow_dispatch) against an existing tag.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach binaries to (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked -p agentflow-cli --target ${{ matrix.target }}
+
+      - name: Package archive
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          bin="agentflow"
+          dist="${bin}-${tag}-${{ matrix.target }}"
+          mkdir -p "dist/${dist}"
+          cp "target/${{ matrix.target }}/release/${bin}" "dist/${dist}/"
+          # strip to shrink the binary (best-effort; ignore if unavailable)
+          strip "dist/${dist}/${bin}" 2>/dev/null || true
+          cp README.md LICENSE CHANGELOG.md "dist/${dist}/"
+          tar -C dist -czf "dist/${dist}.tar.gz" "${dist}"
+          ( cd dist && shasum -a 256 "${dist}.tar.gz" > "${dist}.tar.gz.sha256" )
+          echo "archive=dist/${dist}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${dist}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          fail_on_unmatched_files: true

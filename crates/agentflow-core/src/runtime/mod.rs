@@ -1031,7 +1031,6 @@ impl ProjectStore {
         let params_map = parse_json_map(&step.params_json)?;
         let outputs = parse_json_map(&step.outputs_json)?;
         let resolved_inputs = self.resolve_inputs(flow_id, &inputs)?;
-        let resolved_input_paths = input_paths(&resolved_inputs);
         let params_json = string_map_json(&params_map);
         let input_hashes_json = input_hashes_json(&resolved_inputs);
         let isolated_env = ensure_isolated_tool_environment(
@@ -1056,6 +1055,7 @@ impl ProjectStore {
         let workdir = project_dir(self.root_path()).join("work").join(&attempt_id);
         fs::create_dir_all(&workdir)?;
         let workdir = fs::canonicalize(&workdir)?;
+        let resolved_input_paths = input_paths(&resolved_inputs, &workdir)?;
         let stdout_path = workdir.join("stdout.log");
         let stderr_path = workdir.join("stderr.log");
         let resolved_outputs = output_paths(&workdir, &outputs);
@@ -1891,11 +1891,75 @@ fn output_paths(workdir: &Path, outputs: &BTreeMap<String, String>) -> OutputPat
     OutputPaths { root, paths }
 }
 
-fn input_paths(inputs: &BTreeMap<String, ResolvedInput>) -> BTreeMap<String, PathBuf> {
+fn input_paths(
+    inputs: &BTreeMap<String, ResolvedInput>,
+    workdir: &Path,
+) -> Result<BTreeMap<String, PathBuf>, StorageError> {
+    let inputs_root = workdir.join("inputs");
+    fs::create_dir_all(&inputs_root)?;
     inputs
         .iter()
-        .map(|(name, input)| (name.clone(), input.path.clone()))
+        .map(|(name, input)| {
+            stage_input_path(&input.path, &inputs_root, name)
+                .map(|staged_path| (name.clone(), staged_path))
+        })
         .collect()
+}
+
+fn stage_input_path(
+    source_path: &Path,
+    inputs_root: &Path,
+    port_name: &str,
+) -> Result<PathBuf, StorageError> {
+    stage_input_path_with_linker(source_path, inputs_root, port_name, create_input_symlink)
+}
+
+fn stage_input_path_with_linker<F>(
+    source_path: &Path,
+    inputs_root: &Path,
+    port_name: &str,
+    link: F,
+) -> Result<PathBuf, StorageError>
+where
+    F: Fn(&Path, &Path) -> io::Result<()>,
+{
+    let port_dir = inputs_root.join(sanitize_path_part(port_name));
+    fs::create_dir_all(&port_dir)?;
+    let filename = source_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .map(sanitize_path_part)
+        .unwrap_or_else(|| "input".to_string());
+    let staged_path = port_dir.join(filename);
+
+    // Local/conda staging is a logical workdir boundary: tools receive only
+    // workdir paths, but symlinks can still be followed to the artifact store.
+    // Hard filesystem isolation belongs to the container backend.
+    match link(source_path, &staged_path) {
+        Ok(()) => Ok(staged_path),
+        Err(link_error) => match fs::copy(source_path, &staged_path) {
+            Ok(_) => Ok(staged_path),
+            Err(copy_error) => Err(StorageError::InvalidInput(format!(
+                "failed to stage input port {port_name} from {} to {}: symlink failed ({link_error}); copy failed ({copy_error})",
+                source_path.display(),
+                staged_path.display()
+            ))),
+        },
+    }
+}
+
+#[cfg(unix)]
+fn create_input_symlink(source_path: &Path, staged_path: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(source_path, staged_path)
+}
+
+#[cfg(windows)]
+fn create_input_symlink(source_path: &Path, staged_path: &Path) -> io::Result<()> {
+    if source_path.is_dir() {
+        std::os::windows::fs::symlink_dir(source_path, staged_path)
+    } else {
+        std::os::windows::fs::symlink_file(source_path, staged_path)
+    }
 }
 
 fn input_hashes_json(inputs: &BTreeMap<String, ResolvedInput>) -> String {
@@ -4132,6 +4196,144 @@ steps:
         );
         assert_eq!(store.prune_cache_entries(None).unwrap().removed_entries, 2);
         assert!(store.list_cache_entries().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn run_flow_stages_only_declared_inputs_inside_workdir() {
+        let path = temp_project_path("input-staging");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Runtime Demo")).unwrap();
+        let script_path = path.join("record_input_path.sh");
+        fs::write(
+            &script_path,
+            r#"printf 'declared=%s\n' "$AGENTFLOW_INPUT_DECLARED_TABLE"
+printf 'inputs_json=%s\n' "$AGENTFLOW_INPUTS_JSON"
+cat "$AGENTFLOW_INPUTS_JSON"
+printf '\n'
+cat "$AGENTFLOW_INPUT_DECLARED_TABLE" >/dev/null
+printf 'ok\n' > "$AGENTFLOW_OUTPUT_REPORT"
+"#,
+        )
+        .unwrap();
+
+        register_tool(
+            &store,
+            format!(
+                r#"
+schema_version: agentflow.tool.v0
+namespace: marker
+name: staged_input_probe
+version: 0.1.0
+maturity: wrapped
+description: Record the declared input path exposed to a local tool
+inputs:
+  declared_table:
+    type: TSV
+    required: true
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {}
+"#,
+                script_path.display()
+            ),
+        );
+
+        let declared_source_path = path.join("declared.tsv");
+        fs::write(&declared_source_path, "sample\tvalue\nA\t1\n").unwrap();
+        let hidden_source_path = path.join("hidden.tsv");
+        fs::write(&hidden_source_path, "sample\tvalue\nB\t2\n").unwrap();
+        let declared_id = import_artifact(&store, declared_source_path);
+        let _hidden_id = import_artifact(&store, hidden_source_path);
+        let declared_store_path = store.inspect_artifact(&declared_id).unwrap().summary.path;
+
+        let flow = FlowDraft::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.flow.v0
+id: input_staging_demo
+name: Input staging demo
+steps:
+  - id: probe
+    tool: marker/staged_input_probe
+    reason: Prove tools see staged declared inputs
+    needs: []
+    inputs:
+      declared_table: {declared_id}
+    outputs:
+      report: marker_report
+"#
+        ))
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+
+        let summary = store.run_flow("input_staging_demo").unwrap();
+        assert_eq!(summary.completed_steps, 1);
+        assert_eq!(summary.failed_steps, 0);
+        let workdir = &summary.attempts[0].workdir;
+        let inputs_root = workdir.join("inputs");
+        let mut input_ports = fs::read_dir(&inputs_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        input_ports.sort();
+        assert_eq!(input_ports, vec!["declared_table"]);
+        assert!(!inputs_root.join("hidden_table").exists());
+
+        let logs = store.read_logs(&summary.attempts[0].attempt_id).unwrap();
+        let exposed_input_path = logs
+            .stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("declared="))
+            .map(PathBuf::from)
+            .expect("tool printed declared input path");
+        let expected_staged_path = inputs_root.join("declared_table").join("declared.tsv");
+        assert_eq!(exposed_input_path, expected_staged_path);
+        assert!(exposed_input_path.starts_with(workdir));
+        assert_ne!(exposed_input_path, declared_store_path);
+
+        let inputs_json = fs::read_to_string(workdir.join("inputs.json")).unwrap();
+        let input_map = parse_json_map(&inputs_json).unwrap();
+        assert_eq!(
+            PathBuf::from(input_map.get("declared_table").unwrap()),
+            expected_staged_path
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn stage_input_path_copies_when_symlink_fails() {
+        let path = temp_project_path("input-staging-copy-fallback");
+        fs::create_dir_all(&path).unwrap();
+        let source_path = path.join("source.tsv");
+        fs::write(&source_path, "sample\tvalue\nA\t1\n").unwrap();
+        let inputs_root = path.join("work").join("inputs");
+
+        let staged_path =
+            stage_input_path_with_linker(&source_path, &inputs_root, "source_table", |_, _| {
+                Err(std::io::Error::from_raw_os_error(18))
+            })
+            .unwrap();
+
+        assert_eq!(
+            staged_path,
+            inputs_root.join("source_table").join("source.tsv")
+        );
+        assert_eq!(
+            fs::read(&staged_path).unwrap(),
+            fs::read(&source_path).unwrap()
+        );
+        #[cfg(unix)]
+        assert!(!fs::symlink_metadata(&staged_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
 
         let _ = fs::remove_dir_all(path);
     }

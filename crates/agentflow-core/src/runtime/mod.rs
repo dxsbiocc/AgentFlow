@@ -20,6 +20,9 @@ use crate::storage::{
 };
 
 mod backend;
+mod schedule;
+
+use schedule::{RuleBasedStepScheduler, StepScheduler};
 
 const ISOLATED_ENV_BACKEND: &str = "isolated-micromamba";
 const ISOLATED_ENV_LOCK_FILE: &str = "agentflow-env.lock";
@@ -636,7 +639,10 @@ impl ProjectStore {
         loop {
             let flow = self.inspect_flow(flow_id)?;
             let mut completed = completed_step_ids(&flow.steps);
-            let ready = ready_steps(&flow.steps, &flow.edges, &completed);
+            let ready = RuleBasedStepScheduler.order(
+                ready_steps(&flow.steps, &flow.edges, &completed),
+                &flow.edges,
+            );
             if ready.is_empty() {
                 break;
             }
@@ -3362,9 +3368,11 @@ fn now_unix_nanos() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use super::schedule::{RuleBasedStepScheduler, StepScheduler};
     use super::*;
     use crate::storage::{
-        ArtifactImportMode, ArtifactImportRequest, FlowDraft, ProjectStore, ToolSpec,
+        ArtifactImportMode, ArtifactImportRequest, FlowDraft, ProjectStore, StoredFlowEdge,
+        ToolSpec,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -3396,6 +3404,42 @@ fi
         )
         .unwrap();
         script_path
+    }
+
+    fn write_note_script(path: &Path) -> PathBuf {
+        let script_path = path.join("note_tool.sh");
+        fs::write(
+            &script_path,
+            r#"printf '%s\n' "$AGENTFLOW_PARAM_LABEL" > "$AGENTFLOW_OUTPUT_NOTE"
+echo "$AGENTFLOW_PARAM_LABEL"
+"#,
+        )
+        .unwrap();
+        script_path
+    }
+
+    fn stored_step(local_id: &str) -> StoredFlowStep {
+        StoredFlowStep {
+            id: format!("step:schedule_test/{local_id}"),
+            local_id: local_id.to_string(),
+            tool_ref: Some("schedule/noop".to_string()),
+            step_type: "tool".to_string(),
+            status: "ready".to_string(),
+            reason: None,
+            params_json: "{}".to_string(),
+            inputs_json: "{}".to_string(),
+            outputs_json: "{}".to_string(),
+        }
+    }
+
+    fn stored_edge(from: &str, to: &str) -> StoredFlowEdge {
+        StoredFlowEdge {
+            from_step_id: format!("step:schedule_test/{from}"),
+            to_step_id: format!("step:schedule_test/{to}"),
+            from_local_id: from.to_string(),
+            to_local_id: to.to_string(),
+            edge_type: "needs".to_string(),
+        }
     }
 
     fn make_executable(path: &Path) {
@@ -3533,6 +3577,174 @@ steps:
             .unwrap()
             .summary
             .id
+    }
+
+    fn run_schedule_flow(test_name: &str, serial: bool) -> (PathBuf, FlowRunSummary) {
+        let path = temp_project_path(test_name);
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Runtime Schedule Demo")).unwrap();
+        let script_path = write_note_script(&path);
+        let command = script_path.display();
+
+        register_tool(
+            &store,
+            format!(
+                r#"
+schema_version: agentflow.tool.v0
+namespace: schedule
+name: emit_note
+version: 0.1.0
+maturity: wrapped
+description: Emit a deterministic note
+params:
+  label:
+    type: string
+    required: true
+outputs:
+  note:
+    type: Text
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {command}
+"#
+            ),
+        );
+
+        let wide_needs = if serial { "[narrow]" } else { "[]" };
+        let flow = FlowDraft::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.flow.v0
+id: schedule_demo
+name: Schedule demo
+steps:
+  - id: narrow
+    tool: schedule/emit_note
+    needs: []
+    params:
+      label: narrow
+    outputs:
+      note: narrow_note
+  - id: wide
+    tool: schedule/emit_note
+    needs: {wide_needs}
+    params:
+      label: wide
+    outputs:
+      note: wide_note
+  - id: join
+    tool: schedule/emit_note
+    needs: [narrow, wide]
+    params:
+      label: join
+    outputs:
+      note: join_note
+  - id: wide_tail
+    tool: schedule/emit_note
+    needs: [wide]
+    params:
+      label: wide_tail
+    outputs:
+      note: wide_tail_note
+"#
+        ))
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+        let summary = store.run_flow("schedule_demo").unwrap();
+        (path, summary)
+    }
+
+    fn computed_texts_by_step(path: &Path, flow_id: &str) -> BTreeMap<String, String> {
+        let store = ProjectStore::open(path).unwrap();
+        let mut texts = BTreeMap::new();
+        for artifact in store.list_artifacts().unwrap() {
+            if artifact.kind != "computed" {
+                continue;
+            }
+            let Some(source_step_id) = artifact.source_step_id.as_deref() else {
+                continue;
+            };
+            let Some(local_id) = source_step_id.strip_prefix(&format!("step:{flow_id}/")) else {
+                continue;
+            };
+            texts.insert(
+                local_id.to_string(),
+                fs::read_to_string(artifact.path).unwrap(),
+            );
+        }
+        texts
+    }
+
+    #[test]
+    fn rule_based_step_scheduler_orders_by_downstream_count_then_declaration_order() {
+        let ready = vec![
+            stored_step("single"),
+            stored_step("fanout"),
+            stored_step("tie_first"),
+            stored_step("tie_second"),
+        ];
+        let edges = vec![
+            stored_edge("single", "single_child"),
+            stored_edge("fanout", "fanout_a"),
+            stored_edge("fanout", "fanout_b"),
+            stored_edge("tie_first", "tie_first_child"),
+            stored_edge("tie_second", "tie_second_child"),
+        ];
+
+        let ordered = RuleBasedStepScheduler.order(ready, &edges);
+
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|step| step.local_id.as_str())
+                .collect::<Vec<_>>(),
+            ["fanout", "single", "tie_first", "tie_second"]
+        );
+    }
+
+    #[test]
+    fn rule_based_step_scheduler_keeps_single_ready_step_unchanged() {
+        let ready = vec![stored_step("only")];
+        let edges = vec![stored_edge("only", "child")];
+
+        let ordered = RuleBasedStepScheduler.order(ready.clone(), &edges);
+
+        assert_eq!(ordered, ready);
+    }
+
+    #[test]
+    fn run_flow_schedules_parallel_ready_steps_deterministically_without_changing_outputs() {
+        let (serial_path, serial_summary) = run_schedule_flow("scheduler-serial", true);
+        let serial_outputs = computed_texts_by_step(&serial_path, "schedule_demo");
+        let (parallel_path, parallel_summary) = run_schedule_flow("scheduler-parallel", false);
+        let parallel_outputs = computed_texts_by_step(&parallel_path, "schedule_demo");
+
+        assert_eq!(serial_summary.completed_steps, 4);
+        assert_eq!(serial_summary.failed_steps, 0);
+        assert_eq!(parallel_summary.completed_steps, 4);
+        assert_eq!(parallel_summary.failed_steps, 0);
+        assert_eq!(
+            parallel_summary
+                .attempts
+                .iter()
+                .map(|attempt| attempt.step_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "step:schedule_demo/wide",
+                "step:schedule_demo/narrow",
+                "step:schedule_demo/join",
+                "step:schedule_demo/wide_tail"
+            ]
+        );
+        assert_eq!(parallel_outputs, serial_outputs);
+        assert_eq!(parallel_outputs["narrow"], "narrow\n");
+        assert_eq!(parallel_outputs["wide"], "wide\n");
+        assert_eq!(parallel_outputs["join"], "join\n");
+        assert_eq!(parallel_outputs["wide_tail"], "wide_tail\n");
+
+        let _ = fs::remove_dir_all(serial_path);
+        let _ = fs::remove_dir_all(parallel_path);
     }
 
     #[test]

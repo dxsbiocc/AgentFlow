@@ -1367,7 +1367,12 @@ impl ProjectStore {
         decision: &BranchDecision,
         step: &ProposedStep,
     ) -> Result<Vec<AppliedAction>, StorageError> {
-        let patch = self.propose_branch_patch(flow_id, decision, step)?;
+        let needs = infer_step_needs(self, flow_id, &step.id, &step.inputs, &step.needs)?;
+        let step = ProposedStep {
+            needs,
+            ..step.clone()
+        };
+        let patch = self.propose_branch_patch(flow_id, decision, &step)?;
         self.approve_graph_patch(&patch.id)?;
         let application = self.apply_graph_patch(&patch.id)?;
         Ok(application
@@ -1390,12 +1395,13 @@ impl ProjectStore {
         match self.inspect_flow(flow_id) {
             Ok(_) => self.apply_branch_patch_for_proposal(flow_id, decision, step),
             Err(StorageError::NotFound(_)) => {
+                let needs = infer_step_needs(self, flow_id, &step.id, &step.inputs, &step.needs)?;
                 self.approve_flow(
                     FlowDraft {
                         schema_version: agentflow_schemas::FLOW_SCHEMA_V0.to_string(),
                         id: flow_id.to_string(),
                         name: format!("Auto flow for {}", decision.candidate.hypothesis_id),
-                        steps: vec![flow_step_draft_from_proposed(step)],
+                        steps: vec![flow_step_draft_from_proposed(step, needs)],
                         source_text: auto_flow_source_text(flow_id, decision),
                     },
                     None,
@@ -2057,11 +2063,125 @@ fn auto_flow_id(hypothesis_id: &str) -> String {
     format!("auto_{hypothesis_id}")
 }
 
-fn flow_step_draft_from_proposed(step: &ProposedStep) -> FlowStepDraft {
+fn infer_step_needs(
+    store: &ProjectStore,
+    flow_id: &str,
+    step_id: &str,
+    inputs: &[(String, String)],
+    existing_needs: &[String],
+) -> Result<Vec<String>, StorageError> {
+    let known_steps = known_flow_step_ids(store, flow_id)?;
+    let current_step = normalized_step_local_id(flow_id, step_id).unwrap_or_else(|| step_id.trim());
+    let mut seen = BTreeSet::new();
+    let mut needs = Vec::new();
+
+    for need in existing_needs {
+        let Some(local_id) = normalized_step_local_id(flow_id, need) else {
+            continue;
+        };
+        if local_id == current_step {
+            continue;
+        }
+        if seen.insert(local_id.to_string()) {
+            needs.push(local_id.to_string());
+        }
+    }
+
+    for (_, value) in inputs {
+        if let Some((producer_step, output_name)) = value.split_once('.') {
+            if !output_name.trim().is_empty() {
+                push_inferred_need(
+                    flow_id,
+                    current_step,
+                    &known_steps,
+                    producer_step,
+                    &mut seen,
+                    &mut needs,
+                );
+            }
+            continue;
+        }
+
+        let Some(artifact_id) = artifact_id_from_input_value(value) else {
+            continue;
+        };
+        match store.inspect_artifact(artifact_id) {
+            Ok(inspection) => {
+                let Some(source_step_id) = inspection.summary.source_step_id else {
+                    continue;
+                };
+                push_inferred_need(
+                    flow_id,
+                    current_step,
+                    &known_steps,
+                    &source_step_id,
+                    &mut seen,
+                    &mut needs,
+                );
+            }
+            Err(StorageError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(needs)
+}
+
+fn known_flow_step_ids(
+    store: &ProjectStore,
+    flow_id: &str,
+) -> Result<BTreeSet<String>, StorageError> {
+    match store.inspect_flow(flow_id) {
+        Ok(flow) => Ok(flow
+            .steps
+            .into_iter()
+            .map(|step| step.local_id)
+            .collect::<BTreeSet<_>>()),
+        Err(StorageError::NotFound(_)) => Ok(BTreeSet::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn push_inferred_need(
+    flow_id: &str,
+    current_step: &str,
+    known_steps: &BTreeSet<String>,
+    candidate_step_id: &str,
+    seen: &mut BTreeSet<String>,
+    needs: &mut Vec<String>,
+) {
+    let Some(local_id) = normalized_step_local_id(flow_id, candidate_step_id) else {
+        return;
+    };
+    if local_id == current_step || !known_steps.contains(local_id) {
+        return;
+    }
+    if seen.insert(local_id.to_string()) {
+        needs.push(local_id.to_string());
+    }
+}
+
+fn normalized_step_local_id<'a>(flow_id: &str, step_id: &'a str) -> Option<&'a str> {
+    let step_id = step_id.trim();
+    if step_id.is_empty() {
+        return None;
+    }
+    canonical_step_local_id(flow_id, step_id).or(Some(step_id))
+}
+
+fn artifact_id_from_input_value(value: &str) -> Option<&str> {
+    let artifact_id = value
+        .trim()
+        .strip_prefix("artifact:")
+        .unwrap_or(value.trim());
+    artifact_id.starts_with("artifact_").then_some(artifact_id)
+}
+
+fn flow_step_draft_from_proposed(step: &ProposedStep, needs: Vec<String>) -> FlowStepDraft {
     FlowStepDraft {
         id: step.id.clone(),
         tool_ref: step.tool.clone(),
-        needs: step.needs.clone(),
+        needs,
         reason: None,
         inputs: step.inputs.iter().cloned().collect(),
         params: step.params.iter().cloned().collect(),
@@ -3789,6 +3909,115 @@ runtime:
             .unwrap()
             .summary
             .id
+    }
+
+    fn computed_report_artifact(
+        store: &ProjectStore,
+        root: &std::path::Path,
+        source_step_id: &str,
+    ) -> String {
+        let source_path = root.join("computed_report.md");
+        std::fs::write(&source_path, "# computed\n").unwrap();
+        store
+            .register_computed_artifact(ComputedArtifactRequest {
+                source_path,
+                artifact_type: "Markdown".to_string(),
+                output_name: "report".to_string(),
+                source_step_id: source_step_id.to_string(),
+                source_run_id: "run_source".to_string(),
+            })
+            .unwrap()
+            .summary
+            .id
+    }
+
+    fn register_provenance_tools(store: &ProjectStore, script_path: &std::path::Path) {
+        let command = script_path.display();
+        let source = ToolSpec::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: source_report
+version: 0.1.0
+maturity: exploratory
+description: Produce a local report
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {command}
+"#
+        ))
+        .unwrap();
+        store.register_tool(source).unwrap();
+
+        let consumer = ToolSpec::from_simple_yaml(&format!(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: analysis
+name: consume_report
+version: 0.1.0
+maturity: exploratory
+description: Consume a local report
+inputs:
+  upstream_report:
+    type: Markdown
+    required: true
+outputs:
+  final_report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {command}
+"#
+        ))
+        .unwrap();
+        store.register_tool(consumer).unwrap();
+    }
+
+    fn write_provenance_script(root: &std::path::Path) -> PathBuf {
+        let script_path = root.join("provenance_tool.sh");
+        std::fs::write(
+            &script_path,
+            r#"if [ -n "$AGENTFLOW_OUTPUT_REPORT" ]; then
+  printf '# produced\n' > "$AGENTFLOW_OUTPUT_REPORT"
+fi
+if [ -n "$AGENTFLOW_OUTPUT_FINAL_REPORT" ]; then
+  cat "$AGENTFLOW_INPUT_UPSTREAM_REPORT" > "$AGENTFLOW_OUTPUT_FINAL_REPORT"
+  printf '\n# consumed\n' >> "$AGENTFLOW_OUTPUT_FINAL_REPORT"
+fi
+"#,
+        )
+        .unwrap();
+        script_path
+    }
+
+    fn approve_provenance_flow(store: &ProjectStore, flow_id: &str) {
+        store
+            .approve_flow(
+                FlowDraft::from_simple_yaml(&format!(
+                    r#"
+schema_version: agentflow.flow.v0
+id: {flow_id}
+name: Provenance flow
+steps:
+  - id: producer
+    tool: analysis/source_report
+    reason: Produce upstream report
+    needs: []
+    outputs:
+      report: report
+"#
+                ))
+                .unwrap(),
+                None,
+            )
+            .unwrap();
     }
 
     fn approve_marker_flow(store: &ProjectStore, artifact_id: &str) {
@@ -5906,6 +6135,130 @@ steps:
         );
         assert_eq!(step.needs, vec!["producer_step".to_string()]);
 
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn infer_step_needs_uses_composition_reference() {
+        let (path, store) = init_project("infer-composition-needs");
+        let script = write_provenance_script(&path);
+        register_provenance_tools(&store, &script);
+        approve_provenance_flow(&store, "flow_infer");
+
+        let inputs = vec![("upstream_report".to_string(), "producer.report".to_string())];
+
+        let needs =
+            super::infer_step_needs(&store, "flow_infer", "consumer", &inputs, &[]).unwrap();
+
+        assert_eq!(needs, vec!["producer".to_string()]);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn infer_step_needs_uses_in_flow_computed_artifact_provenance() {
+        let (path, store) = init_project("infer-computed-artifact-needs");
+        let script = write_provenance_script(&path);
+        register_provenance_tools(&store, &script);
+        approve_provenance_flow(&store, "flow_infer");
+        let artifact_id = computed_report_artifact(&store, &path, "step:flow_infer/producer");
+        let inputs = vec![("upstream_report".to_string(), artifact_id)];
+
+        let needs =
+            super::infer_step_needs(&store, "flow_infer", "consumer", &inputs, &[]).unwrap();
+
+        assert_eq!(needs, vec!["producer".to_string()]);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn infer_step_needs_skips_imported_artifact_without_source_step() {
+        let (path, store) = init_project("infer-imported-no-source");
+        let script = write_provenance_script(&path);
+        register_provenance_tools(&store, &script);
+        approve_provenance_flow(&store, "flow_infer");
+        let artifact_id = import_expression_artifact(&store, &path);
+        let inputs = vec![("upstream_report".to_string(), artifact_id)];
+
+        let needs =
+            super::infer_step_needs(&store, "flow_infer", "consumer", &inputs, &[]).unwrap();
+
+        assert!(needs.is_empty());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn infer_step_needs_merges_dedupes_and_excludes_self_reference() {
+        let (path, store) = init_project("infer-dedupe-self");
+        let script = write_provenance_script(&path);
+        register_provenance_tools(&store, &script);
+        approve_provenance_flow(&store, "flow_infer");
+        let artifact_id = computed_report_artifact(&store, &path, "step:flow_infer/producer");
+        let inputs = vec![
+            ("from_step".to_string(), "producer.report".to_string()),
+            ("from_artifact".to_string(), artifact_id),
+            ("self_ref".to_string(), "consumer.report".to_string()),
+        ];
+        let existing_needs = vec![
+            "producer".to_string(),
+            "manual".to_string(),
+            "consumer".to_string(),
+        ];
+
+        let needs =
+            super::infer_step_needs(&store, "flow_infer", "consumer", &inputs, &existing_needs)
+                .unwrap();
+
+        assert_eq!(needs, vec!["producer".to_string(), "manual".to_string()]);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn applied_step_infers_needs_from_computed_artifact_and_runs_after_producer() {
+        let (path, store) = init_project("apply-inferred-needs-run");
+        let script = write_provenance_script(&path);
+        register_provenance_tools(&store, &script);
+        approve_provenance_flow(&store, "flow_apply");
+        let artifact_id = computed_report_artifact(&store, &path, "step:flow_apply/producer");
+        let step = ProposedStep {
+            id: "consumer".to_string(),
+            tool: "analysis/consume_report".to_string(),
+            needs: Vec::new(),
+            inputs: vec![("upstream_report".to_string(), artifact_id)],
+            params: Vec::new(),
+            outputs: vec![("final_report".to_string(), "final_report".to_string())],
+        };
+
+        let applied = store
+            .apply_branch_patch_for_proposal("flow_apply", &sample_decision(), &step)
+            .unwrap();
+
+        assert!(matches!(
+            applied.as_slice(),
+            [AppliedAction::GraphPatchApplied {
+                flow_id,
+                step_id,
+                ..
+            }] if flow_id == "flow_apply" && step_id == "consumer"
+        ));
+        let flow = store.inspect_flow("flow_apply").unwrap();
+        assert!(flow.edges.iter().any(|edge| {
+            edge.edge_type == "needs"
+                && edge.from_local_id == "producer"
+                && edge.to_local_id == "consumer"
+        }));
+
+        let summary = store.run_flow("flow_apply").unwrap();
+
+        assert_eq!(summary.completed_steps, 2);
+        assert_eq!(summary.failed_steps, 0);
+        assert_eq!(
+            summary
+                .attempts
+                .iter()
+                .map(|attempt| attempt.step_id.as_str())
+                .collect::<Vec<_>>(),
+            ["step:flow_apply/producer", "step:flow_apply/consumer"]
+        );
         let _ = std::fs::remove_dir_all(path);
     }
 

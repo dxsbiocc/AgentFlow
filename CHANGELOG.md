@@ -7,6 +7,25 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+### Added — Isolated execution engine (v0.2.0 P1, first cut)
+
+Moves tool execution toward the Nextflow-style model: each tool runs in its own
+isolated environment, and tools compose only through their declared I/O. See
+[docs/design/isolated-execution-engine-design.md](docs/design/isolated-execution-engine-design.md).
+
+- **P1.1 — `ToolExecutionBackend` trait:** the per-backend command construction
+  is now behind a trait (`runtime/backend.rs`) with a `backend_for` factory —
+  the seam future isolated/container backends plug into. Behavior-identical.
+- **P1.2 — `isolated-micromamba` backend:** each tool gets a content-addressed
+  managed env at `.agentflow/envs/<tool>@<lockhash>` (lockhash = env_file +
+  platform), auto-created, locked, and reused; the env lock folds into the run
+  cache key (older backends' cache keys stay byte-identical).
+- **P1.3 — per-step I/O staging:** declared inputs are staged into the step
+  workdir (`workdir/inputs/<port>/`, symlink with copy fallback) and tools see
+  only those staged paths — composition flows strictly through declared I/O.
+  Logical isolation on local/conda; hard filesystem isolation comes with the
+  container backend.
+
 ## [0.1.0] - 2026-06-16
 
 First tagged technical-preview release.

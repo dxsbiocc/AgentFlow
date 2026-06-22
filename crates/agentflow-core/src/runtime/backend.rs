@@ -19,6 +19,7 @@ pub(super) struct ExecContext<'a> {
     pub workdir: &'a Path,
     pub staged_inputs: &'a BTreeMap<String, PathBuf>,
     pub output_dir: &'a Path,
+    pub env_names: &'a [String],
 }
 
 /// Builds the concrete executable + argv for a tool run, per backend.
@@ -130,6 +131,47 @@ impl ToolExecutionBackend for IsolatedMicromambaBackend {
     }
 }
 
+/// Runs the declared command inside a container with hard local containment.
+struct ContainerBackend;
+
+impl ToolExecutionBackend for ContainerBackend {
+    fn prepare_command(
+        &self,
+        runtime: &ToolRuntimeSpec,
+        ctx: &ExecContext,
+    ) -> Result<PreparedRuntimeCommand, StorageError> {
+        let runner = runtime.runner.as_ref().ok_or_else(|| {
+            StorageError::InvalidInput(
+                "container runtime must declare absolute runner path".to_string(),
+            )
+        })?;
+        let image = runtime.image.as_ref().ok_or_else(|| {
+            StorageError::InvalidInput("container runtime must declare image".to_string())
+        })?;
+        let workdir = ctx.workdir.display().to_string();
+        let mut args = vec![
+            "run".to_string(),
+            "--rm".to_string(),
+            "--network".to_string(),
+            "none".to_string(),
+            "-v".to_string(),
+            format!("{workdir}:{workdir}"),
+            "-w".to_string(),
+            workdir,
+        ];
+        for name in ctx.env_names {
+            args.push("-e".to_string());
+            args.push(name.clone());
+        }
+        args.push(image.clone());
+        args.extend(runtime.command.iter().cloned());
+        Ok(PreparedRuntimeCommand {
+            executable: runner.clone(),
+            args,
+        })
+    }
+}
+
 /// Routes a backend identifier to its implementation. Unknown backends return
 /// `None`; the caller maps that to the existing "unsupported runtime.backend"
 /// error so behavior is unchanged.
@@ -145,6 +187,7 @@ pub(super) fn backend_for(backend: &str) -> Option<Box<dyn ToolExecutionBackend>
             prefix_flag: "--prefix",
         })),
         "isolated-micromamba" => Some(Box::new(IsolatedMicromambaBackend)),
+        "container" => Some(Box::new(ContainerBackend)),
         _ => None,
     }
 }

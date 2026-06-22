@@ -66,6 +66,7 @@ pub struct ToolRuntimeSpec {
     pub env_prefix: Option<String>,
     pub env_file: Option<String>,
     pub runner: Option<String>,
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +216,7 @@ impl ToolSpec {
             runtime_env_prefix: self.runtime.env_prefix.clone(),
             runtime_env_file: self.runtime.env_file.clone(),
             runtime_runner: self.runtime.runner.clone(),
+            runtime_container_image: self.runtime.image.clone(),
             source_format: SIMPLE_YAML_SOURCE_FORMAT.to_string(),
             source_text: self.source_text.clone(),
         })
@@ -275,6 +277,8 @@ struct StoredToolSpecJson {
     runtime_env_file: Option<String>,
     #[serde(default)]
     runtime_runner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_container_image: Option<String>,
     #[serde(default)]
     source_format: String,
     #[serde(default)]
@@ -548,6 +552,11 @@ struct RawToolRuntimeSpec {
         deserialize_with = "yaml::deserialize_optional_present_scalar_string"
     )]
     runner: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "yaml::deserialize_optional_present_scalar_string"
+    )]
+    image: Option<String>,
 }
 
 impl RawToolRuntimeSpec {
@@ -590,6 +599,13 @@ impl RawToolRuntimeSpec {
                 .map(|value| {
                     parse_runtime_string("runtime.runner", &value)
                         .map_err(|error| yaml::with_field_location(source_text, "runner", error))
+                })
+                .transpose()?,
+            image: self
+                .image
+                .map(|value| {
+                    parse_runtime_string("runtime.image", &value)
+                        .map_err(|error| yaml::with_field_location(source_text, "image", error))
                 })
                 .transpose()?,
         })
@@ -1568,15 +1584,21 @@ fn validate_runtime_backend(runtime: &ToolRuntimeSpec) -> Result<(), StorageErro
                 || runtime.env_prefix.is_some()
                 || runtime.env_file.is_some()
                 || runtime.runner.is_some()
+                || runtime.image.is_some()
             {
                 return Err(StorageError::InvalidInput(
-                    "local runtime must not declare env_name, env_prefix, env_file, or runner"
+                    "local runtime must not declare env_name, env_prefix, env_file, runner, or image"
                         .to_string(),
                 ));
             }
             Ok(())
         }
         "conda" | "micromamba" => {
+            if runtime.image.is_some() {
+                return Err(StorageError::InvalidInput(
+                    "environment runtime must not declare image".to_string(),
+                ));
+            }
             match (runtime.env_name.as_deref(), runtime.env_prefix.as_deref()) {
                 (Some(_), Some(_)) => {
                     return Err(StorageError::InvalidInput(
@@ -1611,6 +1633,11 @@ fn validate_runtime_backend(runtime: &ToolRuntimeSpec) -> Result<(), StorageErro
             Ok(())
         }
         "isolated-micromamba" => {
+            if runtime.image.is_some() {
+                return Err(StorageError::InvalidInput(
+                    "isolated runtime must not declare image".to_string(),
+                ));
+            }
             if runtime.env_name.is_some() || runtime.env_prefix.is_some() {
                 return Err(StorageError::InvalidInput(
                     "isolated runtime must not declare env_name or env_prefix".to_string(),
@@ -1635,8 +1662,32 @@ fn validate_runtime_backend(runtime: &ToolRuntimeSpec) -> Result<(), StorageErro
             }
             Ok(())
         }
+        "container" => {
+            if runtime.env_name.is_some() || runtime.env_prefix.is_some() || runtime.env_file.is_some()
+            {
+                return Err(StorageError::InvalidInput(
+                    "container runtime must not declare env_name, env_prefix, or env_file"
+                        .to_string(),
+                ));
+            }
+            let runner = runtime.runner.as_deref().ok_or_else(|| {
+                StorageError::InvalidInput(
+                    "container runtime must declare absolute runner path".to_string(),
+                )
+            })?;
+            validate_runtime_path("runtime.runner", runner)?;
+            if !Path::new(runner).is_absolute() {
+                return Err(StorageError::InvalidInput(
+                    "runtime.runner must be an absolute executable path".to_string(),
+                ));
+            }
+            runtime.image.as_deref().ok_or_else(|| {
+                StorageError::InvalidInput("container runtime must declare image".to_string())
+            })?;
+            Ok(())
+        }
         other => Err(StorageError::InvalidInput(format!(
-            "unsupported runtime.backend {other}; supported backends are local, conda, micromamba, isolated-micromamba"
+            "unsupported runtime.backend {other}; supported backends are local, conda, micromamba, isolated-micromamba, container"
         ))),
     }
 }
@@ -1672,6 +1723,7 @@ fn executable_from_stored_json(
         env_prefix: stored.runtime_env_prefix,
         env_file: stored.runtime_env_file,
         runner: stored.runtime_runner,
+        image: stored.runtime_container_image,
     };
 
     let inputs = stored
@@ -2269,6 +2321,98 @@ outputs:
 runtime:
   backend: micromamba
   env_name: af-test
+  command:
+    - python
+"#,
+        )
+        .unwrap_err();
+        assert!(missing_runner.to_string().contains("runner"));
+    }
+
+    #[test]
+    fn parses_container_runtime_image_metadata_and_roundtrips() {
+        let spec = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: container_tool
+version: 0.1.0
+maturity: wrapped
+description: Tool with a container runtime wrapper
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: container
+  runner: /usr/bin/docker
+  image: ghcr.io/acme/tool@sha256:0123456789abcdef
+  command:
+    - python
+    - tools/run.py
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(spec.runtime.backend, "container");
+        assert_eq!(spec.runtime.runner.as_deref(), Some("/usr/bin/docker"));
+        assert_eq!(
+            spec.runtime.image.as_deref(),
+            Some("ghcr.io/acme/tool@sha256:0123456789abcdef")
+        );
+        assert_eq!(spec.runtime.command, ["python", "tools/run.py"]);
+        assert!(spec.stored_json().contains("\"runtime_container_image\""));
+
+        let path = temp_project_path("container-runtime-roundtrip");
+        let store = ProjectStore::init(&path, Some("Tools")).unwrap();
+        store.register_tool(spec).unwrap();
+        let executable = store.executable_tool("local/container_tool").unwrap();
+        assert_eq!(executable.runtime.backend, "container");
+        assert_eq!(
+            executable.runtime.runner.as_deref(),
+            Some("/usr/bin/docker")
+        );
+        assert_eq!(
+            executable.runtime.image.as_deref(),
+            Some("ghcr.io/acme/tool@sha256:0123456789abcdef")
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn rejects_container_runtime_without_image_or_runner() {
+        let missing_image = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: bad_container
+version: 0.1.0
+maturity: wrapped
+description: bad
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: container
+  runner: /usr/bin/docker
+  command:
+    - python
+"#,
+        )
+        .unwrap_err();
+        assert!(missing_image.to_string().contains("image"));
+
+        let missing_runner = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: bad_container
+version: 0.1.0
+maturity: wrapped
+description: bad
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: container
+  image: ghcr.io/acme/tool@sha256:0123456789abcdef
   command:
     - python
 "#,

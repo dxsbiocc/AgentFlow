@@ -84,7 +84,8 @@ cargo run -q -p agentflow-cli -- report marker_demo --path "$AF_DEMO"
 - Local runtime timeout control through `runtime.timeout_seconds`
 - Existing Conda/micromamba environment execution through explicit `runtime.runner` plus `env_name` or `env_prefix`
 - Per-tool isolated environments via the `isolated-micromamba` backend: a content-addressed managed env at `.agentflow/envs/<tool>@<lockhash>` is auto-created and locked from the tool's `env_file` (Nextflow-style process==env), with the env lock folded into the run cache key
-- Per-step I/O staging: declared inputs are staged into the step workdir (`workdir/inputs/<port>/`) so tools compose only through declared inputs/outputs (logical isolation on local/conda; hard filesystem isolation arrives with the container backend)
+- Container execution via `runtime.backend: container`: AgentFlow constructs `<runner> run --rm --network none -v <workdir>:<workdir> -w <workdir> ... <image> <command>` so tools run without network and see only the step workdir mount
+- Per-step I/O staging: declared inputs are staged into the step workdir (`workdir/inputs/<port>/`) so tools compose only through declared inputs/outputs (logical isolation on local/conda; hard filesystem isolation on container through the workdir-only mount)
 - Environment readiness checks through `env check <tool-ref>`
 - Explicit Conda/micromamba environment update through `env prepare <tool-ref>` when `runtime.env_file` is declared
 - Conda/micromamba environment export evidence through `env export <tool-ref>`, including export hash and conservative package-set diff against declared `runtime.env_file` dependencies
@@ -143,14 +144,14 @@ agentflow trace revert <checkpoint-id> --path "$AF_DEMO"  # roll back auto-appli
 - Curated capability index: tool matching uses description/port-type/maturity heuristics rather than a curated capability index (note: a **tool evolution engine** now detects generalization candidates, validates them cross-cohort, and auto-registers a generalized `exploratory` candidate for human adoption — see [docs/CAPABILITIES.md](docs/CAPABILITIES.md) §4)
 - Implicit environment creation, solving, or package installation during `run`
 - Full lockfile normalization, dependency solving, package-manager-specific diff semantics, or environment garbage collection
-- Container / remote execution backends such as Docker, Singularity, or SLURM (a per-tool *isolated* conda/micromamba backend exists — see the supported list; container/remote backends and hard filesystem/egress isolation are the next slice, see [docs/design/isolated-execution-engine-design.md](docs/design/isolated-execution-engine-design.md))
+- Remote/batch execution backends such as Singularity or SLURM; the container backend is currently Docker/podman-style argv construction with default `--network none`, not a scheduler integration
 - Parallel scheduler execution or cancellation controls
 - Rich semantic validators such as file signatures, domain-specific QC policies, and pluggable validator registries
 - Full graph-branch lifecycle such as delete, merge, rollback, or decision-node management (tool-level `supersede` lineage **is** supported — see `agentflow tools supersede`)
 - Cache eviction policy beyond explicit `--all` and `--older-than-seconds` pruning
 - JSON/HTML report export or persisted report artifacts
 - Full-text retrieval, citation graphs, Unpaywall resolution, or non-PubMed literature sources (forage currently covers PubMed metadata/abstracts via an external script)
-- Anti-tamper sandboxing, container isolation, redaction policy, or resource quotas. A **cooperative** in-process egress guard (blocks private/loopback/metadata/CGNAT for synthesized Python tools) and a DNS-pinned allowlist on the source-discovery probe path **are** in place; true anti-tamper containment is deployment-level (container/netns/nftables) and documented in [docs/ops/egress-containment.md](docs/ops/egress-containment.md). See [SECURITY.md](SECURITY.md) for the threat model.
+- Redaction policy or resource quotas. Container-backed tools now get hard network containment via `--network none` plus a workdir-only mount; non-container backends still rely on cooperative guards and deployment controls. See [SECURITY.md](SECURITY.md) for the threat model.
 
 ## Verification Commands
 
@@ -194,7 +195,7 @@ The current happy-path operator workflow is:
 
 ## Remaining Launch Risks
 
-- Local execution is intentionally narrow and still lacks sandbox/container hardening.
+- Non-container local execution is intentionally narrow and still lacks hard sandboxing.
 - Cache hashing remains lightweight; pruning is explicit but does not yet include policies or artifact garbage collection.
 - Validation and observer coverage are deliberately narrow, especially outside the `marker_report` demo path.
 - The runtime is strong enough for a technical preview, but still materially short of the broader AgentFlow product vision.

@@ -7,11 +7,17 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
-### Added — Isolated execution engine (v0.2.0 P1, first cut)
+## [0.2.0] - 2026-06-22
 
-Moves tool execution toward the Nextflow-style model: each tool runs in its own
-isolated environment, and tools compose only through their declared I/O. See
-[docs/design/isolated-execution-engine-design.md](docs/design/isolated-execution-engine-design.md).
+First cut of the execution engine: per-tool isolation, agent-driven composition
+and scheduling, and an OS-level container backend — moving AgentFlow toward the
+Nextflow-style model (each tool isolated; tools compose only through declared
+I/O) with the agent building and ordering the graph itself.
+
+### Added — Isolated execution engine (P1)
+
+Each tool runs in its own isolated environment, composing only through declared
+I/O. See [docs/design/isolated-execution-engine-design.md](docs/design/isolated-execution-engine-design.md).
 
 - **P1.1 — `ToolExecutionBackend` trait:** the per-backend command construction
   is now behind a trait (`runtime/backend.rs`) with a `backend_for` factory —
@@ -25,6 +31,32 @@ isolated environment, and tools compose only through their declared I/O. See
   only those staged paths — composition flows strictly through declared I/O.
   Logical isolation on local/conda; hard filesystem isolation comes with the
   container backend.
+- **Composition proven live:** an end-to-end producer→consumer pipeline on a real
+  365-sample TCGA-LIHC slice (`examples/tools/expression_select` →
+  `local/survival_assoc`), with the producer's output staged into the consumer's
+  workdir and full computed-artifact lineage. Locked by a regression test.
+
+### Added — Agent scheduling & autonomous wiring (P2)
+
+The agent now builds and orders its own composable graphs, not just human-authored
+ones. See [docs/design/agent-scheduling-design.md](docs/design/agent-scheduling-design.md).
+
+- **Ready-step scheduler:** a deterministic `StepScheduler` seam orders ready steps
+  by how much downstream work they unblock (not authoring order). Scheduling only
+  reorders execution — it never changes results (regression-tested).
+- **Provenance needs-wiring:** when a step is applied, its `needs` edges are inferred
+  from input provenance — an artifact's `source_step_id`, or a `producer.output`
+  reference. It only adds edges grounded in real provenance, never invents one.
+
+### Added — Container execution backend (closes #36)
+
+- **`runtime.backend: container`:** runs a tool as `<runner> run --rm --network none
+  -v <workdir>:<workdir> -w <workdir> -e AGENTFLOW_*… <image> <command>` — only the
+  step workdir is mounted (no artifact-store/host visibility) and no network by
+  default. Upgrades P1.3's logical isolation to OS-enforced hard isolation and
+  closes the OS-level egress containment issue. Container tools must bake their
+  code into the image; covered by offline argv tests (real-Docker validation is a
+  later slice — see `docs/CAPABILITIES.md` §6.6).
 
 ## [0.1.0] - 2026-06-16
 

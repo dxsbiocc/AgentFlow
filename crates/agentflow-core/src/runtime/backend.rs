@@ -42,6 +42,7 @@ impl ToolExecutionBackend for LocalBackend {
 /// historical difference between the `conda` and `micromamba` runners.
 struct CondaBackend {
     conda_no_capture: bool,
+    prefix_flag: &'static str,
 }
 
 impl ToolExecutionBackend for CondaBackend {
@@ -64,7 +65,7 @@ impl ToolExecutionBackend for CondaBackend {
                 args.push(env_name.to_string());
             }
             (None, Some(env_prefix)) => {
-                args.push("--prefix".to_string());
+                args.push(self.prefix_flag.to_string());
                 args.push(env_prefix.to_string());
             }
             (Some(_), Some(_)) => {
@@ -87,6 +88,34 @@ impl ToolExecutionBackend for CondaBackend {
     }
 }
 
+/// Runs a declared command inside an AgentFlow-managed micromamba prefix. The
+/// caller injects the derived managed prefix into `runtime.env_prefix`.
+struct IsolatedMicromambaBackend;
+
+impl ToolExecutionBackend for IsolatedMicromambaBackend {
+    fn prepare_command(
+        &self,
+        runtime: &ToolRuntimeSpec,
+    ) -> Result<PreparedRuntimeCommand, StorageError> {
+        if runtime.env_name.is_some() {
+            return Err(StorageError::InvalidInput(
+                "isolated runtime must use a managed env_prefix, not env_name".to_string(),
+            ));
+        }
+        if runtime.env_prefix.is_none() {
+            return Err(StorageError::InvalidInput(
+                "isolated runtime must declare managed env_prefix before command preparation"
+                    .to_string(),
+            ));
+        }
+        CondaBackend {
+            conda_no_capture: false,
+            prefix_flag: "-p",
+        }
+        .prepare_command(runtime)
+    }
+}
+
 /// Routes a backend identifier to its implementation. Unknown backends return
 /// `None`; the caller maps that to the existing "unsupported runtime.backend"
 /// error so behavior is unchanged.
@@ -95,10 +124,13 @@ pub(super) fn backend_for(backend: &str) -> Option<Box<dyn ToolExecutionBackend>
         "local" => Some(Box::new(LocalBackend)),
         "conda" => Some(Box::new(CondaBackend {
             conda_no_capture: true,
+            prefix_flag: "--prefix",
         })),
         "micromamba" => Some(Box::new(CondaBackend {
             conda_no_capture: false,
+            prefix_flag: "--prefix",
         })),
+        "isolated-micromamba" => Some(Box::new(IsolatedMicromambaBackend)),
         _ => None,
     }
 }

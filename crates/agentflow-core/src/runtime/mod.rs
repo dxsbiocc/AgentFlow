@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -20,6 +20,9 @@ use crate::storage::{
 };
 
 mod backend;
+
+const ISOLATED_ENV_BACKEND: &str = "isolated-micromamba";
+const ISOLATED_ENV_LOCK_FILE: &str = "agentflow-env.lock";
 
 pub const PYTHON_EGRESS_GUARD_SITECUSTOMIZE: &str = r#"import ipaddress
 import socket
@@ -169,6 +172,60 @@ pub struct EnvironmentExportSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolatedEnvState {
+    pub prefix: PathBuf,
+    pub lock_hash: String,
+}
+
+pub trait IsolatedEnvProvisioner {
+    fn ensure(&self, env_file: &Path, prefix: &Path, runner: &str) -> Result<(), StorageError>;
+}
+
+pub struct MicromambaProvisioner;
+
+impl IsolatedEnvProvisioner for MicromambaProvisioner {
+    fn ensure(&self, env_file: &Path, prefix: &Path, runner: &str) -> Result<(), StorageError> {
+        let parent = prefix.parent().ok_or_else(|| {
+            StorageError::InvalidInput(format!(
+                "isolated environment prefix has no parent: {}",
+                prefix.display()
+            ))
+        })?;
+        fs::create_dir_all(parent)?;
+
+        let mut create = Command::new(runner);
+        create
+            .args(["create", "-y", "-p"])
+            .arg(prefix)
+            .arg("-f")
+            .arg(env_file)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin");
+        let create_output = run_local_command(create, None).map_err(StorageError::Io)?;
+        if !create_output.status.success() {
+            return Err(provisioner_command_error("create", &create_output));
+        }
+
+        fs::create_dir_all(prefix)?;
+        let mut export = Command::new(runner);
+        export
+            .args(["env", "export", "-p"])
+            .arg(prefix)
+            .arg("--explicit")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin");
+        let export_output = run_local_command(export, None).map_err(StorageError::Io)?;
+        if !export_output.status.success() {
+            return Err(provisioner_command_error("export", &export_output));
+        }
+
+        let mut lock = fs::File::create(prefix.join(ISOLATED_ENV_LOCK_FILE))?;
+        lock.write_all(&export_output.stdout)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunLogs {
     pub attempt_id: String,
     pub stdout_path: PathBuf,
@@ -259,6 +316,15 @@ impl ProjectStore {
                 check_env_file(&tool.runtime, &mut items);
                 check_environment_probe(&tool.runtime, &mut items);
             }
+            "isolated-micromamba" => {
+                check_runner(&tool.runtime, &mut items);
+                check_isolated_environment(
+                    self.root_path(),
+                    &tool.tool_ref,
+                    &tool.runtime,
+                    &mut items,
+                );
+            }
             other => items.push(EnvironmentCheckItem::failed(
                 "backend",
                 format!("unsupported runtime backend {other}"),
@@ -345,6 +411,68 @@ impl ProjectStore {
                             items.push(EnvironmentCheckItem::failed(
                                 "prepare",
                                 "environment prepare command could not start",
+                                Some(error.to_string()),
+                            ));
+                        }
+                    }
+                }
+            }
+            "isolated-micromamba" => {
+                check_runner(&tool.runtime, &mut items);
+                check_isolated_runtime_selector(&tool.runtime, &mut items);
+                check_required_env_file(&tool.runtime, &mut items);
+                if items.iter().all(|item| item.status == "ok") {
+                    match isolated_env_state_for_tool(
+                        self.root_path(),
+                        &tool.tool_ref,
+                        &tool.runtime,
+                    ) {
+                        Ok(Some(state)) => {
+                            command =
+                                isolated_environment_create_argv(&tool.runtime, &state.prefix)?;
+                            match ensure_isolated_tool_environment(
+                                self.root_path(),
+                                &tool.tool_ref,
+                                &tool.runtime,
+                                &MicromambaProvisioner,
+                            ) {
+                                Ok(Some(ready)) => {
+                                    status = "succeeded".to_string();
+                                    items.push(EnvironmentCheckItem::ok(
+                                        "prepare",
+                                        "isolated environment is ready",
+                                        Some(format!(
+                                            "prefix={}; lock_hash={}",
+                                            ready.prefix.display(),
+                                            ready.lock_hash
+                                        )),
+                                    ));
+                                }
+                                Ok(None) => items.push(EnvironmentCheckItem::failed(
+                                    "prepare",
+                                    "isolated environment prepare returned no managed prefix",
+                                    None,
+                                )),
+                                Err(error) => {
+                                    stderr = error.to_string();
+                                    items.push(EnvironmentCheckItem::failed(
+                                        "prepare",
+                                        "isolated environment prepare failed",
+                                        Some(error.to_string()),
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(None) => items.push(EnvironmentCheckItem::failed(
+                            "prepare",
+                            "isolated environment state unavailable",
+                            None,
+                        )),
+                        Err(error) => {
+                            stderr = error.to_string();
+                            items.push(EnvironmentCheckItem::failed(
+                                "prepare",
+                                "isolated environment metadata failed",
                                 Some(error.to_string()),
                             ));
                         }
@@ -906,7 +1034,14 @@ impl ProjectStore {
         let resolved_input_paths = input_paths(&resolved_inputs);
         let params_json = string_map_json(&params_map);
         let input_hashes_json = input_hashes_json(&resolved_inputs);
-        let runtime_config = runtime_config_json(&tool.runtime)?;
+        let isolated_env = ensure_isolated_tool_environment(
+            self.root_path(),
+            &tool.tool_ref,
+            &tool.runtime,
+            &MicromambaProvisioner,
+        )?;
+        let runtime_config =
+            runtime_config_json_for_tool(self.root_path(), &tool.tool_ref, &tool.runtime)?;
         let runtime_hash = stable_hash(&runtime_config);
         let params_hash = stable_hash(&params_json);
         let cache_key = compute_cache_key(
@@ -926,7 +1061,8 @@ impl ProjectStore {
         let resolved_outputs = output_paths(&workdir, &outputs);
         fs::create_dir_all(resolved_outputs.root())?;
 
-        let mut prepared_command = prepare_runtime_command(&tool.runtime)?;
+        let mut prepared_command =
+            prepare_runtime_command_for_tool(&tool.runtime, isolated_env.as_ref())?;
         let synth_pythonpath = if tool.namespace == SYNTH_TOOL_NAMESPACE {
             let guard_dir = install_runtime_python_egress_guard(&workdir)?;
             // Cooperative defense-in-depth for generated synth tools. This is
@@ -1212,7 +1348,11 @@ impl ProjectStore {
         let resolved_inputs = self.resolve_inputs(flow_id, &inputs)?;
         let input_hashes_json = input_hashes_json(&resolved_inputs);
         let params_hash = stable_hash(&string_map_json(&params_map));
-        let runtime_hash = stable_hash(&runtime_config_json(&tool.runtime)?);
+        let runtime_hash = stable_hash(&runtime_config_json_for_tool(
+            self.root_path(),
+            tool_ref,
+            &tool.runtime,
+        )?);
         Ok(compute_cache_key(
             tool_ref,
             &tool.version,
@@ -1711,6 +1851,15 @@ struct LocalCommandOutput {
     timeout_seconds: Option<u64>,
 }
 
+fn provisioner_command_error(action: &str, output: &LocalCommandOutput) -> StorageError {
+    StorageError::InvalidInput(format!(
+        "isolated environment {action} command exited with code {:?}: stdout={} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedRuntimeCommand {
     executable: String,
@@ -1770,6 +1919,13 @@ fn compute_cache_key(
 }
 
 fn runtime_config_json(runtime: &ToolRuntimeSpec) -> Result<String, StorageError> {
+    runtime_config_json_with_isolated_lock(runtime, None)
+}
+
+fn runtime_config_json_with_isolated_lock(
+    runtime: &ToolRuntimeSpec,
+    isolated_env_lock: Option<String>,
+) -> Result<String, StorageError> {
     let env_file_hash = runtime
         .env_file
         .as_deref()
@@ -1784,6 +1940,7 @@ fn runtime_config_json(runtime: &ToolRuntimeSpec) -> Result<String, StorageError
         env_file: runtime.env_file.clone(),
         env_file_hash,
         runner: runtime.runner.clone(),
+        isolated_env_lock,
     })
     .map_err(|err| StorageError::InvalidInput(format!("runtime config JSON failed: {err}")))
 }
@@ -1798,6 +1955,8 @@ struct RuntimeConfigJson {
     env_file: Option<String>,
     env_file_hash: Option<String>,
     runner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    isolated_env_lock: Option<String>,
 }
 
 fn stable_hash(input: &str) -> String {
@@ -1806,6 +1965,51 @@ fn stable_hash(input: &str) -> String {
 
 fn file_hash_fnv64(path: &Path) -> Result<String, StorageError> {
     Ok(stable_hash_bytes(&fs::read(path)?))
+}
+
+fn isolated_env_lock_hash(env_file: &Path) -> Result<String, StorageError> {
+    isolated_env_lock_hash_for_platform(env_file, &platform_tag())
+}
+
+fn isolated_env_lock_hash_for_platform(
+    env_file: &Path,
+    platform_tag: &str,
+) -> Result<String, StorageError> {
+    let mut bytes = fs::read(env_file)?;
+    bytes.extend_from_slice(platform_tag.as_bytes());
+    Ok(stable_hash_bytes(&bytes))
+}
+
+fn platform_tag() -> String {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "osx-arm64".to_string(),
+        ("macos", "x86_64") => "osx-64".to_string(),
+        ("linux", "x86_64") => "linux-64".to_string(),
+        ("linux", "aarch64") => "linux-aarch64".to_string(),
+        ("windows", "x86_64") => "win-64".to_string(),
+        (os, arch) => format!("{os}-{arch}"),
+    }
+}
+
+fn isolated_env_prefix(project_root: &Path, tool_ref: &str, lock_hash: &str) -> PathBuf {
+    project_dir(project_root).join("envs").join(format!(
+        "{}@{}",
+        path_safe_tool_id(tool_ref),
+        lock_hash
+    ))
+}
+
+fn path_safe_tool_id(tool_ref: &str) -> String {
+    tool_ref
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn stable_hash_bytes(bytes: &[u8]) -> String {
@@ -1839,6 +2043,99 @@ fn materialize_workdir(
     Ok(())
 }
 
+fn isolated_env_state_for_tool(
+    project_root: &Path,
+    tool_ref: &str,
+    runtime: &ToolRuntimeSpec,
+) -> Result<Option<IsolatedEnvState>, StorageError> {
+    if runtime.backend != ISOLATED_ENV_BACKEND {
+        return Ok(None);
+    }
+    let env_file = runtime.env_file.as_deref().ok_or_else(|| {
+        StorageError::InvalidInput("isolated runtime must declare runtime.env_file".to_string())
+    })?;
+    let lock_hash = isolated_env_lock_hash(Path::new(env_file))?;
+    Ok(Some(IsolatedEnvState {
+        prefix: isolated_env_prefix(project_root, tool_ref, &lock_hash),
+        lock_hash,
+    }))
+}
+
+fn ensure_isolated_tool_environment(
+    project_root: &Path,
+    tool_ref: &str,
+    runtime: &ToolRuntimeSpec,
+    provisioner: &dyn IsolatedEnvProvisioner,
+) -> Result<Option<IsolatedEnvState>, StorageError> {
+    if runtime.backend != ISOLATED_ENV_BACKEND {
+        return Ok(None);
+    }
+    ensure_isolated_tool_environment_for_platform(
+        project_root,
+        tool_ref,
+        runtime,
+        &platform_tag(),
+        provisioner,
+    )
+    .map(Some)
+}
+
+fn ensure_isolated_tool_environment_for_platform(
+    project_root: &Path,
+    tool_ref: &str,
+    runtime: &ToolRuntimeSpec,
+    platform_tag: &str,
+    provisioner: &dyn IsolatedEnvProvisioner,
+) -> Result<IsolatedEnvState, StorageError> {
+    if runtime.backend != ISOLATED_ENV_BACKEND {
+        return Err(StorageError::InvalidInput(format!(
+            "isolated environment requested for unsupported backend {}",
+            runtime.backend
+        )));
+    }
+    if runtime.env_name.is_some() || runtime.env_prefix.is_some() {
+        return Err(StorageError::InvalidInput(
+            "isolated runtime must not declare env_name or env_prefix".to_string(),
+        ));
+    }
+    let env_file = runtime.env_file.as_deref().ok_or_else(|| {
+        StorageError::InvalidInput("isolated runtime must declare runtime.env_file".to_string())
+    })?;
+    let runner = runtime.runner.as_deref().ok_or_else(|| {
+        StorageError::InvalidInput(
+            "environment runtime must declare absolute runner path".to_string(),
+        )
+    })?;
+    let env_file = Path::new(env_file);
+    let lock_hash = isolated_env_lock_hash_for_platform(env_file, platform_tag)?;
+    let prefix = isolated_env_prefix(project_root, tool_ref, &lock_hash);
+    let lock_path = prefix.join(ISOLATED_ENV_LOCK_FILE);
+    if prefix.exists() && lock_path.is_file() {
+        return Ok(IsolatedEnvState { prefix, lock_hash });
+    }
+
+    provisioner.ensure(env_file, &prefix, runner)?;
+    if !lock_path.is_file() {
+        return Err(StorageError::InvalidInput(format!(
+            "isolated environment provisioner did not write {}",
+            lock_path.display()
+        )));
+    }
+    Ok(IsolatedEnvState { prefix, lock_hash })
+}
+
+fn runtime_config_json_for_tool(
+    project_root: &Path,
+    tool_ref: &str,
+    runtime: &ToolRuntimeSpec,
+) -> Result<String, StorageError> {
+    if runtime.backend != ISOLATED_ENV_BACKEND {
+        return runtime_config_json(runtime);
+    }
+    let isolated = isolated_env_state_for_tool(project_root, tool_ref, runtime)?;
+    runtime_config_json_with_isolated_lock(runtime, isolated.map(|state| state.lock_hash))
+}
+
 fn prepare_runtime_command(
     runtime: &ToolRuntimeSpec,
 ) -> Result<PreparedRuntimeCommand, StorageError> {
@@ -1849,6 +2146,24 @@ fn prepare_runtime_command(
             runtime.backend
         ))),
     }
+}
+
+fn prepare_runtime_command_for_tool(
+    runtime: &ToolRuntimeSpec,
+    isolated_env: Option<&IsolatedEnvState>,
+) -> Result<PreparedRuntimeCommand, StorageError> {
+    if runtime.backend != ISOLATED_ENV_BACKEND {
+        return prepare_runtime_command(runtime);
+    }
+    let isolated_env = isolated_env.ok_or_else(|| {
+        StorageError::InvalidInput(
+            "isolated runtime command requires a managed environment prefix".to_string(),
+        )
+    })?;
+    let mut managed_runtime = runtime.clone();
+    managed_runtime.env_name = None;
+    managed_runtime.env_prefix = Some(isolated_env.prefix.display().to_string());
+    prepare_runtime_command(&managed_runtime)
 }
 
 fn check_runner(runtime: &ToolRuntimeSpec, items: &mut Vec<EnvironmentCheckItem>) {
@@ -1960,6 +2275,78 @@ fn check_prepare_environment_selector(
     }
 }
 
+fn check_isolated_runtime_selector(
+    runtime: &ToolRuntimeSpec,
+    items: &mut Vec<EnvironmentCheckItem>,
+) {
+    if runtime.env_name.is_some() || runtime.env_prefix.is_some() {
+        items.push(EnvironmentCheckItem::failed(
+            "environment",
+            "isolated runtime must not declare env_name or env_prefix",
+            None,
+        ));
+    } else {
+        items.push(EnvironmentCheckItem::ok(
+            "environment",
+            "using AgentFlow-managed isolated environment prefix",
+            None,
+        ));
+    }
+}
+
+fn check_isolated_environment(
+    project_root: &Path,
+    tool_ref: &str,
+    runtime: &ToolRuntimeSpec,
+    items: &mut Vec<EnvironmentCheckItem>,
+) {
+    check_isolated_runtime_selector(runtime, items);
+    check_required_env_file(runtime, items);
+    if items
+        .iter()
+        .any(|item| matches!(item.name.as_str(), "environment" | "env_file") && item.status != "ok")
+    {
+        return;
+    }
+    match isolated_env_state_for_tool(project_root, tool_ref, runtime) {
+        Ok(Some(state)) => {
+            let lock_path = state.prefix.join(ISOLATED_ENV_LOCK_FILE);
+            let status = if lock_path.is_file() {
+                EnvironmentCheckItem::ok(
+                    "managed_env",
+                    "isolated environment lock exists",
+                    Some(format!(
+                        "prefix={}; lock_hash={}",
+                        state.prefix.display(),
+                        state.lock_hash
+                    )),
+                )
+            } else {
+                EnvironmentCheckItem::skipped(
+                    "managed_env",
+                    "isolated environment has not been prepared",
+                    Some(format!(
+                        "prefix={}; lock_hash={}",
+                        state.prefix.display(),
+                        state.lock_hash
+                    )),
+                )
+            };
+            items.push(status);
+        }
+        Ok(None) => items.push(EnvironmentCheckItem::failed(
+            "managed_env",
+            "isolated environment state unavailable",
+            None,
+        )),
+        Err(error) => items.push(EnvironmentCheckItem::failed(
+            "managed_env",
+            "isolated environment metadata failed",
+            Some(error.to_string()),
+        )),
+    }
+}
+
 fn check_env_file(runtime: &ToolRuntimeSpec, items: &mut Vec<EnvironmentCheckItem>) {
     let Some(env_file) = runtime.env_file.as_deref() else {
         items.push(EnvironmentCheckItem::ok(
@@ -2004,6 +2391,29 @@ fn check_required_env_file(runtime: &ToolRuntimeSpec, items: &mut Vec<Environmen
             Some(error.to_string()),
         )),
     }
+}
+
+fn isolated_environment_create_argv(
+    runtime: &ToolRuntimeSpec,
+    prefix: &Path,
+) -> Result<Vec<String>, StorageError> {
+    let runner = runtime.runner.as_ref().ok_or_else(|| {
+        StorageError::InvalidInput(
+            "environment runtime must declare absolute runner path".to_string(),
+        )
+    })?;
+    let env_file = runtime.env_file.as_ref().ok_or_else(|| {
+        StorageError::InvalidInput("isolated runtime must declare runtime.env_file".to_string())
+    })?;
+    Ok(vec![
+        runner.clone(),
+        "create".to_string(),
+        "-y".to_string(),
+        "-p".to_string(),
+        prefix.display().to_string(),
+        "-f".to_string(),
+        env_file.clone(),
+    ])
 }
 
 fn check_environment_probe(runtime: &ToolRuntimeSpec, items: &mut Vec<EnvironmentCheckItem>) {
@@ -3240,6 +3650,156 @@ steps:
         assert!(backend::backend_for("local").is_some());
         assert!(backend::backend_for("conda").is_some());
         assert!(backend::backend_for("micromamba").is_some());
+    }
+
+    #[test]
+    fn isolated_env_lockhash_is_content_and_platform_addressed() {
+        let path = temp_project_path("isolated-lockhash");
+        fs::create_dir_all(&path).unwrap();
+        let env_file = path.join("environment.yml");
+        fs::write(&env_file, "name: af-test\ndependencies:\n  - python=3.11\n").unwrap();
+
+        let first = isolated_env_lock_hash_for_platform(&env_file, "linux-64").unwrap();
+        let repeat = isolated_env_lock_hash_for_platform(&env_file, "linux-64").unwrap();
+        assert_eq!(first, repeat);
+        assert_eq!(
+            isolated_env_prefix(&path, "marker/scan", &first),
+            path.join(".agentflow")
+                .join("envs")
+                .join(format!("marker_scan@{first}"))
+        );
+
+        fs::write(&env_file, "name: af-test\ndependencies:\n  - python=3.12\n").unwrap();
+        let changed_content = isolated_env_lock_hash_for_platform(&env_file, "linux-64").unwrap();
+        assert_ne!(first, changed_content);
+
+        fs::write(&env_file, "name: af-test\ndependencies:\n  - python=3.11\n").unwrap();
+        let changed_platform = isolated_env_lock_hash_for_platform(&env_file, "osx-arm64").unwrap();
+        assert_ne!(first, changed_platform);
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn isolated_env_reuses_existing_lock_without_provisioning() {
+        struct FakeProvisioner {
+            calls: std::cell::Cell<usize>,
+        }
+
+        impl IsolatedEnvProvisioner for FakeProvisioner {
+            fn ensure(
+                &self,
+                _env_file: &Path,
+                prefix: &Path,
+                _runner: &str,
+            ) -> Result<(), StorageError> {
+                self.calls.set(self.calls.get() + 1);
+                fs::create_dir_all(prefix)?;
+                fs::write(prefix.join(ISOLATED_ENV_LOCK_FILE), "fake explicit lock\n")?;
+                Ok(())
+            }
+        }
+
+        let path = temp_project_path("isolated-reuse");
+        fs::create_dir_all(&path).unwrap();
+        let env_file = path.join("environment.yml");
+        fs::write(&env_file, "name: af-test\ndependencies:\n  - python=3.11\n").unwrap();
+        let runtime = ToolRuntimeSpec {
+            backend: "isolated-micromamba".to_string(),
+            command: vec!["python".to_string(), "tool.py".to_string()],
+            timeout_seconds: None,
+            env_name: None,
+            env_prefix: None,
+            env_file: Some(env_file.display().to_string()),
+            runner: Some("/opt/micromamba".to_string()),
+        };
+        let provisioner = FakeProvisioner {
+            calls: std::cell::Cell::new(0),
+        };
+
+        let first = ensure_isolated_tool_environment_for_platform(
+            &path,
+            "marker/scan",
+            &runtime,
+            "linux-64",
+            &provisioner,
+        )
+        .unwrap();
+        assert_eq!(provisioner.calls.get(), 1);
+        assert!(first.prefix.join(ISOLATED_ENV_LOCK_FILE).exists());
+
+        let second = ensure_isolated_tool_environment_for_platform(
+            &path,
+            "marker/scan",
+            &runtime,
+            "linux-64",
+            &provisioner,
+        )
+        .unwrap();
+        assert_eq!(provisioner.calls.get(), 1);
+        assert_eq!(first, second);
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn isolated_micromamba_prepare_command_uses_managed_prefix() {
+        let prefix = "/tmp/af-managed-prefix";
+        let runtime = ToolRuntimeSpec {
+            backend: "isolated-micromamba".to_string(),
+            command: vec!["python".to_string(), "tool.py".to_string()],
+            timeout_seconds: None,
+            env_name: None,
+            env_prefix: Some(prefix.to_string()),
+            env_file: Some("environment.yml".to_string()),
+            runner: Some("/opt/micromamba".to_string()),
+        };
+
+        assert_eq!(
+            prepare_runtime_command(&runtime).unwrap().argv(),
+            vec!["/opt/micromamba", "run", "-p", prefix, "python", "tool.py"]
+        );
+        assert!(backend::backend_for("isolated-micromamba").is_some());
+    }
+
+    #[test]
+    fn runtime_config_json_adds_lockhash_only_for_isolated_backend() {
+        let path = temp_project_path("isolated-runtime-config");
+        fs::create_dir_all(&path).unwrap();
+        let env_file = path.join("environment.yml");
+        fs::write(&env_file, "name: af-test\ndependencies:\n  - python=3.11\n").unwrap();
+
+        let conda = ToolRuntimeSpec {
+            backend: "conda".to_string(),
+            command: vec!["python".to_string(), "run.py".to_string()],
+            timeout_seconds: None,
+            env_name: Some("af-test".to_string()),
+            env_prefix: None,
+            env_file: None,
+            runner: Some("/opt/conda/bin/conda".to_string()),
+        };
+        assert_eq!(
+            runtime_config_json(&conda).unwrap(),
+            "{\"backend\":\"conda\",\"command\":[\"python\",\"run.py\"],\"timeout_seconds\":null,\"env_name\":\"af-test\",\"env_prefix\":null,\"env_file\":null,\"env_file_hash\":null,\"runner\":\"/opt/conda/bin/conda\"}"
+        );
+
+        let isolated = ToolRuntimeSpec {
+            backend: "isolated-micromamba".to_string(),
+            command: vec!["python".to_string(), "run.py".to_string()],
+            timeout_seconds: None,
+            env_name: None,
+            env_prefix: None,
+            env_file: Some(env_file.display().to_string()),
+            runner: Some("/opt/micromamba".to_string()),
+        };
+        let json =
+            runtime_config_json_with_isolated_lock(&isolated, Some("fnv64:abc123".to_string()))
+                .unwrap();
+        assert!(json.contains("\"isolated_env_lock\":\"fnv64:abc123\""));
+        let payload: RuntimeConfigJson = serde_json::from_str(&json).unwrap();
+        assert_eq!(payload.isolated_env_lock.as_deref(), Some("fnv64:abc123"));
+
+        let _ = fs::remove_dir_all(path);
     }
 
     #[test]

@@ -1610,8 +1610,33 @@ fn validate_runtime_backend(runtime: &ToolRuntimeSpec) -> Result<(), StorageErro
             }
             Ok(())
         }
+        "isolated-micromamba" => {
+            if runtime.env_name.is_some() || runtime.env_prefix.is_some() {
+                return Err(StorageError::InvalidInput(
+                    "isolated runtime must not declare env_name or env_prefix".to_string(),
+                ));
+            }
+            let env_file = runtime.env_file.as_deref().ok_or_else(|| {
+                StorageError::InvalidInput(
+                    "isolated runtime must declare runtime.env_file".to_string(),
+                )
+            })?;
+            validate_runtime_path("runtime.env_file", env_file)?;
+            let runner = runtime.runner.as_deref().ok_or_else(|| {
+                StorageError::InvalidInput(
+                    "environment runtime must declare absolute runner path".to_string(),
+                )
+            })?;
+            validate_runtime_path("runtime.runner", runner)?;
+            if !Path::new(runner).is_absolute() {
+                return Err(StorageError::InvalidInput(
+                    "runtime.runner must be an absolute executable path".to_string(),
+                ));
+            }
+            Ok(())
+        }
         other => Err(StorageError::InvalidInput(format!(
-            "unsupported runtime.backend {other}; supported backends are local, conda, micromamba"
+            "unsupported runtime.backend {other}; supported backends are local, conda, micromamba, isolated-micromamba"
         ))),
     }
 }

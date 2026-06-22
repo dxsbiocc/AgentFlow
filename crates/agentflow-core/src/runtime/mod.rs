@@ -1066,9 +1066,14 @@ impl ProjectStore {
         let stderr_path = workdir.join("stderr.log");
         let resolved_outputs = output_paths(&workdir, &outputs);
         fs::create_dir_all(resolved_outputs.root())?;
+        let exec_ctx = backend::ExecContext {
+            workdir: &workdir,
+            staged_inputs: &resolved_input_paths,
+            output_dir: resolved_outputs.root(),
+        };
 
         let mut prepared_command =
-            prepare_runtime_command_for_tool(&tool.runtime, isolated_env.as_ref())?;
+            prepare_runtime_command_for_tool(&tool.runtime, isolated_env.as_ref(), &exec_ctx)?;
         let synth_pythonpath = if tool.namespace == SYNTH_TOOL_NAMESPACE {
             let guard_dir = install_runtime_python_egress_guard(&workdir)?;
             // Cooperative defense-in-depth for generated synth tools. This is
@@ -2208,9 +2213,10 @@ fn runtime_config_json_for_tool(
 
 fn prepare_runtime_command(
     runtime: &ToolRuntimeSpec,
+    ctx: &backend::ExecContext<'_>,
 ) -> Result<PreparedRuntimeCommand, StorageError> {
     match backend::backend_for(&runtime.backend) {
-        Some(backend) => backend.prepare_command(runtime),
+        Some(backend) => backend.prepare_command(runtime, ctx),
         None => Err(StorageError::InvalidInput(format!(
             "unsupported runtime.backend {}",
             runtime.backend
@@ -2221,9 +2227,10 @@ fn prepare_runtime_command(
 fn prepare_runtime_command_for_tool(
     runtime: &ToolRuntimeSpec,
     isolated_env: Option<&IsolatedEnvState>,
+    ctx: &backend::ExecContext<'_>,
 ) -> Result<PreparedRuntimeCommand, StorageError> {
     if runtime.backend != ISOLATED_ENV_BACKEND {
-        return prepare_runtime_command(runtime);
+        return prepare_runtime_command(runtime, ctx);
     }
     let isolated_env = isolated_env.ok_or_else(|| {
         StorageError::InvalidInput(
@@ -2233,7 +2240,7 @@ fn prepare_runtime_command_for_tool(
     let mut managed_runtime = runtime.clone();
     managed_runtime.env_name = None;
     managed_runtime.env_prefix = Some(isolated_env.prefix.display().to_string());
-    prepare_runtime_command(&managed_runtime)
+    prepare_runtime_command(&managed_runtime, ctx)
 }
 
 fn check_runner(runtime: &ToolRuntimeSpec, items: &mut Vec<EnvironmentCheckItem>) {
@@ -3385,6 +3392,16 @@ mod tests {
         ))
     }
 
+    fn test_exec_context<'a>(
+        staged_inputs: &'a BTreeMap<String, PathBuf>,
+    ) -> backend::ExecContext<'a> {
+        backend::ExecContext {
+            workdir: Path::new("/tmp/agentflow-test-workdir"),
+            staged_inputs,
+            output_dir: Path::new("/tmp/agentflow-test-workdir/outputs"),
+        }
+    }
+
     fn write_script(path: &Path) -> PathBuf {
         let script_path = path.join("marker_tool.sh");
         fs::write(
@@ -3863,10 +3880,50 @@ steps:
             env_file: None,
             runner: None,
         };
+        let staged_inputs = BTreeMap::new();
+        let ctx = test_exec_context(&staged_inputs);
 
         assert_eq!(
-            prepare_runtime_command(&runtime).unwrap().argv(),
+            prepare_runtime_command(&runtime, &ctx).unwrap().argv(),
             vec!["/bin/echo".to_string(), "hello world".to_string()]
+        );
+    }
+
+    #[test]
+    fn local_runtime_command_ignores_exec_context() {
+        let runtime = ToolRuntimeSpec {
+            backend: "local".to_string(),
+            command: vec!["/bin/echo".to_string(), "hello world".to_string()],
+            timeout_seconds: Some(5),
+            env_name: None,
+            env_prefix: None,
+            env_file: None,
+            runner: None,
+        };
+        let first_inputs = BTreeMap::new();
+        let first_ctx = backend::ExecContext {
+            workdir: Path::new("/tmp/af-work-a"),
+            staged_inputs: &first_inputs,
+            output_dir: Path::new("/tmp/af-work-a/outputs"),
+        };
+        let mut second_inputs = BTreeMap::new();
+        second_inputs.insert(
+            "reads".to_string(),
+            PathBuf::from("/tmp/af-work-b/inputs/reads/in.fastq"),
+        );
+        let second_ctx = backend::ExecContext {
+            workdir: Path::new("/tmp/af-work-b"),
+            staged_inputs: &second_inputs,
+            output_dir: Path::new("/tmp/af-work-b/outputs"),
+        };
+
+        assert_eq!(
+            prepare_runtime_command(&runtime, &first_ctx)
+                .unwrap()
+                .argv(),
+            prepare_runtime_command(&runtime, &second_ctx)
+                .unwrap()
+                .argv()
         );
     }
 
@@ -3885,8 +3942,11 @@ steps:
     #[test]
     fn conda_micromamba_backends_preserve_argv_difference() {
         // conda keeps --no-capture-output; micromamba does not. (equivalence proof)
+        let staged_inputs = BTreeMap::new();
+        let ctx = test_exec_context(&staged_inputs);
+
         assert_eq!(
-            prepare_runtime_command(&env_runtime("conda"))
+            prepare_runtime_command(&env_runtime("conda"), &ctx)
                 .unwrap()
                 .argv(),
             vec![
@@ -3900,7 +3960,7 @@ steps:
             ]
         );
         assert_eq!(
-            prepare_runtime_command(&env_runtime("micromamba"))
+            prepare_runtime_command(&env_runtime("micromamba"), &ctx)
                 .unwrap()
                 .argv(),
             vec![
@@ -3916,7 +3976,9 @@ steps:
 
     #[test]
     fn unknown_backend_keeps_unsupported_error() {
-        let err = prepare_runtime_command(&env_runtime("podman")).unwrap_err();
+        let staged_inputs = BTreeMap::new();
+        let ctx = test_exec_context(&staged_inputs);
+        let err = prepare_runtime_command(&env_runtime("podman"), &ctx).unwrap_err();
         assert!(
             err.to_string()
                 .contains("unsupported runtime.backend podman"),
@@ -4030,9 +4092,11 @@ steps:
             env_file: Some("environment.yml".to_string()),
             runner: Some("/opt/micromamba".to_string()),
         };
+        let staged_inputs = BTreeMap::new();
+        let ctx = test_exec_context(&staged_inputs);
 
         assert_eq!(
-            prepare_runtime_command(&runtime).unwrap().argv(),
+            prepare_runtime_command(&runtime, &ctx).unwrap().argv(),
             vec!["/opt/micromamba", "run", "-p", prefix, "python", "tool.py"]
         );
         assert!(backend::backend_for("isolated-micromamba").is_some());

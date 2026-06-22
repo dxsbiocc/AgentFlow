@@ -1,6 +1,6 @@
 # RFC: 隔离执行引擎 —— 每工具环境隔离 + 灵活组合 + 智能调度(v0.2.0 P1)
 
-Status: Draft (P1 设计基线)
+Status: P1 first cut shipped — P1.1 (#70)、P1.2 (#71)、P1.3 (#72) 已合并入 `main`;P1.4(README/CHANGELOG/本文档收尾)进行中。容器后端(关 #36)+ agent 智能调度为后续 P2。
 Scope: `crates/agentflow-core/src/runtime/`、`storage/tool_registry.rs`(`ToolRuntimeSpec`)、`crates/agentflow-cli`(`env`/`run` 命令)
 North star: [docs/CAPABILITIES.md](../CAPABILITIES.md) 的诚实性不变量必须保持;`argument.rs` 判决出口 0-LLM/0-网络不变。
 

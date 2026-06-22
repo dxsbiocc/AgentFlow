@@ -83,6 +83,8 @@ cargo run -q -p agentflow-cli -- report marker_demo --path "$AF_DEMO"
 - Deterministic table-oriented validation for `required_columns`, `min_rows`, cross-input `sample_id_column`, input `profile`, and tool-level `validator_profile`
 - Local runtime timeout control through `runtime.timeout_seconds`
 - Existing Conda/micromamba environment execution through explicit `runtime.runner` plus `env_name` or `env_prefix`
+- Per-tool isolated environments via the `isolated-micromamba` backend: a content-addressed managed env at `.agentflow/envs/<tool>@<lockhash>` is auto-created and locked from the tool's `env_file` (Nextflow-style process==env), with the env lock folded into the run cache key
+- Per-step I/O staging: declared inputs are staged into the step workdir (`workdir/inputs/<port>/`) so tools compose only through declared inputs/outputs (logical isolation on local/conda; hard filesystem isolation arrives with the container backend)
 - Environment readiness checks through `env check <tool-ref>`
 - Explicit Conda/micromamba environment update through `env prepare <tool-ref>` when `runtime.env_file` is declared
 - Conda/micromamba environment export evidence through `env export <tool-ref>`, including export hash and conservative package-set diff against declared `runtime.env_file` dependencies
@@ -141,7 +143,7 @@ agentflow trace revert <checkpoint-id> --path "$AF_DEMO"  # roll back auto-appli
 - Curated capability index: tool matching uses description/port-type/maturity heuristics rather than a curated capability index (note: a **tool evolution engine** now detects generalization candidates, validates them cross-cohort, and auto-registers a generalized `exploratory` candidate for human adoption — see [docs/CAPABILITIES.md](docs/CAPABILITIES.md) §4)
 - Implicit environment creation, solving, or package installation during `run`
 - Full lockfile normalization, dependency solving, package-manager-specific diff semantics, or environment garbage collection
-- Remote or isolated execution backends such as Docker, Singularity, or SLURM
+- Container / remote execution backends such as Docker, Singularity, or SLURM (a per-tool *isolated* conda/micromamba backend exists — see the supported list; container/remote backends and hard filesystem/egress isolation are the next slice, see [docs/design/isolated-execution-engine-design.md](docs/design/isolated-execution-engine-design.md))
 - Parallel scheduler execution or cancellation controls
 - Rich semantic validators such as file signatures, domain-specific QC policies, and pluggable validator registries
 - Full graph-branch lifecycle such as delete, merge, rollback, or decision-node management (tool-level `supersede` lineage **is** supported — see `agentflow tools supersede`)

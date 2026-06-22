@@ -1,0 +1,30 @@
+schema_version: agentflow.tool.v0
+namespace: local
+name: expression_select
+version: 0.1.0
+# A deterministic, offline producer tool: subsets gene columns of an
+# ExpressionTable. Its ExpressionTable output is consumed by local/survival_assoc
+# in examples/flows/composed_demo.flow.yaml, demonstrating flow composition +
+# per-step I/O staging. Example artifact, not core.
+maturity: wrapped
+description: Select a subset of gene columns from an ExpressionTable, producing a smaller ExpressionTable. Offline, no network.
+inputs:
+  expression_table:
+    type: ExpressionTable
+    required: true
+    required_columns: sample
+params:
+  genes:
+    type: string
+    required: true
+outputs:
+  selected:
+    type: ExpressionTable
+    required_columns: sample
+    min_rows: 1
+runtime:
+  backend: local
+  command:
+    - /usr/bin/env
+    - python3
+    - expression_select.py

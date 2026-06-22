@@ -1,0 +1,30 @@
+schema_version: agentflow.flow.v0
+id: composed_demo
+name: Composed demo (producer -> consumer)
+# Two-step composition: step `select` produces a subset ExpressionTable, which
+# step `assoc` consumes as its declared expression_table input (referenced as
+# `select.selected`). Demonstrates composing tools strictly through declared I/O
+# and exercises per-step I/O staging end to end.
+steps:
+  - id: select
+    tool: local/expression_select
+    reason: Subset the expression table to the marker gene before association.
+    needs: []
+    inputs:
+      expression_table: artifact_REPLACE_WITH_IMPORTED_EXPRESSION_ID
+    params:
+      genes: TP53
+    outputs:
+      selected: selected
+  - id: assoc
+    tool: local/survival_assoc
+    reason: Run survival association on the upstream-produced expression subset.
+    needs:
+      - select
+    inputs:
+      expression_table: select.selected
+      survival_table: artifact_REPLACE_WITH_IMPORTED_SURVIVAL_ID
+    params:
+      gene: TP53
+    outputs:
+      report: report

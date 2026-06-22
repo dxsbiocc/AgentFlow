@@ -207,7 +207,19 @@ issue36 增量给 Python 工具运行时注入 `sitecustomize` guard，monkeypat
 
 但它不是反篡改沙箱。生成脚本拥有完整 Python 运行时，理论上可 un-patch、替换 socket 函数或走其他解释器 / 原生路径绕过。
 
-### 6.6 部署级出网封堵配方
+### 6.6 执行文件系统 staging
+
+P1.3 后，runtime 会把每个 step 声明的 input artifact stage 到该 step 的 workdir：
+`workdir/inputs/<port>/<filename>`，并只把这些 staged 路径写入 `inputs.json` 与
+`AGENTFLOW_INPUT_*` 环境变量。输出仍从 `workdir/outputs/` 中按声明端口采集回 artifact
+store。这让本地组合在接口层保持“只经声明 I/O”。
+
+边界必须诚实：local / conda / micromamba 后端下这是**逻辑 staging**。默认 symlink 可以被
+follow 到 artifact store；symlink 不可用时会 copy，因此工具得到的总是 workdir 内路径，但
+这还不是反篡改的硬 filesystem sandbox。只挂载 staged inputs、禁止访问 store 或未声明文件的
+强隔离属于后续 container backend。
+
+### 6.7 部署级出网封堵配方
 
 issue36 的部署级残留已收敛为 `docs/ops/egress-containment.md`：在 Linux 部署环境中，
 通过 Docker `--network none`、Docker 受控网桥 + nftables allowlist、或 Linux network

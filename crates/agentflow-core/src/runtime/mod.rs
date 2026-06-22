@@ -19,6 +19,8 @@ use crate::storage::{
     ToolRuntimeSpec,
 };
 
+mod backend;
+
 pub const PYTHON_EGRESS_GUARD_SITECUSTOMIZE: &str = r#"import ipaddress
 import socket
 
@@ -1840,55 +1842,11 @@ fn materialize_workdir(
 fn prepare_runtime_command(
     runtime: &ToolRuntimeSpec,
 ) -> Result<PreparedRuntimeCommand, StorageError> {
-    match runtime.backend.as_str() {
-        "local" => {
-            let executable = runtime.command.first().ok_or_else(|| {
-                StorageError::InvalidInput("runtime.command must not be empty".to_string())
-            })?;
-            Ok(PreparedRuntimeCommand {
-                executable: executable.clone(),
-                args: runtime.command.iter().skip(1).cloned().collect(),
-            })
-        }
-        "conda" | "micromamba" => {
-            let runner = runtime.runner.as_ref().ok_or_else(|| {
-                StorageError::InvalidInput(
-                    "environment runtime must declare absolute runner path".to_string(),
-                )
-            })?;
-            let mut args = vec!["run".to_string()];
-            if runtime.backend == "conda" {
-                args.push("--no-capture-output".to_string());
-            }
-            match (runtime.env_name.as_deref(), runtime.env_prefix.as_deref()) {
-                (Some(env_name), None) => {
-                    args.push("--name".to_string());
-                    args.push(env_name.to_string());
-                }
-                (None, Some(env_prefix)) => {
-                    args.push("--prefix".to_string());
-                    args.push(env_prefix.to_string());
-                }
-                (Some(_), Some(_)) => {
-                    return Err(StorageError::InvalidInput(
-                        "environment runtime must declare only one of env_name or env_prefix"
-                            .to_string(),
-                    ));
-                }
-                (None, None) => {
-                    return Err(StorageError::InvalidInput(
-                        "environment runtime must declare env_name or env_prefix".to_string(),
-                    ));
-                }
-            }
-            args.extend(runtime.command.iter().cloned());
-            Ok(PreparedRuntimeCommand {
-                executable: runner.clone(),
-                args,
-            })
-        }
-        other => Err(StorageError::InvalidInput(format!(
-            "unsupported runtime.backend {other}"
+    match backend::backend_for(&runtime.backend) {
+        Some(backend) => backend.prepare_command(runtime),
+        None => Err(StorageError::InvalidInput(format!(
+            "unsupported runtime.backend {}",
+            runtime.backend
         ))),
     }
 }
@@ -3206,6 +3164,82 @@ steps:
         );
         let payload: RuntimeConfigJson = serde_json::from_str(&json).unwrap();
         assert_eq!(payload.command, ["/bin/echo", "hello world"]);
+    }
+
+    #[test]
+    fn local_runtime_command_builder_keeps_argv_unchanged() {
+        let runtime = ToolRuntimeSpec {
+            backend: "local".to_string(),
+            command: vec!["/bin/echo".to_string(), "hello world".to_string()],
+            timeout_seconds: Some(5),
+            env_name: None,
+            env_prefix: None,
+            env_file: None,
+            runner: None,
+        };
+
+        assert_eq!(
+            prepare_runtime_command(&runtime).unwrap().argv(),
+            vec!["/bin/echo".to_string(), "hello world".to_string()]
+        );
+    }
+
+    fn env_runtime(backend: &str) -> ToolRuntimeSpec {
+        ToolRuntimeSpec {
+            backend: backend.to_string(),
+            command: vec!["python".to_string(), "tool.py".to_string()],
+            timeout_seconds: None,
+            env_name: Some("envA".to_string()),
+            env_prefix: None,
+            env_file: None,
+            runner: Some("/opt/micromamba".to_string()),
+        }
+    }
+
+    #[test]
+    fn conda_micromamba_backends_preserve_argv_difference() {
+        // conda keeps --no-capture-output; micromamba does not. (equivalence proof)
+        assert_eq!(
+            prepare_runtime_command(&env_runtime("conda"))
+                .unwrap()
+                .argv(),
+            vec![
+                "/opt/micromamba",
+                "run",
+                "--no-capture-output",
+                "--name",
+                "envA",
+                "python",
+                "tool.py",
+            ]
+        );
+        assert_eq!(
+            prepare_runtime_command(&env_runtime("micromamba"))
+                .unwrap()
+                .argv(),
+            vec![
+                "/opt/micromamba",
+                "run",
+                "--name",
+                "envA",
+                "python",
+                "tool.py"
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_backend_keeps_unsupported_error() {
+        let err = prepare_runtime_command(&env_runtime("podman")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported runtime.backend podman"),
+            "unexpected error: {err}"
+        );
+        assert!(backend::backend_for("podman").is_none());
+        assert!(backend::backend_for("local").is_some());
+        assert!(backend::backend_for("conda").is_some());
+        assert!(backend::backend_for("micromamba").is_some());
     }
 
     #[test]

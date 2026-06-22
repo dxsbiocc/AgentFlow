@@ -1066,10 +1066,17 @@ impl ProjectStore {
         let stderr_path = workdir.join("stderr.log");
         let resolved_outputs = output_paths(&workdir, &outputs);
         fs::create_dir_all(resolved_outputs.root())?;
+        let step_env_vars = env_vars(
+            &resolved_input_paths,
+            &params_map,
+            resolved_outputs.as_map(),
+        );
+        let agentflow_env_names = agentflow_env_names(&step_env_vars);
         let exec_ctx = backend::ExecContext {
             workdir: &workdir,
             staged_inputs: &resolved_input_paths,
             output_dir: resolved_outputs.root(),
+            env_names: &agentflow_env_names,
         };
 
         let mut prepared_command =
@@ -1185,11 +1192,7 @@ impl ProjectStore {
             .env("AGENTFLOW_INPUTS_JSON", workdir.join("inputs.json"))
             .env("AGENTFLOW_PARAMS_JSON", workdir.join("params.json"))
             .env("AGENTFLOW_OUTPUTS_JSON", workdir.join("outputs.json"))
-            .envs(env_vars(
-                &resolved_input_paths,
-                &params_map,
-                resolved_outputs.as_map(),
-            ));
+            .envs(step_env_vars);
         if let Some(pythonpath) = synth_pythonpath {
             command.env("PYTHONPATH", pythonpath);
         }
@@ -2015,6 +2018,11 @@ fn runtime_config_json_with_isolated_lock(
         env_file: runtime.env_file.clone(),
         env_file_hash,
         runner: runtime.runner.clone(),
+        container_image: if runtime.backend == "container" {
+            runtime.image.clone()
+        } else {
+            None
+        },
         isolated_env_lock,
     })
     .map_err(|err| StorageError::InvalidInput(format!("runtime config JSON failed: {err}")))
@@ -2030,6 +2038,8 @@ struct RuntimeConfigJson {
     env_file: Option<String>,
     env_file_hash: Option<String>,
     runner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    container_image: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     isolated_env_lock: Option<String>,
 }
@@ -3296,6 +3306,22 @@ fn env_vars(
     vars
 }
 
+fn agentflow_env_names(step_env_vars: &[(String, String)]) -> Vec<String> {
+    let mut names = vec![
+        "AGENTFLOW_WORKDIR".to_string(),
+        "AGENTFLOW_INPUTS_JSON".to_string(),
+        "AGENTFLOW_PARAMS_JSON".to_string(),
+        "AGENTFLOW_OUTPUTS_JSON".to_string(),
+    ];
+    names.extend(
+        step_env_vars
+            .iter()
+            .filter(|(name, _)| name.starts_with("AGENTFLOW_"))
+            .map(|(name, _)| name.clone()),
+    );
+    names
+}
+
 fn parse_json_map(input: &str) -> Result<BTreeMap<String, String>, StorageError> {
     serde_json::from_str(input)
         .map_err(|err| StorageError::InvalidInput(format!("cannot parse map: {input}: {err}")))
@@ -3399,6 +3425,7 @@ mod tests {
             workdir: Path::new("/tmp/agentflow-test-workdir"),
             staged_inputs,
             output_dir: Path::new("/tmp/agentflow-test-workdir/outputs"),
+            env_names: &[],
         }
     }
 
@@ -3859,6 +3886,7 @@ steps:
             env_prefix: None,
             env_file: None,
             runner: None,
+            image: None,
         };
         let json = runtime_config_json(&runtime).unwrap();
         assert_eq!(
@@ -3879,6 +3907,7 @@ steps:
             env_prefix: None,
             env_file: None,
             runner: None,
+            image: None,
         };
         let staged_inputs = BTreeMap::new();
         let ctx = test_exec_context(&staged_inputs);
@@ -3899,12 +3928,14 @@ steps:
             env_prefix: None,
             env_file: None,
             runner: None,
+            image: None,
         };
         let first_inputs = BTreeMap::new();
         let first_ctx = backend::ExecContext {
             workdir: Path::new("/tmp/af-work-a"),
             staged_inputs: &first_inputs,
             output_dir: Path::new("/tmp/af-work-a/outputs"),
+            env_names: &[],
         };
         let mut second_inputs = BTreeMap::new();
         second_inputs.insert(
@@ -3915,6 +3946,7 @@ steps:
             workdir: Path::new("/tmp/af-work-b"),
             staged_inputs: &second_inputs,
             output_dir: Path::new("/tmp/af-work-b/outputs"),
+            env_names: &[],
         };
 
         assert_eq!(
@@ -3936,7 +3968,104 @@ steps:
             env_prefix: None,
             env_file: None,
             runner: Some("/opt/micromamba".to_string()),
+            image: None,
         }
+    }
+
+    #[test]
+    fn container_runtime_command_builds_hard_isolation_argv_and_preserves_tool_command_suffix() {
+        let runtime = ToolRuntimeSpec {
+            backend: "container".to_string(),
+            command: vec![
+                "python".to_string(),
+                "tool.py".to_string(),
+                "--mode".to_string(),
+                "strict".to_string(),
+            ],
+            timeout_seconds: None,
+            env_name: None,
+            env_prefix: None,
+            env_file: None,
+            runner: Some("/usr/bin/docker".to_string()),
+            image: Some("ghcr.io/acme/tool@sha256:0123456789abcdef".to_string()),
+        };
+        let staged_inputs = BTreeMap::new();
+        let env_names = vec![
+            "AGENTFLOW_WORKDIR".to_string(),
+            "AGENTFLOW_INPUT_READS".to_string(),
+            "AGENTFLOW_PARAMS_JSON".to_string(),
+            "AGENTFLOW_OUTPUT_REPORT".to_string(),
+        ];
+        let ctx = backend::ExecContext {
+            workdir: Path::new("/tmp/af-step-work"),
+            staged_inputs: &staged_inputs,
+            output_dir: Path::new("/tmp/af-step-work/outputs"),
+            env_names: &env_names,
+        };
+
+        let prepared = prepare_runtime_command(&runtime, &ctx).unwrap();
+
+        assert_eq!(prepared.executable, "/usr/bin/docker");
+        assert_eq!(
+            prepared.args,
+            vec![
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "-v",
+                "/tmp/af-step-work:/tmp/af-step-work",
+                "-w",
+                "/tmp/af-step-work",
+                "-e",
+                "AGENTFLOW_WORKDIR",
+                "-e",
+                "AGENTFLOW_INPUT_READS",
+                "-e",
+                "AGENTFLOW_PARAMS_JSON",
+                "-e",
+                "AGENTFLOW_OUTPUT_REPORT",
+                "ghcr.io/acme/tool@sha256:0123456789abcdef",
+                "python",
+                "tool.py",
+                "--mode",
+                "strict",
+            ]
+        );
+        assert_eq!(
+            &prepared.args[prepared.args.len() - runtime.command.len()..],
+            runtime.command.as_slice()
+        );
+        assert!(backend::backend_for("container").is_some());
+    }
+
+    #[test]
+    fn agentflow_env_names_collects_fixed_and_port_runtime_vars() {
+        let step_env_vars = vec![
+            (
+                "AGENTFLOW_INPUT_READS".to_string(),
+                "/tmp/af-step-work/inputs/reads/in.fastq".to_string(),
+            ),
+            ("AGENTFLOW_PARAM_MODE".to_string(), "strict".to_string()),
+            (
+                "AGENTFLOW_OUTPUT_REPORT".to_string(),
+                "/tmp/af-step-work/outputs/report".to_string(),
+            ),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ];
+
+        assert_eq!(
+            agentflow_env_names(&step_env_vars),
+            vec![
+                "AGENTFLOW_WORKDIR",
+                "AGENTFLOW_INPUTS_JSON",
+                "AGENTFLOW_PARAMS_JSON",
+                "AGENTFLOW_OUTPUTS_JSON",
+                "AGENTFLOW_INPUT_READS",
+                "AGENTFLOW_PARAM_MODE",
+                "AGENTFLOW_OUTPUT_REPORT",
+            ]
+        );
     }
 
     #[test]
@@ -4050,6 +4179,7 @@ steps:
             env_prefix: None,
             env_file: Some(env_file.display().to_string()),
             runner: Some("/opt/micromamba".to_string()),
+            image: None,
         };
         let provisioner = FakeProvisioner {
             calls: std::cell::Cell::new(0),
@@ -4091,6 +4221,7 @@ steps:
             env_prefix: Some(prefix.to_string()),
             env_file: Some("environment.yml".to_string()),
             runner: Some("/opt/micromamba".to_string()),
+            image: None,
         };
         let staged_inputs = BTreeMap::new();
         let ctx = test_exec_context(&staged_inputs);
@@ -4117,6 +4248,7 @@ steps:
             env_prefix: None,
             env_file: None,
             runner: Some("/opt/conda/bin/conda".to_string()),
+            image: None,
         };
         assert_eq!(
             runtime_config_json(&conda).unwrap(),
@@ -4131,6 +4263,7 @@ steps:
             env_prefix: None,
             env_file: Some(env_file.display().to_string()),
             runner: Some("/opt/micromamba".to_string()),
+            image: None,
         };
         let json =
             runtime_config_json_with_isolated_lock(&isolated, Some("fnv64:abc123".to_string()))
@@ -4138,6 +4271,27 @@ steps:
         assert!(json.contains("\"isolated_env_lock\":\"fnv64:abc123\""));
         let payload: RuntimeConfigJson = serde_json::from_str(&json).unwrap();
         assert_eq!(payload.isolated_env_lock.as_deref(), Some("fnv64:abc123"));
+
+        let container = ToolRuntimeSpec {
+            backend: "container".to_string(),
+            command: vec!["python".to_string(), "run.py".to_string()],
+            timeout_seconds: None,
+            env_name: None,
+            env_prefix: None,
+            env_file: None,
+            runner: Some("/usr/bin/docker".to_string()),
+            image: Some("ghcr.io/acme/tool@sha256:0123456789abcdef".to_string()),
+        };
+        let container_json = runtime_config_json(&container).unwrap();
+        assert_eq!(
+            container_json,
+            "{\"backend\":\"container\",\"command\":[\"python\",\"run.py\"],\"timeout_seconds\":null,\"env_name\":null,\"env_prefix\":null,\"env_file\":null,\"env_file_hash\":null,\"runner\":\"/usr/bin/docker\",\"container_image\":\"ghcr.io/acme/tool@sha256:0123456789abcdef\"}"
+        );
+        let payload: RuntimeConfigJson = serde_json::from_str(&container_json).unwrap();
+        assert_eq!(
+            payload.container_image.as_deref(),
+            Some("ghcr.io/acme/tool@sha256:0123456789abcdef")
+        );
 
         let _ = fs::remove_dir_all(path);
     }
@@ -5179,6 +5333,7 @@ steps:
             env_prefix: None,
             env_file: Some(env_file.display().to_string()),
             runner: Some("/opt/conda/bin/conda".to_string()),
+            image: None,
         };
         let first = runtime_config_json(&runtime).unwrap();
         fs::write(&env_file, "name: af-test\ndependencies:\n  - python=3.12\n").unwrap();

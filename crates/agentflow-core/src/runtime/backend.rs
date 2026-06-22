@@ -7,15 +7,26 @@
 //! extraction of `prepare_runtime_command`; the produced argv, error text, and
 //! cache-relevant config are byte-identical to the previous inline `match`.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
 use crate::storage::{StorageError, ToolRuntimeSpec};
 
 use super::PreparedRuntimeCommand;
+
+#[allow(dead_code)]
+pub(super) struct ExecContext<'a> {
+    pub workdir: &'a Path,
+    pub staged_inputs: &'a BTreeMap<String, PathBuf>,
+    pub output_dir: &'a Path,
+}
 
 /// Builds the concrete executable + argv for a tool run, per backend.
 pub(super) trait ToolExecutionBackend {
     fn prepare_command(
         &self,
         runtime: &ToolRuntimeSpec,
+        ctx: &ExecContext,
     ) -> Result<PreparedRuntimeCommand, StorageError>;
 }
 
@@ -26,6 +37,7 @@ impl ToolExecutionBackend for LocalBackend {
     fn prepare_command(
         &self,
         runtime: &ToolRuntimeSpec,
+        _ctx: &ExecContext,
     ) -> Result<PreparedRuntimeCommand, StorageError> {
         let executable = runtime.command.first().ok_or_else(|| {
             StorageError::InvalidInput("runtime.command must not be empty".to_string())
@@ -49,6 +61,7 @@ impl ToolExecutionBackend for CondaBackend {
     fn prepare_command(
         &self,
         runtime: &ToolRuntimeSpec,
+        _ctx: &ExecContext,
     ) -> Result<PreparedRuntimeCommand, StorageError> {
         let runner = runtime.runner.as_ref().ok_or_else(|| {
             StorageError::InvalidInput(
@@ -96,6 +109,7 @@ impl ToolExecutionBackend for IsolatedMicromambaBackend {
     fn prepare_command(
         &self,
         runtime: &ToolRuntimeSpec,
+        ctx: &ExecContext,
     ) -> Result<PreparedRuntimeCommand, StorageError> {
         if runtime.env_name.is_some() {
             return Err(StorageError::InvalidInput(
@@ -112,7 +126,7 @@ impl ToolExecutionBackend for IsolatedMicromambaBackend {
             conda_no_capture: false,
             prefix_flag: "-p",
         }
-        .prepare_command(runtime)
+        .prepare_command(runtime, ctx)
     }
 }
 

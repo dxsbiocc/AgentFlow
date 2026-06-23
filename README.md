@@ -85,10 +85,25 @@ cargo run -q -p agentflow-cli -- report marker_demo --path "$AF_DEMO"
 - Existing Conda/micromamba environment execution through explicit `runtime.runner` plus `env_name` or `env_prefix`
 - Per-tool isolated environments via the `isolated-micromamba` backend: a content-addressed managed env at `.agentflow/envs/<tool>@<lockhash>` is auto-created and locked from the tool's `env_file` (Nextflow-style process==env), with the env lock folded into the run cache key
 - Container execution via `runtime.backend: container`: AgentFlow constructs `<runner> run --rm --network none -v <workdir>:<workdir> -w <workdir> ... <image> <command>` so tools run without network and see only the step workdir mount
+- Multi-engine containers: container tools declare a stable per-tool `image`, while each run can choose docker, podman, or singularity/apptainer with `--container-engine` and `--container-runner`; the default engine remains docker
 - Per-step I/O staging: declared inputs are staged into the step workdir (`workdir/inputs/<port>/`) so tools compose only through declared inputs/outputs (logical isolation on local/conda; hard filesystem isolation on container through the workdir-only mount)
 - Environment readiness checks through `env check <tool-ref>`
 - Explicit Conda/micromamba environment update through `env prepare <tool-ref>` when `runtime.env_file` is declared
 - Conda/micromamba environment export evidence through `env export <tool-ref>`, including export hash and conservative package-set diff against declared `runtime.env_file` dependencies
+
+Example engine switch for the same image-only container tool:
+
+```bash
+# Local Docker or Podman profile. Image-only tools need a run-level runner path.
+agentflow run <flow-id> --container-engine docker --container-runner /usr/bin/docker
+
+# HPC profile using Singularity or Apptainer.
+agentflow run <flow-id> --container-engine singularity --container-runner /usr/bin/singularity
+```
+
+This is an illustrative model example: it needs a real container engine plus an image reference
+that the selected engine can resolve, and this repository has not live-validated the example
+against Docker, Podman, Singularity, or Apptainer.
 
 ## Agent Control Layer
 

@@ -1,0 +1,26 @@
+schema_version: agentflow.tool.v0
+namespace: container
+name: text_filter
+version: 0.1.0
+maturity: wrapped
+description: Illustrative image-only container tool that filters text lines inside the image.
+inputs:
+  text:
+    type: Text
+    required: true
+params:
+  pattern:
+    type: string
+    required: true
+outputs:
+  matches:
+    type: Text
+runtime:
+  backend: container
+  image: ubuntu:24.04
+  command:
+    - /usr/bin/awk
+    - >-
+      BEGIN { input = ENVIRON["AGENTFLOW_INPUT_TEXT"]; output = ENVIRON["AGENTFLOW_OUTPUT_MATCHES"];
+      pattern = ENVIRON["AGENTFLOW_PARAM_PATTERN"]; printf "" > output; while ((getline line < input) > 0)
+      { if (index(line, pattern)) print NR ":" line >> output } close(input); close(output) }

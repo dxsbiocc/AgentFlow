@@ -75,7 +75,7 @@ pub fn usage() -> String {
         "  agentflow flow validate <flow.yaml> [--json] [--path <path>]",
         "  agentflow flow approve <flow.yaml> [--path <path>]",
         "  agentflow flow inspect <flow-id> [--json] [--path <path>]",
-        "  agentflow run <flow-id> [--container-engine docker|podman] [--container-runner <path>] [--path <path>]",
+        "  agentflow run <flow-id> [--container-engine docker|podman|singularity|apptainer] [--container-runner <path>] [--path <path>]",
         "  agentflow run-step <step-id|flow.step|step:flow/step> [--path <path>]",
         "  agentflow report <flow-id> [--path <path>]",
         "  agentflow report research [--path <path>]",
@@ -97,7 +97,7 @@ pub fn usage() -> String {
         "  agentflow evidence list --hypothesis <id> [--json] [--path <path>]",
         "  agentflow verdict render --hypothesis <id> [--json] [--path <path>] [--gate-supports <text> --gate-against <text> --gate-alternatives <text> --gate-data-risks <text> --gate-assumptions <text> --gate-falsifier <text> --gate-claim-basis observed|inferred|speculative --gate-not-yet <text>]",
         "  agentflow verdict show --hypothesis <id> [--json] [--path <path>]",
-        "  agentflow agent run [--apply] [--no-apply] [--auto-run] [--no-auto-run] [--dry-run] [--flow <flow-id>] [--max-apply <n>] [--propose-synth] [--auto-synth] [--no-auto-synth] [--infer-params] [--no-infer-params] [--semantic-match] [--no-semantic-match] [--synthesizer <cmd>] [--auto-forage] [--no-auto-forage] [--forage-max <n>] [--forage-script <path>] [--python <bin>] [--container-engine docker|podman] [--container-runner <path>] [--json] [--path <path>]",
+        "  agentflow agent run [--apply] [--no-apply] [--auto-run] [--no-auto-run] [--dry-run] [--flow <flow-id>] [--max-apply <n>] [--propose-synth] [--auto-synth] [--no-auto-synth] [--infer-params] [--no-infer-params] [--semantic-match] [--no-semantic-match] [--synthesizer <cmd>] [--auto-forage] [--no-auto-forage] [--forage-max <n>] [--forage-script <path>] [--python <bin>] [--container-engine docker|podman|singularity|apptainer] [--container-runner <path>] [--json] [--path <path>]",
         "  agentflow branch candidates [--json] [--path <path>]",
         "  agentflow branch select [--explore] [--json] [--path <path>]",
         "  agentflow decision list [--json] [--path <path>]",
@@ -1397,9 +1397,10 @@ pub(crate) fn run_config_from_container_args(
     let kind = match engine.as_deref().unwrap_or("docker") {
         "docker" => ContainerEngineKind::Docker,
         "podman" => ContainerEngineKind::Podman,
+        "singularity" | "apptainer" => ContainerEngineKind::Singularity,
         other => {
             return Err(CliError::InvalidArgument(format!(
-                "unsupported --container-engine {other}; expected docker or podman"
+                "unsupported --container-engine {other}; expected docker, podman, singularity, or apptainer"
             )));
         }
     };
@@ -5031,13 +5032,13 @@ runtime:
             "run",
             "marker_demo",
             "--container-engine",
-            "singularity",
+            "bogus",
         ]))
         .unwrap_err();
         assert!(
             run_err
                 .message()
-                .contains("unsupported --container-engine singularity"),
+                .contains("unsupported --container-engine bogus"),
             "{}",
             run_err.message()
         );
@@ -5047,16 +5048,31 @@ runtime:
             "agent",
             "run",
             "--container-engine",
-            "singularity",
+            "bogus",
         ]))
         .unwrap_err();
         assert!(
             agent_run_err
                 .message()
-                .contains("unsupported --container-engine singularity"),
+                .contains("unsupported --container-engine bogus"),
             "{}",
             agent_run_err.message()
         );
+    }
+
+    #[test]
+    fn container_engine_args_accept_singularity_and_apptainer_aliases() {
+        let singularity = run_config_from_container_args(vec!["singularity".to_string()], vec![])
+            .unwrap()
+            .container_engine
+            .unwrap();
+        let apptainer = run_config_from_container_args(vec!["apptainer".to_string()], vec![])
+            .unwrap()
+            .container_engine
+            .unwrap();
+
+        assert_eq!(singularity.kind, ContainerEngineKind::Singularity);
+        assert_eq!(apptainer.kind, ContainerEngineKind::Singularity);
     }
 
     #[test]

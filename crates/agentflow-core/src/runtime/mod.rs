@@ -32,6 +32,7 @@ const ISOLATED_ENV_LOCK_FILE: &str = "agentflow-env.lock";
 pub enum ContainerEngineKind {
     Docker,
     Podman,
+    Singularity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1131,6 +1132,24 @@ impl ProjectStore {
             &params_map,
             resolved_outputs.as_map(),
         );
+        let fixed_agentflow_env_vars = vec![
+            (
+                "AGENTFLOW_WORKDIR".to_string(),
+                workdir.display().to_string(),
+            ),
+            (
+                "AGENTFLOW_INPUTS_JSON".to_string(),
+                workdir.join("inputs.json").display().to_string(),
+            ),
+            (
+                "AGENTFLOW_PARAMS_JSON".to_string(),
+                workdir.join("params.json").display().to_string(),
+            ),
+            (
+                "AGENTFLOW_OUTPUTS_JSON".to_string(),
+                workdir.join("outputs.json").display().to_string(),
+            ),
+        ];
         let agentflow_env_names = agentflow_env_names(&step_env_vars);
         let exec_ctx = backend::ExecContext {
             workdir: &workdir,
@@ -1253,7 +1272,12 @@ impl ProjectStore {
             .env("AGENTFLOW_INPUTS_JSON", workdir.join("inputs.json"))
             .env("AGENTFLOW_PARAMS_JSON", workdir.join("params.json"))
             .env("AGENTFLOW_OUTPUTS_JSON", workdir.join("outputs.json"))
-            .envs(step_env_vars);
+            .envs(step_env_vars.iter().map(|(name, value)| (name, value)))
+            .envs(singularity_env_vars(
+                config,
+                &fixed_agentflow_env_vars,
+                &step_env_vars,
+            ));
         if let Some(pythonpath) = synth_pythonpath {
             command.env("PYTHONPATH", pythonpath);
         }
@@ -3383,6 +3407,28 @@ fn agentflow_env_names(step_env_vars: &[(String, String)]) -> Vec<String> {
     names
 }
 
+fn singularity_env_vars(
+    config: &RunConfig,
+    fixed_env_vars: &[(String, String)],
+    step_env_vars: &[(String, String)],
+) -> Vec<(String, String)> {
+    let is_singularity = config
+        .container_engine
+        .as_ref()
+        .map(|selection| selection.kind == ContainerEngineKind::Singularity)
+        .unwrap_or(false);
+    if !is_singularity {
+        return Vec::new();
+    }
+
+    fixed_env_vars
+        .iter()
+        .chain(step_env_vars.iter())
+        .filter(|(name, _)| name.starts_with("AGENTFLOW_"))
+        .map(|(name, value)| (format!("SINGULARITYENV_{name}"), value.clone()))
+        .collect()
+}
+
 fn parse_json_map(input: &str) -> Result<BTreeMap<String, String>, StorageError> {
     serde_json::from_str(input)
         .map_err(|err| StorageError::InvalidInput(format!("cannot parse map: {input}: {err}")))
@@ -4124,6 +4170,10 @@ steps:
             kind: ContainerEngineKind::Podman,
             runner: Some(PathBuf::from("/custom/podman")),
         };
+        let singularity_selection = ContainerEngineSelection {
+            kind: ContainerEngineKind::Singularity,
+            runner: Some(PathBuf::from("/custom/apptainer")),
+        };
         let staged_inputs = BTreeMap::new();
         let docker_ctx = backend::ExecContext {
             workdir: Path::new("/tmp/af-step-work"),
@@ -4139,11 +4189,20 @@ steps:
             env_names: &[],
             container_engine: Some(&podman_selection),
         };
+        let singularity_ctx = backend::ExecContext {
+            workdir: Path::new("/tmp/af-step-work"),
+            staged_inputs: &staged_inputs,
+            output_dir: Path::new("/tmp/af-step-work/outputs"),
+            env_names: &[],
+            container_engine: Some(&singularity_selection),
+        };
 
         let docker_command = prepare_runtime_command(&runtime, &docker_ctx).unwrap();
         let podman_command = prepare_runtime_command(&runtime, &podman_ctx).unwrap();
-        let runtime_json = runtime_config_json(&runtime).unwrap();
-        let runtime_hash = stable_hash(&runtime_json);
+        let singularity_command = prepare_runtime_command(&runtime, &singularity_ctx).unwrap();
+        let docker_runtime_json = runtime_config_json(&runtime).unwrap();
+        let singularity_runtime_json = runtime_config_json(&runtime).unwrap();
+        let runtime_hash = stable_hash(&docker_runtime_json);
         let docker_cache_key = compute_cache_key(
             "analysis/tool",
             "0.1.0",
@@ -4158,13 +4217,108 @@ steps:
             &stable_hash("{}"),
             &runtime_hash,
         );
+        let singularity_cache_key = compute_cache_key(
+            "analysis/tool",
+            "0.1.0",
+            "{}",
+            &stable_hash("{}"),
+            &runtime_hash,
+        );
 
         assert_eq!(docker_command.executable, "/custom/docker");
         assert_eq!(podman_command.executable, "/custom/podman");
+        assert_eq!(singularity_command.executable, "/custom/apptainer");
         assert_eq!(docker_command.args, podman_command.args);
-        assert!(!runtime_json.contains("Docker"));
-        assert!(!runtime_json.contains("Podman"));
+        assert_ne!(docker_command.args, singularity_command.args);
+        assert_eq!(docker_runtime_json, singularity_runtime_json);
+        assert!(!docker_runtime_json.contains("Docker"));
+        assert!(!docker_runtime_json.contains("Podman"));
+        assert!(!docker_runtime_json.contains("Singularity"));
         assert_eq!(docker_cache_key, podman_cache_key);
+        assert_eq!(docker_cache_key, singularity_cache_key);
+    }
+
+    #[test]
+    fn singularity_env_forwarding_adds_prefixed_agentflow_vars_only_for_singularity() {
+        let step_env_vars = vec![
+            (
+                "AGENTFLOW_INPUT_READS".to_string(),
+                "/tmp/af-step-work/inputs/reads/in.fastq".to_string(),
+            ),
+            ("AGENTFLOW_PARAM_MODE".to_string(), "strict".to_string()),
+            (
+                "AGENTFLOW_OUTPUT_REPORT".to_string(),
+                "/tmp/af-step-work/outputs/report".to_string(),
+            ),
+        ];
+        let fixed_env_vars = vec![
+            (
+                "AGENTFLOW_WORKDIR".to_string(),
+                "/tmp/af-step-work".to_string(),
+            ),
+            (
+                "AGENTFLOW_INPUTS_JSON".to_string(),
+                "/tmp/af-step-work/inputs.json".to_string(),
+            ),
+            (
+                "AGENTFLOW_PARAMS_JSON".to_string(),
+                "/tmp/af-step-work/params.json".to_string(),
+            ),
+            (
+                "AGENTFLOW_OUTPUTS_JSON".to_string(),
+                "/tmp/af-step-work/outputs.json".to_string(),
+            ),
+        ];
+        let singularity_config = RunConfig {
+            container_engine: Some(ContainerEngineSelection {
+                kind: ContainerEngineKind::Singularity,
+                runner: Some(PathBuf::from("/usr/bin/apptainer")),
+            }),
+        };
+        let docker_config = RunConfig {
+            container_engine: Some(ContainerEngineSelection {
+                kind: ContainerEngineKind::Docker,
+                runner: Some(PathBuf::from("/usr/bin/docker")),
+            }),
+        };
+
+        assert_eq!(
+            singularity_env_vars(&singularity_config, &fixed_env_vars, &step_env_vars),
+            vec![
+                (
+                    "SINGULARITYENV_AGENTFLOW_WORKDIR".to_string(),
+                    "/tmp/af-step-work".to_string()
+                ),
+                (
+                    "SINGULARITYENV_AGENTFLOW_INPUTS_JSON".to_string(),
+                    "/tmp/af-step-work/inputs.json".to_string()
+                ),
+                (
+                    "SINGULARITYENV_AGENTFLOW_PARAMS_JSON".to_string(),
+                    "/tmp/af-step-work/params.json".to_string()
+                ),
+                (
+                    "SINGULARITYENV_AGENTFLOW_OUTPUTS_JSON".to_string(),
+                    "/tmp/af-step-work/outputs.json".to_string()
+                ),
+                (
+                    "SINGULARITYENV_AGENTFLOW_INPUT_READS".to_string(),
+                    "/tmp/af-step-work/inputs/reads/in.fastq".to_string()
+                ),
+                (
+                    "SINGULARITYENV_AGENTFLOW_PARAM_MODE".to_string(),
+                    "strict".to_string()
+                ),
+                (
+                    "SINGULARITYENV_AGENTFLOW_OUTPUT_REPORT".to_string(),
+                    "/tmp/af-step-work/outputs/report".to_string()
+                ),
+            ]
+        );
+        assert!(singularity_env_vars(&docker_config, &fixed_env_vars, &step_env_vars).is_empty());
+        assert!(
+            singularity_env_vars(&RunConfig::default(), &fixed_env_vars, &step_env_vars).is_empty()
+        );
     }
 
     #[test]

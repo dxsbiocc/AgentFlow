@@ -178,6 +178,38 @@ impl ContainerEngine for DockerEngine {
     }
 }
 
+/// Singularity-compatible container runner. Apptainer uses the same argv shape.
+pub(super) struct SingularityEngine;
+
+impl ContainerEngine for SingularityEngine {
+    fn build(
+        &self,
+        runner: &str,
+        image: &str,
+        command: &[String],
+        ctx: &ExecContext,
+    ) -> PreparedRuntimeCommand {
+        let workdir = ctx.workdir.display().to_string();
+        let mut args = vec![
+            "exec".to_string(),
+            "--containall".to_string(),
+            "--net".to_string(),
+            "--network".to_string(),
+            "none".to_string(),
+            "-B".to_string(),
+            format!("{workdir}:{workdir}"),
+            "--pwd".to_string(),
+            workdir,
+            image.to_string(),
+        ];
+        args.extend(command.iter().cloned());
+        PreparedRuntimeCommand {
+            executable: runner.to_string(),
+            args,
+        }
+    }
+}
+
 /// Runs the declared command inside a container with hard local containment.
 struct ContainerBackend;
 
@@ -209,6 +241,9 @@ impl ToolExecutionBackend for ContainerBackend {
         match engine_kind {
             ContainerEngineKind::Docker | ContainerEngineKind::Podman => {
                 Ok(DockerEngine.build(runner, image, &runtime.command, ctx))
+            }
+            ContainerEngineKind::Singularity => {
+                Ok(SingularityEngine.build(runner, image, &runtime.command, ctx))
             }
         }
     }
@@ -373,6 +408,64 @@ mod tests {
                 "python",
                 "tool.py",
             ]
+        );
+    }
+
+    #[test]
+    fn singularity_engine_builds_exec_argv_without_docker_env_flags() {
+        let staged_inputs = BTreeMap::new();
+        let env_names = vec![
+            "AGENTFLOW_WORKDIR".to_string(),
+            "AGENTFLOW_INPUT_READS".to_string(),
+            "AGENTFLOW_PARAMS_JSON".to_string(),
+            "AGENTFLOW_OUTPUT_REPORT".to_string(),
+        ];
+        let ctx = ExecContext {
+            workdir: Path::new("/tmp/af-step-work"),
+            staged_inputs: &staged_inputs,
+            output_dir: Path::new("/tmp/af-step-work/outputs"),
+            env_names: &env_names,
+            container_engine: None,
+        };
+        let command = vec![
+            "python".to_string(),
+            "tool.py".to_string(),
+            "--mode".to_string(),
+            "strict".to_string(),
+        ];
+
+        let prepared = SingularityEngine.build(
+            "/usr/bin/apptainer",
+            "docker://ghcr.io/acme/tool:1",
+            &command,
+            &ctx,
+        );
+
+        assert_eq!(prepared.executable, "/usr/bin/apptainer");
+        assert_eq!(
+            prepared.args,
+            vec![
+                "exec",
+                "--containall",
+                "--net",
+                "--network",
+                "none",
+                "-B",
+                "/tmp/af-step-work:/tmp/af-step-work",
+                "--pwd",
+                "/tmp/af-step-work",
+                "docker://ghcr.io/acme/tool:1",
+                "python",
+                "tool.py",
+                "--mode",
+                "strict",
+            ]
+        );
+        assert!(!prepared.args.iter().any(|arg| arg == "run"));
+        assert!(!prepared.args.iter().any(|arg| arg == "-e"));
+        assert_eq!(
+            &prepared.args[prepared.args.len() - command.len()..],
+            command.as_slice()
         );
     }
 }

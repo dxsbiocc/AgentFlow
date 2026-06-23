@@ -110,7 +110,7 @@ pub(crate) struct PathJsonArgs {
 pub(crate) struct RunArgs {
     #[arg(value_name = "flow-id")]
     pub(crate) flow_id: String,
-    #[arg(long, value_name = "docker|podman")]
+    #[arg(long, value_name = "docker|podman|singularity|apptainer")]
     pub(crate) container_engine: Vec<String>,
     #[arg(long, value_name = "path")]
     pub(crate) container_runner: Vec<PathBuf>,
@@ -580,7 +580,11 @@ pub(crate) struct VerdictShowArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct AgentArgs {
-    #[arg(long, global = true, value_name = "docker|podman")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "docker|podman|singularity|apptainer"
+    )]
     pub(crate) container_engine: Vec<String>,
     #[arg(long, global = true, value_name = "path")]
     pub(crate) container_runner: Vec<PathBuf>,

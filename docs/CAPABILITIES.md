@@ -265,9 +265,12 @@ agentflow run <flow-id> --container-engine singularity --container-runner /usr/b
   工件谱系完整。**这次 live 测试发现并修复了一个真实 bug**:P1.3 默认 symlink stage input,而 symlink
   目标(artifact store)在 workdir mount 之外 → 容器内悬空。修复:容器后端改为**拷贝** stage input
   到 workdir(真实文件,经 mount 可读)。
-- **`container` — podman / singularity / apptainer 仍仅离线 argv 测试**,未对真实 daemon/HPC 跑过
-  (本机无 podman/singularity)。docker 引擎的 live 结果给了这套模型很强的信心,但 singularity 的
-  `--containall`/`SINGULARITYENV_` 路径仍待 HPC host 实测。不在那之前宣称全引擎"生产就绪"。
+- **`container` — podman / singularity / apptainer 仍仅离线 argv 测试**,未对真实运行时跑过。
+  podman 与 docker 共用同一套 `DockerEngine`(CLI 兼容),其 argv 路径已被 docker 的 live 测试覆盖;
+  本机 podman CLI(5.8.3)已装但未 `podman machine init/start`(macOS 容器需 Linux VM,属内存大户,
+  暂跳过),只差一台 machine 即可一条命令实测。singularity/apptainer 的 `--containall`/`SINGULARITYENV_`
+  路径仍待 HPC host 实测。docker 引擎的 live 结果给了这套模型很强的信心,但在 podman/singularity 实测前
+  不宣称全引擎"生产就绪"。
 
 ### 6.7 部署级出网封堵配方
 

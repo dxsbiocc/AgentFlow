@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::storage::{StorageError, ToolRuntimeSpec};
 
-use super::PreparedRuntimeCommand;
+use super::{ContainerEngineKind, ContainerEngineSelection, PreparedRuntimeCommand};
 
 #[allow(dead_code)]
 pub(super) struct ExecContext<'a> {
@@ -20,6 +20,7 @@ pub(super) struct ExecContext<'a> {
     pub staged_inputs: &'a BTreeMap<String, PathBuf>,
     pub output_dir: &'a Path,
     pub env_names: &'a [String],
+    pub container_engine: Option<&'a ContainerEngineSelection>,
 }
 
 /// Builds the concrete executable + argv for a tool run, per backend.
@@ -186,15 +187,30 @@ impl ToolExecutionBackend for ContainerBackend {
         runtime: &ToolRuntimeSpec,
         ctx: &ExecContext,
     ) -> Result<PreparedRuntimeCommand, StorageError> {
-        let runner = runtime.runner.as_ref().ok_or_else(|| {
-            StorageError::InvalidInput(
-                "container runtime must declare absolute runner path".to_string(),
-            )
-        })?;
+        let runner_override = ctx
+            .container_engine
+            .and_then(|selection| selection.runner.as_ref())
+            .map(|runner| runner.to_string_lossy().into_owned());
+        let runner = match runner_override.as_deref() {
+            Some(runner) => runner,
+            None => runtime.runner.as_deref().ok_or_else(|| {
+                StorageError::InvalidInput(
+                    "container runtime must declare absolute runner path".to_string(),
+                )
+            })?,
+        };
         let image = runtime.image.as_ref().ok_or_else(|| {
             StorageError::InvalidInput("container runtime must declare image".to_string())
         })?;
-        Ok(DockerEngine.build(runner, image, &runtime.command, ctx))
+        let engine_kind = ctx
+            .container_engine
+            .map(|selection| selection.kind)
+            .unwrap_or(ContainerEngineKind::Docker);
+        match engine_kind {
+            ContainerEngineKind::Docker | ContainerEngineKind::Podman => {
+                Ok(DockerEngine.build(runner, image, &runtime.command, ctx))
+            }
+        }
     }
 }
 
@@ -239,6 +255,7 @@ mod tests {
             staged_inputs: &staged_inputs,
             output_dir: Path::new("/tmp/af-step-work/outputs"),
             env_names: &env_names,
+            container_engine: None,
         };
         let command = vec![
             "python".to_string(),
@@ -306,6 +323,55 @@ mod tests {
                 "tool.py",
                 "--mode",
                 "strict",
+            ]
+        );
+    }
+
+    #[test]
+    fn container_backend_podman_selection_uses_docker_argv_shape_with_override_runner() {
+        let runtime = ToolRuntimeSpec {
+            backend: "container".to_string(),
+            command: vec!["python".to_string(), "tool.py".to_string()],
+            timeout_seconds: None,
+            env_name: None,
+            env_prefix: None,
+            env_file: None,
+            runner: Some("/usr/bin/docker".to_string()),
+            image: Some("ghcr.io/acme/tool:1".to_string()),
+        };
+        let selection = super::ContainerEngineSelection {
+            kind: super::ContainerEngineKind::Podman,
+            runner: Some(PathBuf::from("/usr/bin/podman")),
+        };
+        let staged_inputs = BTreeMap::new();
+        let env_names = vec!["AGENTFLOW_WORKDIR".to_string()];
+        let ctx = ExecContext {
+            workdir: Path::new("/tmp/af-step-work"),
+            staged_inputs: &staged_inputs,
+            output_dir: Path::new("/tmp/af-step-work/outputs"),
+            env_names: &env_names,
+            container_engine: Some(&selection),
+        };
+
+        let prepared = ContainerBackend.prepare_command(&runtime, &ctx).unwrap();
+
+        assert_eq!(prepared.executable, "/usr/bin/podman");
+        assert_eq!(
+            prepared.args,
+            vec![
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "-v",
+                "/tmp/af-step-work:/tmp/af-step-work",
+                "-w",
+                "/tmp/af-step-work",
+                "-e",
+                "AGENTFLOW_WORKDIR",
+                "ghcr.io/acme/tool:1",
+                "python",
+                "tool.py",
             ]
         );
     }

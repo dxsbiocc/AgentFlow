@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::cli_args::*;
+use agentflow_core::runtime::{ContainerEngineKind, ContainerEngineSelection, RunConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliError {
@@ -74,7 +75,7 @@ pub fn usage() -> String {
         "  agentflow flow validate <flow.yaml> [--json] [--path <path>]",
         "  agentflow flow approve <flow.yaml> [--path <path>]",
         "  agentflow flow inspect <flow-id> [--json] [--path <path>]",
-        "  agentflow run <flow-id> [--path <path>]",
+        "  agentflow run <flow-id> [--container-engine docker|podman] [--container-runner <path>] [--path <path>]",
         "  agentflow run-step <step-id|flow.step|step:flow/step> [--path <path>]",
         "  agentflow report <flow-id> [--path <path>]",
         "  agentflow report research [--path <path>]",
@@ -96,7 +97,7 @@ pub fn usage() -> String {
         "  agentflow evidence list --hypothesis <id> [--json] [--path <path>]",
         "  agentflow verdict render --hypothesis <id> [--json] [--path <path>] [--gate-supports <text> --gate-against <text> --gate-alternatives <text> --gate-data-risks <text> --gate-assumptions <text> --gate-falsifier <text> --gate-claim-basis observed|inferred|speculative --gate-not-yet <text>]",
         "  agentflow verdict show --hypothesis <id> [--json] [--path <path>]",
-        "  agentflow agent run [--apply] [--no-apply] [--auto-run] [--no-auto-run] [--dry-run] [--flow <flow-id>] [--max-apply <n>] [--propose-synth] [--auto-synth] [--no-auto-synth] [--infer-params] [--no-infer-params] [--semantic-match] [--no-semantic-match] [--synthesizer <cmd>] [--auto-forage] [--no-auto-forage] [--forage-max <n>] [--forage-script <path>] [--python <bin>] [--json] [--path <path>]",
+        "  agentflow agent run [--apply] [--no-apply] [--auto-run] [--no-auto-run] [--dry-run] [--flow <flow-id>] [--max-apply <n>] [--propose-synth] [--auto-synth] [--no-auto-synth] [--infer-params] [--no-infer-params] [--semantic-match] [--no-semantic-match] [--synthesizer <cmd>] [--auto-forage] [--no-auto-forage] [--forage-max <n>] [--forage-script <path>] [--python <bin>] [--container-engine docker|podman] [--container-runner <path>] [--json] [--path <path>]",
         "  agentflow branch candidates [--json] [--path <path>]",
         "  agentflow branch select [--explore] [--json] [--path <path>]",
         "  agentflow decision list [--json] [--path <path>]",
@@ -164,9 +165,10 @@ fn status_command(args: PathJsonArgs) -> Result<String, CliError> {
 
 fn run_command(args: RunArgs) -> Result<String, CliError> {
     let flow_id = args.flow_id;
+    let run_config = run_config_from_container_args(args.container_engine, args.container_runner)?;
     let project_path = project_path_from_only(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
-    let summary = store.run_flow(&flow_id)?;
+    let summary = store.run_flow_with(&flow_id, &run_config)?;
     Ok(format!(
         "Run complete\nFlow: {}\nCompleted steps: {}\nFailed steps: {}\nAttempts:\n{}",
         summary.flow_id,
@@ -174,6 +176,23 @@ fn run_command(args: RunArgs) -> Result<String, CliError> {
         summary.failed_steps,
         format_attempts(&summary.attempts)
     ))
+}
+
+fn agent_command(args: AgentArgs) -> Result<String, CliError> {
+    let AgentArgs {
+        container_engine,
+        container_runner,
+        command,
+    } = args;
+    let run_config = run_config_from_container_args(container_engine, container_runner)?;
+    let args = AgentArgs {
+        container_engine: Vec::new(),
+        container_runner: Vec::new(),
+        command,
+    };
+    agentflow_core::runtime::with_run_config(&run_config, || {
+        crate::agent_ops_commands::agent_command(args)
+    })
 }
 
 fn run_step_command(args: StepRefArgs) -> Result<String, CliError> {
@@ -1364,6 +1383,29 @@ impl Default for ImportOptions {
 
 pub(crate) fn last_value<T>(mut values: Vec<T>) -> Option<T> {
     values.pop()
+}
+
+pub(crate) fn run_config_from_container_args(
+    container_engine: Vec<String>,
+    container_runner: Vec<PathBuf>,
+) -> Result<RunConfig, CliError> {
+    let engine = last_value(container_engine);
+    let runner = last_value(container_runner);
+    if engine.is_none() && runner.is_none() {
+        return Ok(RunConfig::default());
+    }
+    let kind = match engine.as_deref().unwrap_or("docker") {
+        "docker" => ContainerEngineKind::Docker,
+        "podman" => ContainerEngineKind::Podman,
+        other => {
+            return Err(CliError::InvalidArgument(format!(
+                "unsupported --container-engine {other}; expected docker or podman"
+            )));
+        }
+    };
+    Ok(RunConfig {
+        container_engine: Some(ContainerEngineSelection { kind, runner }),
+    })
 }
 
 pub(crate) fn project_path_from_only(args: PathOnlyArgs) -> Result<PathBuf, CliError> {
@@ -4980,6 +5022,41 @@ runtime:
         assert!(rerun.message().contains("run-step supports draft"));
 
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn run_and_agent_run_reject_unknown_container_engine() {
+        let run_err = run(args(&[
+            "agentflow",
+            "run",
+            "marker_demo",
+            "--container-engine",
+            "singularity",
+        ]))
+        .unwrap_err();
+        assert!(
+            run_err
+                .message()
+                .contains("unsupported --container-engine singularity"),
+            "{}",
+            run_err.message()
+        );
+
+        let agent_run_err = run(args(&[
+            "agentflow",
+            "agent",
+            "run",
+            "--container-engine",
+            "singularity",
+        ]))
+        .unwrap_err();
+        assert!(
+            agent_run_err
+                .message()
+                .contains("unsupported --container-engine singularity"),
+            "{}",
+            agent_run_err.message()
+        );
     }
 
     #[test]

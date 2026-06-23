@@ -131,6 +131,52 @@ impl ToolExecutionBackend for IsolatedMicromambaBackend {
     }
 }
 
+pub(super) trait ContainerEngine {
+    fn build(
+        &self,
+        runner: &str,
+        image: &str,
+        command: &[String],
+        ctx: &ExecContext,
+    ) -> PreparedRuntimeCommand;
+}
+
+/// Docker-compatible container runner. Podman is supported through the same
+/// CLI-compatible argv shape.
+pub(super) struct DockerEngine;
+
+impl ContainerEngine for DockerEngine {
+    fn build(
+        &self,
+        runner: &str,
+        image: &str,
+        command: &[String],
+        ctx: &ExecContext,
+    ) -> PreparedRuntimeCommand {
+        let workdir = ctx.workdir.display().to_string();
+        let mut args = vec![
+            "run".to_string(),
+            "--rm".to_string(),
+            "--network".to_string(),
+            "none".to_string(),
+            "-v".to_string(),
+            format!("{workdir}:{workdir}"),
+            "-w".to_string(),
+            workdir,
+        ];
+        for name in ctx.env_names {
+            args.push("-e".to_string());
+            args.push(name.clone());
+        }
+        args.push(image.to_string());
+        args.extend(command.iter().cloned());
+        PreparedRuntimeCommand {
+            executable: runner.to_string(),
+            args,
+        }
+    }
+}
+
 /// Runs the declared command inside a container with hard local containment.
 struct ContainerBackend;
 
@@ -148,27 +194,7 @@ impl ToolExecutionBackend for ContainerBackend {
         let image = runtime.image.as_ref().ok_or_else(|| {
             StorageError::InvalidInput("container runtime must declare image".to_string())
         })?;
-        let workdir = ctx.workdir.display().to_string();
-        let mut args = vec![
-            "run".to_string(),
-            "--rm".to_string(),
-            "--network".to_string(),
-            "none".to_string(),
-            "-v".to_string(),
-            format!("{workdir}:{workdir}"),
-            "-w".to_string(),
-            workdir,
-        ];
-        for name in ctx.env_names {
-            args.push("-e".to_string());
-            args.push(name.clone());
-        }
-        args.push(image.clone());
-        args.extend(runtime.command.iter().cloned());
-        Ok(PreparedRuntimeCommand {
-            executable: runner.clone(),
-            args,
-        })
+        Ok(DockerEngine.build(runner, image, &runtime.command, ctx))
     }
 }
 
@@ -189,5 +215,98 @@ pub(super) fn backend_for(backend: &str) -> Option<Box<dyn ToolExecutionBackend>
         "isolated-micromamba" => Some(Box::new(IsolatedMicromambaBackend)),
         "container" => Some(Box::new(ContainerBackend)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn docker_engine_builds_container_argv_byte_for_byte() {
+        let staged_inputs = BTreeMap::new();
+        let env_names = vec![
+            "AGENTFLOW_WORKDIR".to_string(),
+            "AGENTFLOW_INPUT_READS".to_string(),
+            "AGENTFLOW_PARAMS_JSON".to_string(),
+            "AGENTFLOW_OUTPUT_REPORT".to_string(),
+        ];
+        let ctx = ExecContext {
+            workdir: Path::new("/tmp/af-step-work"),
+            staged_inputs: &staged_inputs,
+            output_dir: Path::new("/tmp/af-step-work/outputs"),
+            env_names: &env_names,
+        };
+        let command = vec![
+            "python".to_string(),
+            "tool.py".to_string(),
+            "--mode".to_string(),
+            "strict".to_string(),
+        ];
+
+        let prepared = DockerEngine.build(
+            "/usr/bin/docker",
+            "ghcr.io/acme/tool@sha256:0123456789abcdef",
+            &command,
+            &ctx,
+        );
+
+        assert_eq!(prepared.executable, "/usr/bin/docker");
+        assert_eq!(
+            prepared.args,
+            vec![
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "-v",
+                "/tmp/af-step-work:/tmp/af-step-work",
+                "-w",
+                "/tmp/af-step-work",
+                "-e",
+                "AGENTFLOW_WORKDIR",
+                "-e",
+                "AGENTFLOW_INPUT_READS",
+                "-e",
+                "AGENTFLOW_PARAMS_JSON",
+                "-e",
+                "AGENTFLOW_OUTPUT_REPORT",
+                "ghcr.io/acme/tool@sha256:0123456789abcdef",
+                "python",
+                "tool.py",
+                "--mode",
+                "strict",
+            ]
+        );
+        assert_eq!(
+            prepared.argv(),
+            vec![
+                "/usr/bin/docker",
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "-v",
+                "/tmp/af-step-work:/tmp/af-step-work",
+                "-w",
+                "/tmp/af-step-work",
+                "-e",
+                "AGENTFLOW_WORKDIR",
+                "-e",
+                "AGENTFLOW_INPUT_READS",
+                "-e",
+                "AGENTFLOW_PARAMS_JSON",
+                "-e",
+                "AGENTFLOW_OUTPUT_REPORT",
+                "ghcr.io/acme/tool@sha256:0123456789abcdef",
+                "python",
+                "tool.py",
+                "--mode",
+                "strict",
+            ]
+        );
     }
 }

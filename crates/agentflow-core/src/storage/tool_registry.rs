@@ -1670,16 +1670,13 @@ fn validate_runtime_backend(runtime: &ToolRuntimeSpec) -> Result<(), StorageErro
                         .to_string(),
                 ));
             }
-            let runner = runtime.runner.as_deref().ok_or_else(|| {
-                StorageError::InvalidInput(
-                    "container runtime must declare absolute runner path".to_string(),
-                )
-            })?;
-            validate_runtime_path("runtime.runner", runner)?;
-            if !Path::new(runner).is_absolute() {
-                return Err(StorageError::InvalidInput(
-                    "runtime.runner must be an absolute executable path".to_string(),
-                ));
+            if let Some(runner) = runtime.runner.as_deref() {
+                validate_runtime_path("runtime.runner", runner)?;
+                if !Path::new(runner).is_absolute() {
+                    return Err(StorageError::InvalidInput(
+                        "runtime.runner must be an absolute executable path".to_string(),
+                    ));
+                }
             }
             runtime.image.as_deref().ok_or_else(|| {
                 StorageError::InvalidInput("container runtime must declare image".to_string())
@@ -2379,7 +2376,7 @@ runtime:
     }
 
     #[test]
-    fn rejects_container_runtime_without_image_or_runner() {
+    fn rejects_container_runtime_without_image_but_allows_image_only_runner_optional() {
         let missing_image = ToolSpec::from_simple_yaml(
             r#"
 schema_version: agentflow.tool.v0
@@ -2400,13 +2397,15 @@ runtime:
         .unwrap_err();
         assert!(missing_image.to_string().contains("image"));
 
-        let missing_runner = ToolSpec::from_simple_yaml(
+        // MC.3 deliberately moves containers to a Nextflow-style model: each
+        // tool declares a stable image, while engine+runner come from the run profile.
+        let image_only = ToolSpec::from_simple_yaml(
             r#"
 schema_version: agentflow.tool.v0
-name: bad_container
+name: image_only_container
 version: 0.1.0
 maturity: wrapped
-description: bad
+description: Image-only container tool
 outputs:
   report:
     type: Markdown
@@ -2417,8 +2416,34 @@ runtime:
     - python
 "#,
         )
+        .unwrap();
+        assert_eq!(image_only.runtime.backend, "container");
+        assert!(image_only.runtime.runner.is_none());
+        assert_eq!(
+            image_only.runtime.image.as_deref(),
+            Some("ghcr.io/acme/tool@sha256:0123456789abcdef")
+        );
+
+        let relative_runner = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: relative_runner_container
+version: 0.1.0
+maturity: wrapped
+description: bad
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: container
+  runner: docker
+  image: ghcr.io/acme/tool@sha256:0123456789abcdef
+  command:
+    - python
+"#,
+        )
         .unwrap_err();
-        assert!(missing_runner.to_string().contains("runner"));
+        assert!(relative_runner.to_string().contains("absolute"));
     }
 
     #[test]
@@ -3146,6 +3171,7 @@ runtime:
         let store = ProjectStore::init(&path, Some("Tools")).unwrap();
 
         for file_name in [
+            "container_text_filter.tool.yaml",
             "local_survival_assoc.tool.yaml",
             "marker_survival_scan.tool.yaml",
             "tcga_survival_assoc.tool.yaml",
@@ -3155,7 +3181,7 @@ runtime:
                 .unwrap();
         }
 
-        assert_eq!(store.list_tools().unwrap().len(), 3);
+        assert_eq!(store.list_tools().unwrap().len(), 4);
 
         let _ = std::fs::remove_dir_all(path);
     }

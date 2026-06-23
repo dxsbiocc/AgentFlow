@@ -227,7 +227,7 @@ impl ToolExecutionBackend for ContainerBackend {
             Some(runner) => runner,
             None => runtime.runner.as_deref().ok_or_else(|| {
                 StorageError::InvalidInput(
-                    "container runtime must declare absolute runner path".to_string(),
+                    "container runtime must declare runner; pass --container-runner or declare runtime.runner".to_string(),
                 )
             })?,
         };
@@ -409,6 +409,36 @@ mod tests {
                 "tool.py",
             ]
         );
+    }
+
+    #[test]
+    fn container_backend_missing_runner_points_to_run_override_or_runtime_runner() {
+        let runtime = ToolRuntimeSpec {
+            backend: "container".to_string(),
+            command: vec!["python".to_string(), "tool.py".to_string()],
+            timeout_seconds: None,
+            env_name: None,
+            env_prefix: None,
+            env_file: None,
+            runner: None,
+            image: Some("ghcr.io/acme/tool:1".to_string()),
+        };
+        let staged_inputs = BTreeMap::new();
+        let ctx = ExecContext {
+            workdir: Path::new("/tmp/af-step-work"),
+            staged_inputs: &staged_inputs,
+            output_dir: Path::new("/tmp/af-step-work/outputs"),
+            env_names: &[],
+            container_engine: None,
+        };
+
+        let err = ContainerBackend
+            .prepare_command(&runtime, &ctx)
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("pass --container-runner or declare runtime.runner"));
     }
 
     #[test]

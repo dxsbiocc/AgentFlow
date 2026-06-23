@@ -251,10 +251,17 @@ agentflow run <flow-id> --container-engine singularity --container-runner /usr/b
 这只是模型示例:实际运行需要主机上有真实 engine,且工具 `image` 引用能被所选 engine 解析。
 本仓库当前没有对 Docker/Podman/Singularity/Apptainer 做 live 验证。
 
-**验证状态(诚实)**:容器后端目前**仅由离线 argv 断言测试覆盖**(证明命令行构造正确),
-**尚未对真实 Docker daemon 跑过**。真实 daemon 验证(确认 `--network none` 真封网、workdir-only
-真隔离、自包含镜像工具能跑通)需要一个 Docker 主机,属后续切片;在那之前,不宣称容器后端已
-"生产就绪"的反篡改隔离,只能说命令构造正确、模型设计到位。
+**验证状态(诚实,按后端分别标注)**:
+
+- **`isolated-micromamba`:已 live 验证(2026-06-23,macOS arm64,micromamba 2.1.1)。** 一次真实
+  run 自行跑通了:从 `env_file` 真 solve 出受管 env、内容寻址到 `.agentflow/envs/<tool>@<lockhash>/`、
+  写出 `agentflow-env.lock`、工具实际执行**受管 env 内的二进制**(隔离真实生效)、产出正确、二次
+  run 命中缓存不重 solve。不再是 fake-provisioner-only。仍诚实:只在该单一平台/单一小 env 上验过,
+  不同 channel/大型 solve/跨平台锁的鲁棒性仍随用随证。
+- **`container`(docker/podman/singularity/apptainer):仍仅由离线 argv 断言测试覆盖**(证明命令行
+  构造正确),**尚未对真实 daemon/HPC 主机跑过**。真实验证(确认 `--network none` 真封网、
+  workdir-only 真隔离、自包含镜像工具能跑通)需要一个 Docker/HPC 主机,属后续;在那之前不宣称容器
+  后端已"生产就绪"的反篡改隔离,只能说命令构造正确、模型设计到位。
 
 ### 6.7 部署级出网封堵配方
 

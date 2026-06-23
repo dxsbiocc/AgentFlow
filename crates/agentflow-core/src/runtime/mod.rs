@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -26,6 +27,48 @@ use schedule::{RuleBasedStepScheduler, StepScheduler};
 
 const ISOLATED_ENV_BACKEND: &str = "isolated-micromamba";
 const ISOLATED_ENV_LOCK_FILE: &str = "agentflow-env.lock";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerEngineKind {
+    Docker,
+    Podman,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerEngineSelection {
+    pub kind: ContainerEngineKind,
+    pub runner: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RunConfig {
+    pub container_engine: Option<ContainerEngineSelection>,
+}
+
+thread_local! {
+    static SCOPED_RUN_CONFIG: RefCell<Option<RunConfig>> = const { RefCell::new(None) };
+}
+
+pub fn with_run_config<T>(config: &RunConfig, run: impl FnOnce() -> T) -> T {
+    struct ScopedRunConfigGuard(Option<RunConfig>);
+
+    impl Drop for ScopedRunConfigGuard {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            SCOPED_RUN_CONFIG.with(|slot| {
+                *slot.borrow_mut() = previous;
+            });
+        }
+    }
+
+    let previous = SCOPED_RUN_CONFIG.with(|slot| slot.replace(Some(config.clone())));
+    let _guard = ScopedRunConfigGuard(previous);
+    run()
+}
+
+fn scoped_run_config() -> Option<RunConfig> {
+    SCOPED_RUN_CONFIG.with(|slot| slot.borrow().clone())
+}
 
 pub const PYTHON_EGRESS_GUARD_SITECUSTOMIZE: &str = r#"import ipaddress
 import socket
@@ -626,6 +669,14 @@ impl ProjectStore {
     }
 
     pub fn run_flow(&self, flow_id: &str) -> Result<FlowRunSummary, StorageError> {
+        self.run_flow_with(flow_id, &RunConfig::default())
+    }
+
+    pub fn run_flow_with(
+        &self,
+        flow_id: &str,
+        config: &RunConfig,
+    ) -> Result<FlowRunSummary, StorageError> {
         if self.inspect_flow(flow_id)?.status != "approved" {
             return Err(StorageError::InvalidInput(format!(
                 "flow {flow_id} must be approved before run"
@@ -649,7 +700,7 @@ impl ProjectStore {
 
             let mut progressed = false;
             for step in ready {
-                let attempt = self.run_step(flow_id, &step)?;
+                let attempt = self.run_step(flow_id, &step, config)?;
                 match attempt.status.as_str() {
                     "succeeded" | "cache_hit" => {
                         completed.insert(attempt.step_id.clone());
@@ -806,6 +857,14 @@ impl ProjectStore {
     }
 
     pub fn run_step_ref(&self, step_ref: &str) -> Result<FlowRunSummary, StorageError> {
+        let scoped_config = scoped_run_config();
+        let default_config;
+        let config = if let Some(config) = scoped_config.as_ref() {
+            config
+        } else {
+            default_config = RunConfig::default();
+            &default_config
+        };
         let (flow_id, step_local_id) = self.resolve_step_ref(step_ref)?;
         let flow = self.inspect_flow(&flow_id)?;
         if flow.status != "approved" {
@@ -831,7 +890,7 @@ impl ProjectStore {
         }
         ensure_step_dependencies_completed(&flow.steps, &flow.edges, step)?;
 
-        let attempt = self.run_step(&flow_id, step)?;
+        let attempt = self.run_step(&flow_id, step, config)?;
         let completed_steps =
             usize::from(matches!(attempt.status.as_str(), "succeeded" | "cache_hit"));
         let failed_steps = usize::from(completed_steps == 0);
@@ -1028,6 +1087,7 @@ impl ProjectStore {
         &self,
         flow_id: &str,
         step: &StoredFlowStep,
+        config: &RunConfig,
     ) -> Result<AttemptSummary, StorageError> {
         let tool_ref = step.tool_ref.as_deref().ok_or_else(|| {
             StorageError::InvalidInput(format!("step {} has no tool_ref", step.id))
@@ -1077,6 +1137,7 @@ impl ProjectStore {
             staged_inputs: &resolved_input_paths,
             output_dir: resolved_outputs.root(),
             env_names: &agentflow_env_names,
+            container_engine: config.container_engine.as_ref(),
         };
 
         let mut prepared_command =
@@ -3426,6 +3487,7 @@ mod tests {
             staged_inputs,
             output_dir: Path::new("/tmp/agentflow-test-workdir/outputs"),
             env_names: &[],
+            container_engine: None,
         }
     }
 
@@ -3936,6 +3998,7 @@ steps:
             staged_inputs: &first_inputs,
             output_dir: Path::new("/tmp/af-work-a/outputs"),
             env_names: &[],
+            container_engine: None,
         };
         let mut second_inputs = BTreeMap::new();
         second_inputs.insert(
@@ -3947,6 +4010,7 @@ steps:
             staged_inputs: &second_inputs,
             output_dir: Path::new("/tmp/af-work-b/outputs"),
             env_names: &[],
+            container_engine: None,
         };
 
         assert_eq!(
@@ -4001,6 +4065,7 @@ steps:
             staged_inputs: &staged_inputs,
             output_dir: Path::new("/tmp/af-step-work/outputs"),
             env_names: &env_names,
+            container_engine: None,
         };
 
         let prepared = prepare_runtime_command(&runtime, &ctx).unwrap();
@@ -4037,6 +4102,69 @@ steps:
             runtime.command.as_slice()
         );
         assert!(backend::backend_for("container").is_some());
+    }
+
+    #[test]
+    fn container_engine_selection_does_not_change_runtime_config_or_cache_key() {
+        let runtime = ToolRuntimeSpec {
+            backend: "container".to_string(),
+            command: vec!["python".to_string(), "run.py".to_string()],
+            timeout_seconds: None,
+            env_name: None,
+            env_prefix: None,
+            env_file: None,
+            runner: Some("/usr/bin/docker".to_string()),
+            image: Some("ghcr.io/acme/tool@sha256:0123456789abcdef".to_string()),
+        };
+        let docker_selection = ContainerEngineSelection {
+            kind: ContainerEngineKind::Docker,
+            runner: Some(PathBuf::from("/custom/docker")),
+        };
+        let podman_selection = ContainerEngineSelection {
+            kind: ContainerEngineKind::Podman,
+            runner: Some(PathBuf::from("/custom/podman")),
+        };
+        let staged_inputs = BTreeMap::new();
+        let docker_ctx = backend::ExecContext {
+            workdir: Path::new("/tmp/af-step-work"),
+            staged_inputs: &staged_inputs,
+            output_dir: Path::new("/tmp/af-step-work/outputs"),
+            env_names: &[],
+            container_engine: Some(&docker_selection),
+        };
+        let podman_ctx = backend::ExecContext {
+            workdir: Path::new("/tmp/af-step-work"),
+            staged_inputs: &staged_inputs,
+            output_dir: Path::new("/tmp/af-step-work/outputs"),
+            env_names: &[],
+            container_engine: Some(&podman_selection),
+        };
+
+        let docker_command = prepare_runtime_command(&runtime, &docker_ctx).unwrap();
+        let podman_command = prepare_runtime_command(&runtime, &podman_ctx).unwrap();
+        let runtime_json = runtime_config_json(&runtime).unwrap();
+        let runtime_hash = stable_hash(&runtime_json);
+        let docker_cache_key = compute_cache_key(
+            "analysis/tool",
+            "0.1.0",
+            "{}",
+            &stable_hash("{}"),
+            &runtime_hash,
+        );
+        let podman_cache_key = compute_cache_key(
+            "analysis/tool",
+            "0.1.0",
+            "{}",
+            &stable_hash("{}"),
+            &runtime_hash,
+        );
+
+        assert_eq!(docker_command.executable, "/custom/docker");
+        assert_eq!(podman_command.executable, "/custom/podman");
+        assert_eq!(docker_command.args, podman_command.args);
+        assert!(!runtime_json.contains("Docker"));
+        assert!(!runtime_json.contains("Podman"));
+        assert_eq!(docker_cache_key, podman_cache_key);
     }
 
     #[test]

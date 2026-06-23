@@ -110,6 +110,10 @@ pub(crate) struct PathJsonArgs {
 pub(crate) struct RunArgs {
     #[arg(value_name = "flow-id")]
     pub(crate) flow_id: String,
+    #[arg(long, value_name = "docker|podman")]
+    pub(crate) container_engine: Vec<String>,
+    #[arg(long, value_name = "path")]
+    pub(crate) container_runner: Vec<PathBuf>,
     #[command(flatten)]
     pub(crate) project: PathOnlyArgs,
 }
@@ -576,6 +580,10 @@ pub(crate) struct VerdictShowArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct AgentArgs {
+    #[arg(long, global = true, value_name = "docker|podman")]
+    pub(crate) container_engine: Vec<String>,
+    #[arg(long, global = true, value_name = "path")]
+    pub(crate) container_runner: Vec<PathBuf>,
     #[command(subcommand)]
     pub(crate) command: AgentCommand,
 }
@@ -962,7 +970,7 @@ fn dispatch(cli: Cli) -> Result<String, CliError> {
         TopCommand::Observe(args) => crate::observe_command(args),
         TopCommand::Observations(args) => crate::observations_command(args),
         TopCommand::Research(args) => crate::research_command(args),
-        TopCommand::Agent(args) => crate::agent_ops_commands::agent_command(args),
+        TopCommand::Agent(args) => crate::agent_command(args),
         TopCommand::Hypothesis(args) => crate::agent_commands::hypothesis_command(args),
         TopCommand::Evidence(args) => crate::agent_commands::evidence_command(args),
         TopCommand::Verdict(args) => crate::agent_commands::verdict_command(args),

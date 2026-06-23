@@ -7,6 +7,47 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-23
+
+Nextflow-style multi-engine container execution, plus the first real-runtime
+validation of the isolated and container backends.
+
+### Added — Multi-engine containers
+
+The container engine is now decoupled from the tool: a tool declares only a
+stable `image`, and each run chooses the engine. See
+[docs/design/multi-engine-container-design.md](docs/design/multi-engine-container-design.md).
+
+- **Engine seam + selection:** a `ContainerEngine` abstraction (`DockerEngine`,
+  `SingularityEngine`) chosen per run via `run`/`agent run`
+  `--container-engine docker|podman|singularity|apptainer` and
+  `--container-runner <path>` (default docker). Podman reuses the Docker
+  CLI-compatible argv; Singularity runs `exec --containall --net --network none
+  -B <wd>:<wd> --pwd <wd>` with env forwarded via `SINGULARITYENV_*`.
+- **Image-only tools:** container tools declare just `image`; the engine and
+  runner come from the run profile.
+- **Engine is not in the cache key:** the same image under docker/podman/
+  singularity yields identical run identity — the engine only changes *where* a
+  tool runs, not *what* it produces.
+
+### Fixed
+
+- **Container input staging:** container backends now stage declared inputs as
+  real file copies, not symlinks. A symlink would point into the artifact store,
+  which is outside the container's workdir-only mount, leaving a dangling link
+  inside the container. Found by the live Docker validation below.
+
+### Validated (live)
+
+- **`isolated-micromamba` — live-proven:** a real run solves a managed env from
+  `env_file`, content-addresses + locks it, executes the tool against the env's
+  own binaries (real isolation), and reuses it on a second run.
+- **`container` + docker — live-proven:** a real `--container-engine docker` run
+  executes an image-only tool inside the container with `--network none` and a
+  workdir-only mount, producing correct output with full artifact lineage.
+- podman/singularity engines remain offline-argv-tested (no local host); see
+  `docs/CAPABILITIES.md` §6.6.
+
 ## [0.2.0] - 2026-06-22
 
 First cut of the execution engine: per-tool isolation, agent-driven composition

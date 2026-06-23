@@ -1122,7 +1122,10 @@ impl ProjectStore {
         let workdir = project_dir(self.root_path()).join("work").join(&attempt_id);
         fs::create_dir_all(&workdir)?;
         let workdir = fs::canonicalize(&workdir)?;
-        let resolved_input_paths = input_paths(&resolved_inputs, &workdir)?;
+        // Container backends mount only the workdir; staged inputs must be real
+        // copies, not symlinks into the (unmounted) artifact store.
+        let stage_inputs_by_copy = tool.runtime.backend == "container";
+        let resolved_input_paths = input_paths(&resolved_inputs, &workdir, stage_inputs_by_copy)?;
         let stdout_path = workdir.join("stdout.log");
         let stderr_path = workdir.join("stderr.log");
         let resolved_outputs = output_paths(&workdir, &outputs);
@@ -1993,13 +1996,14 @@ fn output_paths(workdir: &Path, outputs: &BTreeMap<String, String>) -> OutputPat
 fn input_paths(
     inputs: &BTreeMap<String, ResolvedInput>,
     workdir: &Path,
+    force_copy: bool,
 ) -> Result<BTreeMap<String, PathBuf>, StorageError> {
     let inputs_root = workdir.join("inputs");
     fs::create_dir_all(&inputs_root)?;
     inputs
         .iter()
         .map(|(name, input)| {
-            stage_input_path(&input.path, &inputs_root, name)
+            stage_input_path(&input.path, &inputs_root, name, force_copy)
                 .map(|staged_path| (name.clone(), staged_path))
         })
         .collect()
@@ -2009,8 +2013,21 @@ fn stage_input_path(
     source_path: &Path,
     inputs_root: &Path,
     port_name: &str,
+    force_copy: bool,
 ) -> Result<PathBuf, StorageError> {
-    stage_input_path_with_linker(source_path, inputs_root, port_name, create_input_symlink)
+    // Container backends mount only the per-step workdir, so a symlink into the
+    // artifact store (outside the mount) would dangle inside the container.
+    // Stage real file copies for them; other backends keep the lighter symlink
+    // (with copy fallback) logical boundary.
+    if force_copy {
+        stage_input_path_with_linker(source_path, inputs_root, port_name, copy_input_file)
+    } else {
+        stage_input_path_with_linker(source_path, inputs_root, port_name, create_input_symlink)
+    }
+}
+
+fn copy_input_file(source_path: &Path, staged_path: &Path) -> io::Result<()> {
+    fs::copy(source_path, staged_path).map(|_| ())
 }
 
 fn stage_input_path_with_linker<F>(
@@ -5046,6 +5063,47 @@ steps:
             .unwrap()
             .file_type()
             .is_symlink());
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn stage_input_path_force_copy_produces_real_file_not_symlink() {
+        // Container backends mount only the workdir; a symlink into the artifact
+        // store would dangle inside the container. force_copy must stage a real
+        // file copy so it is readable through the workdir mount.
+        let path = temp_project_path("input-staging-force-copy");
+        fs::create_dir_all(&path).unwrap();
+        let source_path = path.join("source.tsv");
+        fs::write(&source_path, "sample\tvalue\nA\t1\n").unwrap();
+        let inputs_root = path.join("work").join("inputs");
+
+        let staged_path =
+            stage_input_path(&source_path, &inputs_root, "source_table", true).unwrap();
+
+        assert_eq!(
+            fs::read(&staged_path).unwrap(),
+            fs::read(&source_path).unwrap()
+        );
+        #[cfg(unix)]
+        assert!(
+            !fs::symlink_metadata(&staged_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "container staging must be a real copy, not a symlink"
+        );
+
+        // Without force_copy the default symlink boundary is used (unix).
+        #[cfg(unix)]
+        {
+            let staged_symlink =
+                stage_input_path(&source_path, &inputs_root, "linked_table", false).unwrap();
+            assert!(fs::symlink_metadata(&staged_symlink)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
 
         let _ = fs::remove_dir_all(path);
     }

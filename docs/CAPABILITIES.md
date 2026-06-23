@@ -258,10 +258,16 @@ agentflow run <flow-id> --container-engine singularity --container-runner /usr/b
   写出 `agentflow-env.lock`、工具实际执行**受管 env 内的二进制**(隔离真实生效)、产出正确、二次
   run 命中缓存不重 solve。不再是 fake-provisioner-only。仍诚实:只在该单一平台/单一小 env 上验过,
   不同 channel/大型 solve/跨平台锁的鲁棒性仍随用随证。
-- **`container`(docker/podman/singularity/apptainer):仍仅由离线 argv 断言测试覆盖**(证明命令行
-  构造正确),**尚未对真实 daemon/HPC 主机跑过**。真实验证(确认 `--network none` 真封网、
-  workdir-only 真隔离、自包含镜像工具能跑通)需要一个 Docker/HPC 主机,属后续;在那之前不宣称容器
-  后端已"生产就绪"的反篡改隔离,只能说命令构造正确、模型设计到位。
+- **`container` — docker 引擎已 live 验证(2026-06-23,macOS,Docker 29.3.1)。** 一个 image-only
+  容器工具(`backend: container` + `image: alpine:3.20`)经 `run --container-engine docker` 真跑通:
+  AgentFlow 构造的 `docker run --rm --network none -v <wd>:<wd> -w <wd> -e AGENTFLOW_* alpine awk ...`
+  在容器内执行、`--network none` 无网、只挂 workdir、`-e` 转发 `AGENTFLOW_*`、产出正确、computed
+  工件谱系完整。**这次 live 测试发现并修复了一个真实 bug**:P1.3 默认 symlink stage input,而 symlink
+  目标(artifact store)在 workdir mount 之外 → 容器内悬空。修复:容器后端改为**拷贝** stage input
+  到 workdir(真实文件,经 mount 可读)。
+- **`container` — podman / singularity / apptainer 仍仅离线 argv 测试**,未对真实 daemon/HPC 跑过
+  (本机无 podman/singularity)。docker 引擎的 live 结果给了这套模型很强的信心,但 singularity 的
+  `--containall`/`SINGULARITYENV_` 路径仍待 HPC host 实测。不在那之前宣称全引擎"生产就绪"。
 
 ### 6.7 部署级出网封堵配方
 

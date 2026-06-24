@@ -1071,9 +1071,13 @@ fn apply_semantic_relevance_to_candidates(
     }
 
     if changed {
+        // Preserve the answer-priority tier (answer tools ahead of intermediate
+        // producers) that match_tools established, before fit/score ordering.
         candidates.sort_by(|left, right| {
-            fit_rank(right.fit)
-                .cmp(&fit_rank(left.fit))
+            right
+                .answer_priority
+                .cmp(&left.answer_priority)
+                .then_with(|| fit_rank(right.fit).cmp(&fit_rank(left.fit)))
                 .then_with(|| right.score.cmp(&left.score))
                 .then_with(|| left.tool_ref.cmp(&right.tool_ref))
         });
@@ -6644,12 +6648,14 @@ steps:
                 fit: Fit::Medium,
                 score: 8,
                 reason: "keyword:name:thrsp, relevance:keyword".to_string(),
+                answer_priority: false,
             },
             ToolCandidate {
                 tool_ref: "analysis/fallback_low".to_string(),
                 fit: Fit::Low,
                 score: 20,
                 reason: "maturity:verified".to_string(),
+                answer_priority: false,
             },
         ];
 
@@ -6953,6 +6959,7 @@ steps:
             fit: Fit::High,
             score: 1,
             reason: "io:exact".to_string(),
+            answer_priority: false,
         }];
 
         let promoted = super::apply_semantic_relevance_to_candidates(
@@ -6989,24 +6996,28 @@ steps:
                 fit: Fit::Low,
                 score: 8,
                 reason: "candidate one".to_string(),
+                answer_priority: false,
             },
             ToolCandidate {
                 tool_ref: "analysis/low_two".to_string(),
                 fit: Fit::Low,
                 score: 7,
                 reason: "candidate two".to_string(),
+                answer_priority: false,
             },
             ToolCandidate {
                 tool_ref: "analysis/low_three".to_string(),
                 fit: Fit::Low,
                 score: 6,
                 reason: "candidate three".to_string(),
+                answer_priority: false,
             },
             ToolCandidate {
                 tool_ref: "analysis/outside_target".to_string(),
                 fit: Fit::Low,
                 score: 5,
                 reason: "candidate four".to_string(),
+                answer_priority: false,
             },
         ];
 
@@ -7028,6 +7039,52 @@ steps:
             ]
         );
         assert_eq!(candidates[3].fit, Fit::Low);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn semantic_resort_preserves_answer_priority_over_higher_scoring_producer() {
+        let (path, store) = init_project("semantic-answer-priority");
+        register_semantic_tool(&store, "answer_tool", "verified", "answer tool", &[]);
+        register_semantic_tool(&store, "producer_tool", "verified", "producer tool", &[]);
+        let scorer = StubRelevanceScorer::always(Some(true));
+        let mut candidates = vec![
+            // The answer tool yields an observation but is only a Low-fit, low-score
+            // match; the semantic scorer promotes it (Low -> Medium), forcing a re-sort.
+            ToolCandidate {
+                tool_ref: "analysis/answer_tool".to_string(),
+                fit: Fit::Low,
+                score: 1,
+                reason: "produces:observation".to_string(),
+                answer_priority: true,
+            },
+            // A keyword-heavy intermediate producer: much higher score, not an answer.
+            ToolCandidate {
+                tool_ref: "analysis/producer_tool".to_string(),
+                fit: Fit::Medium,
+                score: 50,
+                reason: "input:counts:RawCounts".to_string(),
+                answer_priority: false,
+            },
+        ];
+
+        let changed = super::apply_semantic_relevance_to_candidates(
+            &store,
+            &mut candidates,
+            "THRSP survival mechanism needs validation",
+            &scorer,
+        )
+        .unwrap();
+
+        assert!(
+            changed,
+            "promoting the Low answer tool should trigger the re-sort"
+        );
+        assert_eq!(
+            candidates[0].tool_ref, "analysis/answer_tool",
+            "the answer tool must stay first after the semantic re-sort, despite the producer's higher score"
+        );
 
         let _ = std::fs::remove_dir_all(path);
     }

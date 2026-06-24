@@ -41,6 +41,11 @@ pub struct ToolCandidate {
     pub fit: Fit,
     pub score: i32,
     pub reason: String,
+    /// True when this was matched for an "answer this hypothesis" query
+    /// (no desired output type) and the tool yields an observation. Such answer
+    /// tools sort strictly ahead of intermediate producers; carried on the
+    /// candidate so later re-sorts (e.g. semantic relevance) preserve the tier.
+    pub answer_priority: bool,
 }
 
 impl ProjectStore {
@@ -117,6 +122,22 @@ impl ProjectStore {
                 }
             }
 
+            // For an "answer this hypothesis" query (no specific desired output
+            // type), a tool that yields an observation (an output port with an
+            // observer) is an answer; a pure intermediate producer is not. Answer
+            // tools are ranked strictly ahead of non-answer tools below, so a
+            // keyword-heavy producer cannot win the top branch slot — it can only
+            // be chained in as a prerequisite. Producer searches
+            // (desired_output_type set) are unaffected, and fit never changes.
+            let answer_priority = query.desired_output_type.is_none()
+                && executable
+                    .outputs
+                    .values()
+                    .any(|output| output.observer.is_some());
+            if answer_priority {
+                reasons.push("produces:observation".to_string());
+            }
+
             let required_count = required_inputs.len();
             let all_required_inputs_satisfied = satisfied_required_inputs == required_count;
             let majority_required_inputs_satisfied =
@@ -145,13 +166,15 @@ impl ProjectStore {
                 fit,
                 score,
                 reason: reason_text(reasons),
+                answer_priority,
             });
         }
 
         candidates.sort_by(|left, right| {
             right
-                .score
-                .cmp(&left.score)
+                .answer_priority
+                .cmp(&left.answer_priority)
+                .then_with(|| right.score.cmp(&left.score))
                 .then_with(|| left.tool_ref.cmp(&right.tool_ref))
         });
         Ok(candidates)
@@ -398,6 +421,85 @@ runtime:
             .unwrap()
             .summary
             .id
+    }
+
+    #[test]
+    fn answer_tool_outranks_keyword_heavy_producer_for_hypothesis_query() {
+        let (path, store) = init_store("answer-priority");
+
+        // A producer stuffed with the query keywords, yielding only an
+        // intermediate ExpressionTable (no observer on its output).
+        register_tool(
+            &store,
+            &tool_yaml(
+                "local",
+                "keyword_prep",
+                "verified",
+                "Prepare gene expression for survival association over the imported cohort.",
+                &one_required_input("counts", "RawCounts"),
+                no_params(),
+                "  expression:\n    type: ExpressionTable\n",
+            ),
+        );
+        // An answer tool: fewer keyword hits, but its output yields an observation.
+        register_tool(
+            &store,
+            &tool_yaml(
+                "local",
+                "assoc",
+                "verified",
+                "Association report.",
+                &one_required_input("expression", "ExpressionTable"),
+                no_params(),
+                "  report:\n    type: Markdown\n    observer: marker_report\n",
+            ),
+        );
+
+        // "Answer this hypothesis" query (no desired output type): the answer tool
+        // must win the top slot even though the producer scores higher.
+        let answer_query = CapabilityQuery {
+            desired_output_type: None,
+            available_input_types: vec!["RawCounts".to_string()],
+            keywords: vec![
+                "expression".to_string(),
+                "survival".to_string(),
+                "association".to_string(),
+                "imported".to_string(),
+                "cohort".to_string(),
+            ],
+        };
+        let ranked = store.match_tools(&answer_query).unwrap();
+        assert_eq!(
+            ranked[0].tool_ref, "local/assoc",
+            "the observation-yielding tool must win the top answer slot"
+        );
+        let prep = ranked
+            .iter()
+            .find(|candidate| candidate.tool_ref == "local/keyword_prep")
+            .unwrap();
+        let assoc = ranked
+            .iter()
+            .find(|candidate| candidate.tool_ref == "local/assoc")
+            .unwrap();
+        assert!(
+            prep.score > assoc.score,
+            "the producer is keyword-heavier (higher score) yet ranked below the answer tool"
+        );
+
+        // A producer search (desired output type set) must be unaffected — the
+        // producer still wins, so backward-chaining still finds it.
+        let producer_query = CapabilityQuery {
+            desired_output_type: Some("ExpressionTable".to_string()),
+            available_input_types: vec!["RawCounts".to_string()],
+            keywords: Vec::new(),
+        };
+        let ranked = store.match_tools(&producer_query).unwrap();
+        assert_eq!(
+            ranked[0].tool_ref, "local/keyword_prep",
+            "producer search must still pick the producer"
+        );
+
+        let _ = fs::remove_dir_all(path);
     }
 
     #[test]

@@ -2008,7 +2008,7 @@ fn inferred_param_warning(params: &[(String, String)]) -> String {
         .map(|(name, value)| format!("{name}={value}"))
         .collect::<Vec<_>>()
         .join(",");
-    format!("⚠ 该结果依赖 LLM 推断的未确认参数：{params}（请人工确认参数正确再据此判定立场）")
+    format!("⚠ 该结果依赖推断的未确认参数：{params}（请人工确认参数正确再据此判定立场）")
 }
 
 fn auto_synth_warning(tool_ref: &str) -> String {
@@ -2226,6 +2226,15 @@ fn infer_replace_params(
                             )
                         },
                     )?
+                })
+                .or_else(|| {
+                    // Deterministic, 0-LLM fallback: a param declared `infer: gene`
+                    // is filled with a gene symbol extracted from the hypothesis.
+                    // Like cohort inference, the value is recorded as inferred, so
+                    // the run stays grade-capped and cannot autonomously affirm.
+                    (spec.and_then(|spec| spec.infer) == Some(ParamInferKind::Gene)).then(|| {
+                        valid_inferred_param_value(infer_gene_symbol(hypothesis_statement), spec)
+                    })?
                 });
         let Some(inferred) = inferred else {
             continue;
@@ -4735,7 +4744,7 @@ steps:
         assert!(point.digest.contains(observation_id));
         assert!(point.digest.contains(statement));
         assert!(point.digest.contains(
-            "⚠ 该结果依赖 LLM 推断的未确认参数：gene=THRSP（请人工确认参数正确再据此判定立场）"
+            "⚠ 该结果依赖推断的未确认参数：gene=THRSP（请人工确认参数正确再据此判定立场）"
         ));
         assert!(report.to_json().contains("\"type\":\"flow_auto_created\""));
 
@@ -6902,6 +6911,69 @@ steps:
     }
 
     #[test]
+    fn gene_infer_param_filled_deterministically_without_llm() {
+        use super::infer_replace_params;
+        use crate::storage::{ParamInferKind, ToolParamSpec};
+        use std::collections::BTreeMap;
+
+        fn gene_spec(infer: Option<ParamInferKind>) -> BTreeMap<String, ToolParamSpec> {
+            let mut specs = BTreeMap::new();
+            specs.insert(
+                "gene".to_string(),
+                ToolParamSpec {
+                    type_name: "string".to_string(),
+                    required: true,
+                    enum_values: None,
+                    pattern: None,
+                    infer,
+                },
+            );
+            specs
+        }
+        fn step_with_replace_gene() -> ProposedStep {
+            ProposedStep {
+                id: "s".to_string(),
+                tool: "t/x".to_string(),
+                needs: vec![],
+                inputs: vec![],
+                params: vec![("gene".to_string(), "REPLACE_gene".to_string())],
+                outputs: vec![],
+            }
+        }
+
+        // Declared `infer: gene` -> filled deterministically from the statement,
+        // with no LLM inferer, and recorded as an inferred param (grade-capped).
+        let mut declared = step_with_replace_gene();
+        let inferred = infer_replace_params(
+            &mut declared,
+            "SPP1 expression associates with overall survival",
+            &NoopParamInferer,
+            &NoopCohortInferer,
+            &gene_spec(Some(ParamInferKind::Gene)),
+        );
+        assert_eq!(
+            declared.params,
+            vec![("gene".to_string(), "SPP1".to_string())]
+        );
+        assert_eq!(inferred, vec!["gene".to_string()]);
+
+        // Without the declarative hint, the placeholder is left for human/LLM.
+        let mut undeclared = step_with_replace_gene();
+        let inferred = infer_replace_params(
+            &mut undeclared,
+            "SPP1 expression associates with overall survival",
+            &NoopParamInferer,
+            &NoopCohortInferer,
+            &gene_spec(None),
+        );
+        assert_eq!(
+            undeclared.params,
+            vec![("gene".to_string(), "REPLACE_gene".to_string())]
+        );
+        assert!(inferred.is_empty());
+    }
+
+    #[test]
     fn cohort_inferer_fills_only_declared_infer_param() {
         let (declared_path, declared_store) = init_project("cohort-infer-declared");
         let declared_script = write_auto_run_segment_marker_script(&declared_path);
@@ -7092,7 +7164,7 @@ steps:
             .find(|point| point.kind == DecisionKind::StanceAssessment)
             .unwrap();
         assert!(point.digest.contains(
-            "⚠ 该结果依赖 LLM 推断的未确认参数：gene=THRSP（请人工确认参数正确再据此判定立场）"
+            "⚠ 该结果依赖推断的未确认参数：gene=THRSP（请人工确认参数正确再据此判定立场）"
         ));
         assert_eq!(point.options.len(), 3);
         assert_eq!(point.recommendation, 2);
@@ -7134,7 +7206,7 @@ steps:
             .iter()
             .find(|point| point.kind == DecisionKind::StanceAssessment)
             .unwrap();
-        assert!(!point.digest.contains("LLM 推断的未确认参数"));
+        assert!(!point.digest.contains("推断的未确认参数"));
         assert_eq!(
             store
                 .inferred_params_for_step("auto_flow", "step_marker_deepen")

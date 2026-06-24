@@ -20,6 +20,10 @@ params:
   gene:
     type: string
     required: true
+    # Deterministic param inference: the autonomous loop fills `gene` with a gene
+    # symbol extracted from the hypothesis statement (no LLM). Still recorded as an
+    # inferred param, so an autonomous run stays grade-capped (cannot affirm).
+    infer: gene
 outputs:
   report:
     type: Markdown

@@ -55,6 +55,7 @@ pub struct ToolParamSpec {
 #[serde(rename_all = "snake_case")]
 pub enum ParamInferKind {
     Cohort,
+    Gene,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

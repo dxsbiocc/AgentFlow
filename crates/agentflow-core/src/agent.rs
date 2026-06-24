@@ -61,6 +61,12 @@ pub struct EnrichedProposal {
     pub matched_fit: Option<String>,
     pub match_reason: Option<String>,
     pub drafted_step: Option<ProposedStep>,
+    /// Producer steps the agent drafted to satisfy the consumer's inputs that
+    /// were not yet available as artifacts. Ordered so applying them in sequence
+    /// (each before `drafted_step`) yields a valid producer -> consumer chain.
+    /// Empty for the common single-step case (kept off the wire when empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prerequisite_steps: Vec<ProposedStep>,
 }
 
 impl EnrichedProposal {
@@ -324,6 +330,16 @@ impl SourceDiscoveryOutput {
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("source discovery output serializes to JSON")
     }
+}
+
+/// Per-step finalization metadata shared by the direct-apply path and producer
+/// prerequisites. Prerequisites pass the empty/`None` defaults.
+struct StepFinalizationMeta<'a> {
+    inferred_param_names: &'a [String],
+    auto_synth_tool_ref: Option<&'a str>,
+    capability_need: Option<&'a str>,
+    auto_synth_source_trace: Option<&'a str>,
+    auto_run: bool,
 }
 
 struct AppliedStepFinalization<'a> {
@@ -719,6 +735,10 @@ impl ProjectStore {
                     let mut synthesized_capability_need = None;
                     let mut auto_synth_source_trace = None;
                     if auto_synth && auto_synth_gap(&proposal) {
+                        // Synthesis replaces the matched tool with a self-contained
+                        // synthesized step, so any producer chain drafted for the
+                        // discarded match no longer applies.
+                        proposal.prerequisite_steps.clear();
                         let flow_id = config.flow.clone().unwrap_or_else(|| {
                             auto_flow_id(&proposal.decision.candidate.hypothesis_id)
                         });
@@ -921,76 +941,52 @@ impl ProjectStore {
                                 )?;
                                 raised_decisions.push(point);
                             } else {
-                                let apply_result = if config.flow.is_some() {
-                                    self.apply_branch_patch_for_proposal(
+                                // Apply drafted producer prerequisites first (in
+                                // order) so the consumer's inputs resolve to real
+                                // producer outputs before it runs.
+                                for prereq in &proposal.prerequisite_steps {
+                                    self.apply_and_record_step(
                                         &flow_id,
                                         &proposal.decision,
-                                        step,
-                                    )
-                                } else {
-                                    self.apply_auto_flow_for_proposal(
-                                        &flow_id,
-                                        &proposal.decision,
-                                        step,
-                                    )
-                                };
-                                match apply_result {
-                                    Ok(actions) => {
-                                        for action in actions {
-                                            let applied_step = match &action {
-                                                AppliedAction::GraphPatchApplied {
-                                                    flow_id,
-                                                    step_id,
-                                                    ..
-                                                } => Some((flow_id.clone(), step_id.clone())),
-                                                AppliedAction::FlowAutoCreated { flow_id } => {
-                                                    Some((flow_id.clone(), step.id.clone()))
-                                                }
-                                                _ => None,
-                                            };
-                                            if let Some((flow_id, step_id)) = applied_step {
-                                                self.record_applied_step_action(
-                                                    AppliedStepFinalization {
-                                                        action,
-                                                        hypothesis_id: &proposal
-                                                            .decision
-                                                            .candidate
-                                                            .hypothesis_id,
-                                                        flow_id: &flow_id,
-                                                        step_id: &step_id,
-                                                        step,
-                                                        inferred_param_names: &inferred_param_names,
-                                                        auto_synth_tool_ref: auto_synth_tool_ref
-                                                            .as_deref(),
-                                                        capability_need:
-                                                            synthesized_capability_need.as_deref(),
-                                                        auto_synth_source_trace:
-                                                            auto_synth_source_trace.as_deref(),
-                                                        auto_run: config.auto_run,
-                                                    },
-                                                    ApplyCycleOutputs {
-                                                        applied: &mut applied,
-                                                        apply_failures: &mut apply_failures,
-                                                        generalization_candidates:
-                                                            &mut generalization_candidates,
-                                                        raised_decisions: &mut raised_decisions,
-                                                        grounding,
-                                                    },
-                                                )?;
-                                            } else {
-                                                applied.push(action);
-                                            }
-                                        }
-                                    }
-                                    Err(error) => apply_failures.push(ApplyFailure {
-                                        hypothesis_id: proposal
-                                            .decision
-                                            .candidate
-                                            .hypothesis_id
-                                            .clone(),
-                                        reason: error.to_string(),
-                                    }),
+                                        prereq,
+                                        config.flow.is_some(),
+                                        StepFinalizationMeta {
+                                            inferred_param_names: &[],
+                                            auto_synth_tool_ref: None,
+                                            capability_need: None,
+                                            auto_synth_source_trace: None,
+                                            auto_run: config.auto_run,
+                                        },
+                                        ApplyCycleOutputs {
+                                            applied: &mut applied,
+                                            apply_failures: &mut apply_failures,
+                                            generalization_candidates:
+                                                &mut generalization_candidates,
+                                            raised_decisions: &mut raised_decisions,
+                                            grounding,
+                                        },
+                                    )?;
                                 }
+                                self.apply_and_record_step(
+                                    &flow_id,
+                                    &proposal.decision,
+                                    step,
+                                    config.flow.is_some(),
+                                    StepFinalizationMeta {
+                                        inferred_param_names: &inferred_param_names,
+                                        auto_synth_tool_ref: auto_synth_tool_ref.as_deref(),
+                                        capability_need: synthesized_capability_need.as_deref(),
+                                        auto_synth_source_trace: auto_synth_source_trace.as_deref(),
+                                        auto_run: config.auto_run,
+                                    },
+                                    ApplyCycleOutputs {
+                                        applied: &mut applied,
+                                        apply_failures: &mut apply_failures,
+                                        generalization_candidates: &mut generalization_candidates,
+                                        raised_decisions: &mut raised_decisions,
+                                        grounding,
+                                    },
+                                )?;
                             }
                         }
                     }
@@ -1231,6 +1227,7 @@ impl ProjectStore {
                     matched_fit: None,
                     match_reason: None,
                     drafted_step: None,
+                    prerequisite_steps: Vec::new(),
                 },
                 Vec::new(),
             ));
@@ -1253,6 +1250,11 @@ impl ProjectStore {
                 &mut inferred_param_names,
             );
         }
+        // Backward-chain: any required input the consumer could not bind to an
+        // available artifact is satisfied by drafting a producer step that
+        // outputs that type, rewiring the consumer input to producer.output.
+        let prerequisite_steps =
+            self.chain_producer_steps(&candidate.tool_ref, &mut drafted_step, available)?;
         let needs = self.infer_step_needs(&drafted_step)?;
         let drafted_step = ProposedStep {
             needs,
@@ -1265,9 +1267,70 @@ impl ProjectStore {
                 matched_fit: Some(candidate.fit.as_str().to_string()),
                 match_reason: Some(candidate.reason),
                 drafted_step: Some(drafted_step),
+                prerequisite_steps,
             },
             inferred_param_names,
         ))
+    }
+
+    /// For each required input the consumer step still binds to an
+    /// `artifact_REPLACE_<name>` placeholder (no available artifact of that
+    /// type), find a producer tool that outputs the type with all of its own
+    /// inputs available, draft it, and rewire the consumer input to
+    /// `<producer_step>.<output>`. One level only; never chains a producer that
+    /// would itself need another producer, and never selects the consumer.
+    fn chain_producer_steps(
+        &self,
+        consumer_ref: &str,
+        consumer_step: &mut ProposedStep,
+        available: &[(String, String)],
+    ) -> Result<Vec<ProposedStep>, StorageError> {
+        let executable = self.executable_tool(consumer_ref)?;
+        let available_types = available
+            .iter()
+            .map(|(type_name, _)| type_name.clone())
+            .collect::<Vec<_>>();
+        let mut producers: Vec<ProposedStep> = Vec::new();
+
+        for (input_name, value) in consumer_step.inputs.iter_mut() {
+            if *value != format!("artifact_REPLACE_{input_name}") {
+                continue;
+            }
+            let Some(spec) = executable.inputs.get(input_name.as_str()) else {
+                continue;
+            };
+            let desired_type = spec.type_name.clone();
+            let query = CapabilityQuery {
+                desired_output_type: Some(desired_type.clone()),
+                available_input_types: available_types.clone(),
+                keywords: Vec::new(),
+            };
+            // Fit::High here means: outputs the desired type AND all of the
+            // producer's own required inputs are already available.
+            let producer = self
+                .match_tools(&query)?
+                .into_iter()
+                .find(|candidate| candidate.fit == Fit::High && candidate.tool_ref != consumer_ref);
+            let Some(producer) = producer else {
+                continue;
+            };
+            let producer_step = self.draft_step_for(&producer.tool_ref, available)?;
+            let producer_exec = self.executable_tool(&producer.tool_ref)?;
+            let Some(output_port) = producer_exec
+                .outputs
+                .iter()
+                .find(|(_, output)| output.type_name == desired_type)
+                .map(|(name, _)| name.clone())
+            else {
+                continue;
+            };
+            *value = format!("{}.{output_port}", producer_step.id);
+            if !producers.iter().any(|step| step.id == producer_step.id) {
+                producers.push(producer_step);
+            }
+        }
+
+        Ok(producers)
     }
 
     fn draft_synthesized_step(
@@ -1353,12 +1416,37 @@ impl ProjectStore {
             &decision.candidate.statement,
             scorer,
         )?;
-        let candidate_count = candidates
+        let mut relevant = candidates
             .into_iter()
-            .filter(|candidate| matches!(candidate.fit, Fit::High | Fit::Medium))
-            .take(2)
-            .count();
-        Ok(candidate_count > 1)
+            .filter(|candidate| matches!(candidate.fit, Fit::High | Fit::Medium));
+        let Some(top) = relevant.next() else {
+            return Ok(false);
+        };
+
+        // Input types the selected (top) tool cannot bind from available
+        // artifacts. A candidate that *produces* one of these is a producer the
+        // chain would draft to feed the top tool — a complement, not an
+        // alternative answer — so it must not count as an equivalent branch.
+        let available: BTreeSet<&str> = available_input_types.iter().map(String::as_str).collect();
+        let top_executable = self.executable_tool(&top.tool_ref)?;
+        let unmet_input_types: BTreeSet<String> = top_executable
+            .inputs
+            .values()
+            .filter(|input| input.required && !available.contains(input.type_name.as_str()))
+            .map(|input| input.type_name.clone())
+            .collect();
+
+        for candidate in relevant {
+            let executable = self.executable_tool(&candidate.tool_ref)?;
+            let produces_unmet_input = executable
+                .outputs
+                .values()
+                .any(|output| unmet_input_types.contains(&output.type_name));
+            if !produces_unmet_input {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn apply_branch_patch_for_proposal(
@@ -1412,6 +1500,74 @@ impl ProjectStore {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn apply_and_record_step(
+        &self,
+        flow_id: &str,
+        decision: &BranchDecision,
+        step: &ProposedStep,
+        use_existing_flow: bool,
+        meta: StepFinalizationMeta<'_>,
+        outputs: ApplyCycleOutputs<'_>,
+    ) -> Result<(), StorageError> {
+        let ApplyCycleOutputs {
+            applied,
+            apply_failures,
+            generalization_candidates,
+            raised_decisions,
+            grounding,
+        } = outputs;
+        let apply_result = if use_existing_flow {
+            self.apply_branch_patch_for_proposal(flow_id, decision, step)
+        } else {
+            self.apply_auto_flow_for_proposal(flow_id, decision, step)
+        };
+        match apply_result {
+            Ok(actions) => {
+                for action in actions {
+                    let applied_step = match &action {
+                        AppliedAction::GraphPatchApplied {
+                            flow_id, step_id, ..
+                        } => Some((flow_id.clone(), step_id.clone())),
+                        AppliedAction::FlowAutoCreated { flow_id } => {
+                            Some((flow_id.clone(), step.id.clone()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((flow_id, step_id)) = applied_step {
+                        self.record_applied_step_action(
+                            AppliedStepFinalization {
+                                action,
+                                hypothesis_id: &decision.candidate.hypothesis_id,
+                                flow_id: &flow_id,
+                                step_id: &step_id,
+                                step,
+                                inferred_param_names: meta.inferred_param_names,
+                                auto_synth_tool_ref: meta.auto_synth_tool_ref,
+                                capability_need: meta.capability_need,
+                                auto_synth_source_trace: meta.auto_synth_source_trace,
+                                auto_run: meta.auto_run,
+                            },
+                            ApplyCycleOutputs {
+                                applied: &mut *applied,
+                                apply_failures: &mut *apply_failures,
+                                generalization_candidates: &mut *generalization_candidates,
+                                raised_decisions: &mut *raised_decisions,
+                                grounding,
+                            },
+                        )?;
+                    } else {
+                        applied.push(action);
+                    }
+                }
+            }
+            Err(error) => apply_failures.push(ApplyFailure {
+                hypothesis_id: decision.candidate.hypothesis_id.clone(),
+                reason: error.to_string(),
+            }),
+        }
+        Ok(())
     }
 
     fn record_applied_step_action(
@@ -2888,6 +3044,7 @@ mod tests {
                 params: vec![("gene".to_string(), "TP53".to_string())],
                 outputs: vec![("report".to_string(), "marker_report".to_string())],
             }),
+            prerequisite_steps: Vec::new(),
         }
     }
 

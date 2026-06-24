@@ -1,0 +1,26 @@
+schema_version: agentflow.tool.v0
+namespace: local
+name: normalized_to_expression
+version: 0.1.0
+# Fixture producer: NormalizedCounts -> ExpressionTable via log2(x+1). Its
+# NormalizedCounts input is produced by normalize_counts, so reaching an
+# ExpressionTable from RawCounts requires chaining two producers — the
+# multi-level backward-chaining case. Example artifact, not core engine code.
+maturity: wrapped
+description: Transform NormalizedCounts into an ExpressionTable via log2(x+1). Offline, no network.
+inputs:
+  normalized:
+    type: NormalizedCounts
+    required: true
+    required_columns: sample
+outputs:
+  expression:
+    type: ExpressionTable
+    required_columns: sample
+    min_rows: 1
+runtime:
+  backend: local
+  command:
+    - /usr/bin/env
+    - python3
+    - normalized_to_expression.py

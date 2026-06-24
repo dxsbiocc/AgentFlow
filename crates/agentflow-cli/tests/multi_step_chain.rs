@@ -280,3 +280,178 @@ fn agent_backward_chains_producer_for_unavailable_input() {
         "flow should have one producer->consumer edge\n{inspect}"
     );
 }
+
+fn write_passthrough_producer(
+    project: &Path,
+    name: &str,
+    input_port: &str,
+    input_type: &str,
+    output_port: &str,
+    output_type: &str,
+) -> PathBuf {
+    let script_path = project.join(format!("{name}.sh"));
+    let in_env = format!("AGENTFLOW_INPUT_{}", input_port.to_ascii_uppercase());
+    let out_env = format!("AGENTFLOW_OUTPUT_{}", output_port.to_ascii_uppercase());
+    fs::write(
+        &script_path,
+        format!("set -eu\ncp \"${in_env}\" \"${out_env}\"\nprintf '{name} ok\\n'\n"),
+    )
+    .expect("producer script should be written");
+
+    let spec_path = project.join(format!("{name}.tool.yaml"));
+    fs::write(
+        &spec_path,
+        format!(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: chain
+name: {name}
+version: 0.1.0
+maturity: wrapped
+description: Offline fixture producer {input_type} to {output_type}.
+inputs:
+  {input_port}:
+    type: {input_type}
+    required: true
+outputs:
+  {output_port}:
+    type: {output_type}
+    min_rows: 1
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {}
+"#,
+            script_path.display()
+        ),
+    )
+    .expect("producer spec should be written");
+    spec_path
+}
+
+/// Two producers must be chained (RawCounts -> MidCounts -> ExpressionTable)
+/// because neither the consumer's ExpressionTable nor the middle producer's
+/// MidCounts input is available — only RawCounts is. Exercises recursive
+/// (multi-level) backward chaining and the transitive equivalent-branch
+/// exclusion (neither intermediate producer trips the brake).
+#[test]
+fn agent_backward_chains_multiple_producer_levels() {
+    let project = TempProject::new("multi-level");
+    let path = project.path.to_string_lossy().to_string();
+
+    run_agentflow(["init", "--name", "MultiLevel", "--path", &path]);
+    let lower = write_passthrough_producer(
+        &project.path,
+        "lower",
+        "counts",
+        "RawCounts",
+        "mid",
+        "MidCounts",
+    );
+    let upper = write_passthrough_producer(
+        &project.path,
+        "upper",
+        "mid",
+        "MidCounts",
+        "expression",
+        "ExpressionTable",
+    );
+    let consumer = write_consumer_tool(&project.path);
+    run_agentflow([
+        "tools",
+        "register",
+        &lower.to_string_lossy(),
+        "--path",
+        &path,
+    ]);
+    run_agentflow([
+        "tools",
+        "register",
+        &upper.to_string_lossy(),
+        "--path",
+        &path,
+    ]);
+    run_agentflow([
+        "tools",
+        "register",
+        &consumer.to_string_lossy(),
+        "--path",
+        &path,
+    ]);
+
+    let (counts, survival) = write_input_tables(&project.path);
+    run_agentflow([
+        "import",
+        &counts.to_string_lossy(),
+        "--type",
+        "RawCounts",
+        "--mode",
+        "copy",
+        "--path",
+        &path,
+    ]);
+    run_agentflow([
+        "import",
+        &survival.to_string_lossy(),
+        "--type",
+        "SurvivalTable",
+        "--mode",
+        "copy",
+        "--path",
+        &path,
+    ]);
+    run_agentflow([
+        "hypothesis",
+        "create",
+        "--statement",
+        "M1 shows a survival association in the imported cohort",
+        "--origin",
+        "user_goal",
+        "--goal",
+        "g1",
+        "--path",
+        &path,
+    ]);
+
+    let output = run_agentflow([
+        "agent",
+        "run",
+        "--apply",
+        "--auto-run",
+        "--no-auto-synth",
+        "--no-auto-forage",
+        "--no-semantic-match",
+        "--path",
+        &path,
+    ]);
+
+    assert!(
+        output.contains("step_lower ran") && output.contains("step_upper ran"),
+        "both chained producers should have run\n{output}"
+    );
+    assert!(
+        output.contains("step_marker_emit ran and observed"),
+        "consumer step should have run and observed\n{output}"
+    );
+    assert!(
+        !output.contains("missing required"),
+        "no required input/param should be missing\n{output}"
+    );
+
+    let flow_id = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("flow "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("auto-created flow id in output")
+        .to_string();
+    let inspect = run_agentflow(["flow", "inspect", &flow_id, "--path", &path]);
+    assert!(
+        inspect.contains("Steps: 3"),
+        "flow should have three chained steps\n{inspect}"
+    );
+    assert!(
+        inspect.contains("Edges: 2"),
+        "flow should have two chain edges\n{inspect}"
+    );
+}

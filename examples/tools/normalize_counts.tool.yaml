@@ -1,0 +1,26 @@
+schema_version: agentflow.tool.v0
+namespace: local
+name: normalize_counts
+version: 0.1.0
+# Fixture producer: RawCounts -> NormalizedCounts (counts-per-million). Its
+# output feeds normalized_to_expression, so reaching an ExpressionTable from
+# RawCounts requires chaining two producers — the multi-level backward-chaining
+# case. Example artifact, not core engine code.
+maturity: wrapped
+description: Library-size normalize RawCounts to NormalizedCounts (CPM). Offline, no network.
+inputs:
+  counts:
+    type: RawCounts
+    required: true
+    required_columns: sample
+outputs:
+  normalized:
+    type: NormalizedCounts
+    required_columns: sample
+    min_rows: 1
+runtime:
+  backend: local
+  command:
+    - /usr/bin/env
+    - python3
+    - normalize_counts.py

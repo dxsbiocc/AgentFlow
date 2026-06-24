@@ -747,7 +747,7 @@ impl ProjectStore {
                             reversible: true,
                             equivalent_branches: self.has_equivalent_tool_branches(
                                 &proposal.decision,
-                                &available_input_types,
+                                &available,
                                 &cycle_scorer,
                             )?,
                             conflicts_user_premise: false,
@@ -921,7 +921,7 @@ impl ProjectStore {
                                 reversible: true,
                                 equivalent_branches: self.has_equivalent_tool_branches(
                                     &proposal.decision,
-                                    &available_input_types,
+                                    &available,
                                     &cycle_scorer,
                                 )?,
                                 conflicts_user_premise: false,
@@ -1285,48 +1285,101 @@ impl ProjectStore {
         consumer_step: &mut ProposedStep,
         available: &[(String, String)],
     ) -> Result<Vec<ProposedStep>, StorageError> {
-        let executable = self.executable_tool(consumer_ref)?;
+        let mut visited = BTreeSet::from([consumer_ref.to_string()]);
+        self.chain_producer_steps_rec(consumer_step, available, &mut visited, 0)
+    }
+
+    /// Recursively satisfy a step's `artifact_REPLACE_*` inputs by drafting
+    /// producer steps. A producer whose own inputs are all available terminates
+    /// a branch; otherwise its missing inputs are chained one level deeper. The
+    /// returned steps are in apply order — deepest producers first, each before
+    /// the step that consumes its output. Grounding is all-or-nothing per input:
+    /// a producer (and its sub-chain) is committed only if no placeholder input
+    /// remains; otherwise the input is left as the placeholder for graceful
+    /// apply-time failure. A depth limit and a per-path visited set bound the
+    /// search and prevent producer cycles.
+    fn chain_producer_steps_rec(
+        &self,
+        step: &mut ProposedStep,
+        available: &[(String, String)],
+        visited: &mut BTreeSet<String>,
+        depth: usize,
+    ) -> Result<Vec<ProposedStep>, StorageError> {
+        const MAX_CHAIN_DEPTH: usize = 4;
+        if depth >= MAX_CHAIN_DEPTH {
+            return Ok(Vec::new());
+        }
         let available_types = available
             .iter()
             .map(|(type_name, _)| type_name.clone())
             .collect::<Vec<_>>();
         let mut producers: Vec<ProposedStep> = Vec::new();
 
-        for (input_name, value) in consumer_step.inputs.iter_mut() {
+        for (input_name, value) in step.inputs.iter_mut() {
             if *value != format!("artifact_REPLACE_{input_name}") {
                 continue;
             }
-            let Some(spec) = executable.inputs.get(input_name.as_str()) else {
+            let Some(desired_type) = self
+                .executable_tool(&step.tool)?
+                .inputs
+                .get(input_name.as_str())
+                .map(|spec| spec.type_name.clone())
+            else {
                 continue;
             };
-            let desired_type = spec.type_name.clone();
             let query = CapabilityQuery {
                 desired_output_type: Some(desired_type.clone()),
                 available_input_types: available_types.clone(),
                 keywords: Vec::new(),
             };
-            // Fit::High here means: outputs the desired type AND all of the
-            // producer's own required inputs are already available.
-            let producer = self
-                .match_tools(&query)?
-                .into_iter()
-                .find(|candidate| candidate.fit == Fit::High && candidate.tool_ref != consumer_ref);
-            let Some(producer) = producer else {
-                continue;
-            };
-            let producer_step = self.draft_step_for(&producer.tool_ref, available)?;
-            let producer_exec = self.executable_tool(&producer.tool_ref)?;
-            let Some(output_port) = producer_exec
-                .outputs
-                .iter()
-                .find(|(_, output)| output.type_name == desired_type)
-                .map(|(name, _)| name.clone())
-            else {
-                continue;
-            };
-            *value = format!("{}.{output_port}", producer_step.id);
-            if !producers.iter().any(|step| step.id == producer_step.id) {
-                producers.push(producer_step);
+            // Candidates are score-sorted, so a Fit::High producer (all of its
+            // own inputs already available) is tried before one that itself
+            // needs chaining. Each candidate is grounded all-or-nothing.
+            for candidate in self.match_tools(&query)? {
+                if visited.contains(&candidate.tool_ref) {
+                    continue;
+                }
+                let candidate_exec = self.executable_tool(&candidate.tool_ref)?;
+                let Some(output_port) = candidate_exec
+                    .outputs
+                    .iter()
+                    .find(|(_, output)| output.type_name == desired_type)
+                    .map(|(name, _)| name.clone())
+                else {
+                    continue;
+                };
+
+                let snapshot = visited.clone();
+                visited.insert(candidate.tool_ref.clone());
+                let mut producer_step = self.draft_step_for(&candidate.tool_ref, available)?;
+                let sub_producers = self.chain_producer_steps_rec(
+                    &mut producer_step,
+                    available,
+                    visited,
+                    depth + 1,
+                )?;
+                let grounded = producer_step
+                    .inputs
+                    .iter()
+                    .all(|(name, value)| *value != format!("artifact_REPLACE_{name}"));
+                if !grounded {
+                    *visited = snapshot;
+                    continue;
+                }
+
+                *value = format!("{}.{output_port}", producer_step.id);
+                for sub in sub_producers {
+                    if !producers.iter().any(|existing| existing.id == sub.id) {
+                        producers.push(sub);
+                    }
+                }
+                if !producers
+                    .iter()
+                    .any(|existing| existing.id == producer_step.id)
+                {
+                    producers.push(producer_step);
+                }
+                break;
             }
         }
 
@@ -1401,12 +1454,16 @@ impl ProjectStore {
     fn has_equivalent_tool_branches(
         &self,
         decision: &BranchDecision,
-        available_input_types: &[String],
+        available: &[(String, String)],
         scorer: &dyn RelevanceScorer,
     ) -> Result<bool, StorageError> {
+        let available_types = available
+            .iter()
+            .map(|(type_name, _)| type_name.clone())
+            .collect::<Vec<_>>();
         let query = CapabilityQuery {
             desired_output_type: None,
-            available_input_types: available_input_types.to_vec(),
+            available_input_types: available_types.clone(),
             keywords: proposal_keywords(&decision.candidate.statement),
         };
         let mut candidates = self.match_tools(&query)?;
@@ -1423,26 +1480,30 @@ impl ProjectStore {
             return Ok(false);
         };
 
-        // Input types the selected (top) tool cannot bind from available
-        // artifacts. A candidate that *produces* one of these is a producer the
-        // chain would draft to feed the top tool — a complement, not an
+        // Build the producer chain the top candidate would draft, then collect
+        // every input type the chain consumes that isn't already an available
+        // artifact. A candidate that produces one of these intermediate types is
+        // part of (or an alternative for) the chain — a complement, not an
         // alternative answer — so it must not count as an equivalent branch.
-        let available: BTreeSet<&str> = available_input_types.iter().map(String::as_str).collect();
-        let top_executable = self.executable_tool(&top.tool_ref)?;
-        let unmet_input_types: BTreeSet<String> = top_executable
-            .inputs
-            .values()
-            .filter(|input| input.required && !available.contains(input.type_name.as_str()))
-            .map(|input| input.type_name.clone())
-            .collect();
+        let available_set: BTreeSet<&str> = available_types.iter().map(String::as_str).collect();
+        let mut top_step = self.draft_step_for(&top.tool_ref, available)?;
+        let chain = self.chain_producer_steps(&top.tool_ref, &mut top_step, available)?;
+        let mut chain_unmet_types: BTreeSet<String> = BTreeSet::new();
+        for step in std::iter::once(&top_step).chain(chain.iter()) {
+            for input in self.executable_tool(&step.tool)?.inputs.values() {
+                if input.required && !available_set.contains(input.type_name.as_str()) {
+                    chain_unmet_types.insert(input.type_name.clone());
+                }
+            }
+        }
 
         for candidate in relevant {
-            let executable = self.executable_tool(&candidate.tool_ref)?;
-            let produces_unmet_input = executable
+            let produces_chain_input = self
+                .executable_tool(&candidate.tool_ref)?
                 .outputs
                 .values()
-                .any(|output| unmet_input_types.contains(&output.type_name));
-            if !produces_unmet_input {
+                .any(|output| chain_unmet_types.contains(&output.type_name));
+            if !produces_chain_input {
                 return Ok(true);
             }
         }

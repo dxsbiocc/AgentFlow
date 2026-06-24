@@ -44,6 +44,11 @@ pub struct ContainerEngineSelection {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RunConfig {
     pub container_engine: Option<ContainerEngineSelection>,
+    /// Maximum number of independent ready steps whose tool subprocesses may run
+    /// concurrently within one scheduler wave. 0 or 1 means sequential (the
+    /// default, byte-identical to the pre-parallel runtime). Only the subprocess
+    /// overlaps; preparation and recording stay serial on the main thread.
+    pub max_parallel: usize,
 }
 
 thread_local! {
@@ -700,21 +705,39 @@ impl ProjectStore {
             }
 
             let mut progressed = false;
-            for step in ready {
-                let attempt = self.run_step(flow_id, &step, config)?;
-                match attempt.status.as_str() {
-                    "succeeded" | "cache_hit" => {
-                        completed.insert(attempt.step_id.clone());
-                        completed_steps += 1;
-                        progressed = true;
+            if config.max_parallel > 1 {
+                // Parallel wave: prepare + record stay serial on the main thread
+                // (single connection); only the tool subprocesses overlap.
+                for attempt in self.run_ready_wave_parallel(flow_id, &ready, config)? {
+                    match attempt.status.as_str() {
+                        "succeeded" | "cache_hit" => {
+                            completed.insert(attempt.step_id.clone());
+                            completed_steps += 1;
+                            progressed = true;
+                        }
+                        _ => {
+                            failed_steps += 1;
+                        }
                     }
-                    _ => {
-                        failed_steps += 1;
-                    }
+                    attempts.push(attempt);
                 }
-                attempts.push(attempt);
-                if failed_steps > 0 {
-                    break;
+            } else {
+                for step in ready {
+                    let attempt = self.run_step(flow_id, &step, config)?;
+                    match attempt.status.as_str() {
+                        "succeeded" | "cache_hit" => {
+                            completed.insert(attempt.step_id.clone());
+                            completed_steps += 1;
+                            progressed = true;
+                        }
+                        _ => {
+                            failed_steps += 1;
+                        }
+                    }
+                    attempts.push(attempt);
+                    if failed_steps > 0 {
+                        break;
+                    }
                 }
             }
 
@@ -729,6 +752,96 @@ impl ProjectStore {
             failed_steps,
             attempts,
         })
+    }
+
+    /// Run one scheduler wave with the tool subprocesses overlapping. Steps are
+    /// taken in batches of at most `config.max_parallel` (guaranteed > 1 by the
+    /// caller); each batch is prepared (DB reads + run/attempt inserts), its
+    /// subprocesses run on `std::thread::scope` worker threads, then its results
+    /// are recorded — preparation and recording stay on the main thread, so the
+    /// single SQLite connection is never shared across threads. Like the
+    /// sequential path, a batch that produces any failure stops the wave (later
+    /// batches are neither prepared nor launched, so no run rows are orphaned).
+    /// Returned in ready order, identical to a serial run of the same
+    /// (independent) steps on the success path.
+    fn run_ready_wave_parallel(
+        &self,
+        flow_id: &str,
+        ready: &[StoredFlowStep],
+        config: &RunConfig,
+    ) -> Result<Vec<AttemptSummary>, StorageError> {
+        let max = config.max_parallel;
+        let mut attempts: Vec<AttemptSummary> = Vec::with_capacity(ready.len());
+        let mut steps = ready.iter();
+        loop {
+            let batch: Vec<&StoredFlowStep> = steps.by_ref().take(max).collect();
+            if batch.is_empty() {
+                break;
+            }
+
+            // Prepare the batch (serial). Cache hits / pre-run validation failures
+            // are already finished; the rest carry a built command.
+            let mut batch_results: Vec<Option<AttemptSummary>> = Vec::with_capacity(batch.len());
+            let mut pending: Vec<(usize, PendingStep)> = Vec::new();
+            for step in &batch {
+                match self.prepare_step(flow_id, step, config)? {
+                    PreparedStep::Finished(summary) => batch_results.push(Some(summary)),
+                    PreparedStep::Pending(prepared) => {
+                        batch_results.push(None);
+                        pending.push((batch_results.len() - 1, *prepared));
+                    }
+                }
+            }
+
+            // Run the pending subprocesses concurrently — no DB access on threads.
+            let mut records: Vec<(usize, PendingStep)> = Vec::with_capacity(pending.len());
+            let mut jobs: Vec<(usize, Command, Option<u64>)> = Vec::with_capacity(pending.len());
+            for (slot, mut prepared) in pending {
+                let command = prepared
+                    .command
+                    .take()
+                    .expect("pending step retains its command until execution");
+                let timeout = prepared.timeout_seconds;
+                jobs.push((slot, command, timeout));
+                records.push((slot, prepared));
+            }
+            let outputs: Vec<(usize, std::io::Result<LocalCommandOutput>)> =
+                std::thread::scope(|scope| {
+                    jobs.into_iter()
+                        .map(|(slot, command, timeout)| {
+                            scope.spawn(move || (slot, run_local_command(command, timeout)))
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|handle| handle.join().expect("step subprocess thread panicked"))
+                        .collect()
+                });
+
+            // Record results (serial).
+            for (slot, output) in outputs {
+                let position = records
+                    .iter()
+                    .position(|(candidate, _)| *candidate == slot)
+                    .expect("recorded slot for executed subprocess");
+                let (slot, prepared) = records.remove(position);
+                batch_results[slot] = Some(self.record_step(prepared, output)?);
+            }
+
+            // Collect in ready order; stop the wave after any failure, matching the
+            // sequential path which breaks on the first failed step.
+            let mut batch_failed = false;
+            for summary in batch_results.into_iter().flatten() {
+                if !matches!(summary.status.as_str(), "succeeded" | "cache_hit") {
+                    batch_failed = true;
+                }
+                attempts.push(summary);
+            }
+            if batch_failed {
+                break;
+            }
+        }
+
+        Ok(attempts)
     }
 
     pub fn list_cache_entries(&self) -> Result<Vec<CacheEntrySummary>, StorageError> {
@@ -1090,6 +1203,30 @@ impl ProjectStore {
         step: &StoredFlowStep,
         config: &RunConfig,
     ) -> Result<AttemptSummary, StorageError> {
+        match self.prepare_step(flow_id, step, config)? {
+            PreparedStep::Finished(summary) => Ok(summary),
+            PreparedStep::Pending(pending) => self.execute_and_record_step(*pending),
+        }
+    }
+
+    fn execute_and_record_step(
+        &self,
+        mut pending: PendingStep,
+    ) -> Result<AttemptSummary, StorageError> {
+        let command = pending
+            .command
+            .take()
+            .expect("prepared step retains its command until execution");
+        let output = run_local_command(command, pending.timeout_seconds);
+        self.record_step(pending, output)
+    }
+
+    fn prepare_step(
+        &self,
+        flow_id: &str,
+        step: &StoredFlowStep,
+        config: &RunConfig,
+    ) -> Result<PreparedStep, StorageError> {
         let tool_ref = step.tool_ref.as_deref().ok_or_else(|| {
             StorageError::InvalidInput(format!("step {} has no tool_ref", step.id))
         })?;
@@ -1218,17 +1355,19 @@ impl ProjectStore {
         if let Err(error) = validate_declared_inputs(&resolved_inputs, &tool.inputs) {
             fs::write(&stdout_path, "")?;
             fs::write(&stderr_path, error.to_string())?;
-            return self.finish_attempt(FinishAttempt {
-                run_id,
-                attempt_id,
-                step_id: step.id.clone(),
-                workdir,
-                stdout_path,
-                stderr_path,
-                status: RunAttemptStatus::Failed,
-                exit_code: None,
-                error_message: Some(error.to_string()),
-            });
+            return Ok(PreparedStep::Finished(self.finish_attempt(
+                FinishAttempt {
+                    run_id,
+                    attempt_id,
+                    step_id: step.id.clone(),
+                    workdir,
+                    stdout_path,
+                    stderr_path,
+                    status: RunAttemptStatus::Failed,
+                    exit_code: None,
+                    error_message: Some(error.to_string()),
+                },
+            )?));
         }
 
         if let Some(cached_outputs) = self.cache_entry(&cache_key)? {
@@ -1252,17 +1391,19 @@ impl ProjectStore {
                     (RunAttemptStatus::Failed, Some(error.to_string()))
                 }
             };
-            return self.finish_attempt(FinishAttempt {
-                run_id,
-                attempt_id,
-                step_id: step.id.clone(),
-                workdir,
-                stdout_path,
-                stderr_path,
-                status,
-                exit_code: None,
-                error_message,
-            });
+            return Ok(PreparedStep::Finished(self.finish_attempt(
+                FinishAttempt {
+                    run_id,
+                    attempt_id,
+                    step_id: step.id.clone(),
+                    workdir,
+                    stdout_path,
+                    stderr_path,
+                    status,
+                    exit_code: None,
+                    error_message,
+                },
+            )?));
         }
 
         let mut command = Command::new(&prepared_command.executable);
@@ -1284,7 +1425,47 @@ impl ProjectStore {
         if let Some(pythonpath) = synth_pythonpath {
             command.env("PYTHONPATH", pythonpath);
         }
-        let output = run_local_command(command, tool.runtime.timeout_seconds);
+        Ok(PreparedStep::Pending(Box::new(PendingStep {
+            command: Some(command),
+            timeout_seconds: tool.runtime.timeout_seconds,
+            tool_ref: tool_ref.to_string(),
+            tool_outputs: tool.outputs.clone(),
+            run_id,
+            attempt_id,
+            step_id: step.id.clone(),
+            workdir,
+            stdout_path,
+            stderr_path,
+            resolved_outputs,
+            cache_key,
+            input_hashes_json,
+            params_hash,
+            runtime_hash,
+        })))
+    }
+
+    fn record_step(
+        &self,
+        pending: PendingStep,
+        output: std::io::Result<LocalCommandOutput>,
+    ) -> Result<AttemptSummary, StorageError> {
+        let PendingStep {
+            command: _,
+            timeout_seconds: _,
+            tool_ref,
+            tool_outputs,
+            run_id,
+            attempt_id,
+            step_id,
+            workdir,
+            stdout_path,
+            stderr_path,
+            resolved_outputs,
+            cache_key,
+            input_hashes_json,
+            params_hash,
+            runtime_hash,
+        } = pending;
 
         let (status, exit_code, error_message) = match output {
             Ok(output) => {
@@ -1303,14 +1484,13 @@ impl ProjectStore {
                     (RunAttemptStatus::TimedOut, code, Some(message))
                 } else if output.status.success() {
                     match validate_outputs(&resolved_outputs) {
-                        Ok(()) => match validate_declared_outputs(&resolved_outputs, &tool.outputs)
+                        Ok(()) => match validate_declared_outputs(&resolved_outputs, &tool_outputs)
                         {
                             Ok(()) => {
                                 let mut published_outputs = BTreeMap::new();
                                 let publish_result = resolved_outputs.as_map().iter().try_for_each(
                                     |(output_name, output_path)| {
-                                        let artifact_type = tool
-                                            .outputs
+                                        let artifact_type = tool_outputs
                                             .get(output_name)
                                             .map(|port| port.type_name.clone())
                                             .unwrap_or_else(|| "File".to_string());
@@ -1319,14 +1499,14 @@ impl ProjectStore {
                                                 source_path: output_path.clone(),
                                                 artifact_type,
                                                 output_name: output_name.clone(),
-                                                source_step_id: step.id.clone(),
+                                                source_step_id: step_id.clone(),
                                                 source_run_id: run_id.clone(),
                                             },
                                         )?;
                                         self.observe_declared_output(
                                             &artifact.summary.id,
                                             output_name,
-                                            &tool.outputs,
+                                            &tool_outputs,
                                         )?;
                                         published_outputs.insert(
                                             output_name.clone(),
@@ -1384,7 +1564,7 @@ impl ProjectStore {
         self.finish_attempt(FinishAttempt {
             run_id,
             attempt_id,
-            step_id: step.id.clone(),
+            step_id: step_id.clone(),
             workdir,
             stdout_path,
             stderr_path,
@@ -1855,6 +2035,37 @@ fn local_step_id(db_step_id: &str) -> String {
     db_step_id
         .rsplit_once('/')
         .map_or_else(|| db_step_id.to_string(), |(_, local)| local.to_string())
+}
+
+/// A step that has been prepared (inputs resolved, workdir materialized, run/
+/// attempt rows inserted) and now only needs its tool subprocess run, then its
+/// result recorded. The subprocess (`run_local_command`) touches no database, so
+/// a wave of these can execute concurrently; preparation and recording stay on
+/// the main thread, keeping the single SQLite connection race-free.
+struct PendingStep {
+    command: Option<Command>,
+    timeout_seconds: Option<u64>,
+    tool_ref: String,
+    tool_outputs: BTreeMap<String, crate::storage::ToolPortSpec>,
+    run_id: String,
+    attempt_id: String,
+    step_id: String,
+    workdir: PathBuf,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    resolved_outputs: OutputPaths,
+    cache_key: String,
+    input_hashes_json: String,
+    params_hash: String,
+    runtime_hash: String,
+}
+
+enum PreparedStep {
+    /// Already finished during preparation (cache hit or a pre-run validation
+    /// failure) — the attempt is fully recorded.
+    Finished(AttemptSummary),
+    /// Needs its subprocess run and the result recorded.
+    Pending(Box<PendingStep>),
 }
 
 struct OutputPaths {
@@ -3749,6 +3960,14 @@ steps:
     }
 
     fn run_schedule_flow(test_name: &str, serial: bool) -> (PathBuf, FlowRunSummary) {
+        run_schedule_flow_with(test_name, serial, 0)
+    }
+
+    fn run_schedule_flow_with(
+        test_name: &str,
+        serial: bool,
+        max_parallel: usize,
+    ) -> (PathBuf, FlowRunSummary) {
         let path = temp_project_path(test_name);
         fs::create_dir_all(&path).unwrap();
         let store = ProjectStore::init(&path, Some("Runtime Schedule Demo")).unwrap();
@@ -3820,8 +4039,38 @@ steps:
         ))
         .unwrap();
         store.approve_flow(flow, None).unwrap();
-        let summary = store.run_flow("schedule_demo").unwrap();
+        let summary = store
+            .run_flow_with(
+                "schedule_demo",
+                &RunConfig {
+                    max_parallel,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         (path, summary)
+    }
+
+    #[test]
+    fn parallel_execution_matches_serial_outputs_and_lineage() {
+        // Serial baseline: the fan-out flow (serial=false makes `wide` ready
+        // alongside `narrow`), executed sequentially (max_parallel = 0).
+        let (serial_path, serial_summary) = run_schedule_flow("parallel-baseline", false);
+        let serial_outputs = computed_texts_by_step(&serial_path, "schedule_demo");
+
+        // Same flow, executed with up to four subprocesses overlapping.
+        let (parallel_path, parallel_summary) = run_schedule_flow_with("parallel-real", false, 4);
+        let parallel_outputs = computed_texts_by_step(&parallel_path, "schedule_demo");
+
+        assert_eq!(serial_summary.completed_steps, 4);
+        assert_eq!(serial_summary.failed_steps, 0);
+        assert_eq!(parallel_summary.completed_steps, 4);
+        assert_eq!(parallel_summary.failed_steps, 0);
+        // The parallel run produces byte-identical computed outputs for every step.
+        assert_eq!(parallel_outputs, serial_outputs);
+
+        let _ = fs::remove_dir_all(serial_path);
+        let _ = fs::remove_dir_all(parallel_path);
     }
 
     fn computed_texts_by_step(path: &Path, flow_id: &str) -> BTreeMap<String, String> {
@@ -4291,12 +4540,14 @@ steps:
                 kind: ContainerEngineKind::Singularity,
                 runner: Some(PathBuf::from("/usr/bin/apptainer")),
             }),
+            ..Default::default()
         };
         let docker_config = RunConfig {
             container_engine: Some(ContainerEngineSelection {
                 kind: ContainerEngineKind::Docker,
                 runner: Some(PathBuf::from("/usr/bin/docker")),
             }),
+            ..Default::default()
         };
 
         assert_eq!(

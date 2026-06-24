@@ -1,8 +1,19 @@
 # RFC: Parallel step execution (scheduler fan-out)
 
-Status: Proposed (design only — not implemented)
+Status: IMPLEMENTED (Option A, behind `--max-parallel`)
 Date: 2026-06-24
 Relates to: agent-scheduling-design.md (#75), the multi-level chaining work (#95)
+
+> Implemented per the Option A recommendation: `run_step` was split into
+> `prepare_step` → (`run_local_command`) → `record_step`; `run_flow_with` runs a
+> wave's subprocesses on scoped worker threads (`run_ready_wave_parallel`), at
+> most `RunConfig.max_parallel` at a time, with preparation and recording serial
+> on the main thread. `--max-parallel N` (default 0/1 = sequential,
+> byte-identical) on `run` and `agent run`. A consistency test asserts a fan-out
+> flow run in parallel yields byte-identical computed outputs to a serial run;
+> a live demo showed 4 independent `sleep 1` steps drop ~4.0s → ~1.0s. The
+> in-wave failure policy (stop the outer loop after a wave with any failure) and
+> same-key cache dedupe remain as noted below.
 
 ## Problem
 

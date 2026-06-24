@@ -1,0 +1,27 @@
+schema_version: agentflow.tool.v0
+namespace: local
+name: counts_to_expression
+version: 0.1.0
+# A deterministic, offline producer tool: log2(x+1)-normalizes a RawCounts table
+# into an ExpressionTable. It bridges a type gap so the autonomous loop can
+# backward-chain — given only RawCounts and a tool needing an ExpressionTable,
+# the agent drafts this producer and wires its output into the consumer.
+# Example artifact, not core engine code.
+maturity: wrapped
+description: Normalize a RawCounts table into an ExpressionTable via log2(x+1). Offline, no network.
+inputs:
+  counts:
+    type: RawCounts
+    required: true
+    required_columns: sample
+outputs:
+  expression:
+    type: ExpressionTable
+    required_columns: sample
+    min_rows: 1
+runtime:
+  backend: local
+  command:
+    - /usr/bin/env
+    - python3
+    - counts_to_expression.py

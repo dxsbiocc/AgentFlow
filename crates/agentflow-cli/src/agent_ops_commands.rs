@@ -2685,10 +2685,16 @@ fn format_forage_observation(heading: &str, observation: &ForageObservation) -> 
 }
 
 fn format_forage_observation_summary(observation: &ForageObservation) -> String {
+    let retracted = if observation.retracted {
+        " RETRACTED"
+    } else {
+        ""
+    };
     format!(
-        "{} [{}] {}\n  source: {}\n  external id: {}",
+        "{} [{}{}] {}\n  source: {}\n  external id: {}",
         observation.id,
         observation.access_status,
+        retracted,
         observation.title,
         observation.source_id,
         observation.external_id
@@ -2842,6 +2848,10 @@ fn ingest_forage_hits(
 }
 
 fn parse_forage_hit(line: &str, line_number: usize) -> Result<ForageHit, CliError> {
+    // Retraction status is intentionally not read from the hits JSONL: ingested
+    // hits default to non-retracted, and retraction is asserted deliberately via
+    // `forage observe --retracted`. If fetch scripts start carrying retraction
+    // data, wire it through here.
     let external_id = required_jsonl_string(line, "external_id", line_number)?;
     let title = required_jsonl_string(line, "title", line_number)?;
     let access_status_value = required_jsonl_string(line, "access_status", line_number)?;
@@ -4905,6 +4915,73 @@ EOF
         .unwrap();
         assert!(link.contains("\"grade\":\"literature_supported\""));
         assert!(link.contains("\"stance\":\"supports\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn forage_observe_retracted_grades_unsupported() {
+        let path = temp_project_path("forage-retracted");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis(&store);
+
+        // A retracted source, even open-access full text, must grade Unsupported.
+        let observation = run(args(&[
+            "agentflow",
+            "forage",
+            "observe",
+            "--source",
+            "pubmed",
+            "--external-id",
+            "PMID:RETRACTED",
+            "--title",
+            "Retracted study",
+            "--access",
+            "open_access_full_text",
+            "--retracted",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(observation.contains("\"retracted\":true"));
+        let observation_id = json_id(&observation);
+
+        // Human-readable list surfaces the retracted marker.
+        let list = run(args(&[
+            "agentflow",
+            "forage",
+            "list",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(
+            list.contains("RETRACTED"),
+            "list should flag retraction:\n{list}"
+        );
+
+        let link = run(args(&[
+            "agentflow",
+            "forage",
+            "link",
+            "--hypothesis",
+            &hypothesis_id,
+            "--observation",
+            &observation_id,
+            "--stance",
+            "supports",
+            "--note",
+            "retracted source",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(
+            link.contains("\"grade\":\"unsupported\""),
+            "retracted source must grade unsupported:\n{link}"
+        );
 
         let _ = std::fs::remove_dir_all(path);
     }

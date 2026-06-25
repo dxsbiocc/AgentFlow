@@ -102,6 +102,7 @@ struct ForageObserveOptions {
     external_id: Option<String>,
     title: Option<String>,
     access: Option<AccessStatus>,
+    retracted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -508,7 +509,13 @@ fn forage_observe_command(args: ForageObserveArgs) -> Result<String, CliError> {
         .ok_or_else(|| CliError::InvalidArgument("forage observe requires --access".to_string()))?;
     let path = options.project.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&path)?;
-    let observation = store.record_forage_observation(&source, &external_id, &title, access)?;
+    let observation = store.record_forage_observation(
+        &source,
+        &external_id,
+        &title,
+        access,
+        options.retracted,
+    )?;
 
     if options.project.json {
         Ok(observation.to_json())
@@ -2160,6 +2167,7 @@ impl TryFrom<ForageObserveArgs> for ForageObserveOptions {
             access: last_value(args.access)
                 .map(|access| parse_access_status(&access))
                 .transpose()?,
+            retracted: args.retracted,
         })
     }
 }
@@ -2659,13 +2667,19 @@ fn format_resolution(point: &DecisionPoint) -> String {
 }
 
 fn format_forage_observation(heading: &str, observation: &ForageObservation) -> String {
+    let retracted = if observation.retracted {
+        "\nRetracted: true"
+    } else {
+        ""
+    };
     format!(
-        "{heading}\nId: {}\nSource: {}\nExternal id: {}\nTitle: {}\nAccess: {}\nRetrieved: {}",
+        "{heading}\nId: {}\nSource: {}\nExternal id: {}\nTitle: {}\nAccess: {}{}\nRetrieved: {}",
         observation.id,
         observation.source_id,
         observation.external_id,
         observation.title,
         observation.access_status,
+        retracted,
         observation.retrieved_at
     )
 }
@@ -2820,6 +2834,7 @@ fn ingest_forage_hits(
             &hit.external_id,
             &hit.title,
             hit.access_status,
+            false,
         )?);
     }
 

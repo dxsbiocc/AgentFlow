@@ -94,6 +94,7 @@ pub struct ForageObservation {
     pub external_id: String,
     pub title: String,
     pub access_status: AccessStatus,
+    pub retracted: bool,
     pub retrieved_at: i64,
 }
 
@@ -162,6 +163,14 @@ pub fn grade_for_forage_source(status: AccessStatus, source_id: &str) -> Evidenc
     }
 }
 
+pub fn grade_for_forage_observation(observation: &ForageObservation) -> EvidenceGrade {
+    if observation.retracted {
+        EvidenceGrade::Unsupported
+    } else {
+        grade_for_forage_source(observation.access_status, &observation.source_id)
+    }
+}
+
 pub fn current_strength(strength0: f64, age_days: f64, half_life_days: u32) -> f64 {
     if half_life_days == 0 || age_days <= 0.0 {
         return strength0;
@@ -196,6 +205,7 @@ impl ProjectStore {
         external_id: &str,
         title: &str,
         access_status: AccessStatus,
+        retracted: bool,
     ) -> Result<ForageObservation, StorageError> {
         validate_non_empty("observation source_id", source_id)?;
         validate_non_empty("observation external_id", external_id)?;
@@ -211,6 +221,7 @@ impl ProjectStore {
                 external_id,
                 title,
                 access_status,
+                retracted,
             ),
         })?;
         self.touch_project()?;
@@ -295,7 +306,7 @@ impl ProjectStore {
             hypothesis_id: hypothesis_id.to_string(),
             observation_id: Some(observation.id.clone()),
             source: Some(observation.external_id.clone()),
-            grade: grade_for_forage_source(observation.access_status, &observation.source_id),
+            grade: grade_for_forage_observation(&observation),
             stance,
             note: note.to_string(),
         })
@@ -334,6 +345,8 @@ struct ForageObservationPayload {
     external_id: String,
     title: String,
     access_status: AccessStatus,
+    #[serde(default)]
+    retracted: bool,
 }
 
 fn forage_observation_payload_json(
@@ -341,12 +354,14 @@ fn forage_observation_payload_json(
     external_id: &str,
     title: &str,
     access_status: AccessStatus,
+    retracted: bool,
 ) -> String {
     serde_json::to_string(&ForageObservationPayload {
         source_id: source_id.trim().to_string(),
         external_id: external_id.trim().to_string(),
         title: title.trim().to_string(),
         access_status,
+        retracted,
     })
     .expect("forage observation payload serializes to JSON")
 }
@@ -363,6 +378,7 @@ fn forage_observation_from_event(
         external_id: payload.external_id,
         title: payload.title,
         access_status: payload.access_status,
+        retracted: payload.retracted,
         retrieved_at: created_at,
     })
 }
@@ -387,8 +403,8 @@ mod tests {
     use crate::storage::{now_unix_seconds, EventRecord, ProjectStore, StorageError};
 
     use super::{
-        current_strength, grade_for_forage_source, grade_from_access, is_preprint_source,
-        AccessStatus, ForageAction, ForagePolicy,
+        current_strength, grade_for_forage_observation, grade_for_forage_source, grade_from_access,
+        is_preprint_source, AccessStatus, ForageAction, ForagePolicy,
     };
 
     fn temp_project_path(test_name: &str) -> PathBuf {
@@ -509,6 +525,42 @@ mod tests {
     }
 
     #[test]
+    fn retracted_observation_is_unsupported_regardless_of_access() {
+        let observation = super::ForageObservation {
+            id: "event_1".to_string(),
+            source_id: "pubmed".to_string(),
+            external_id: "PMID:123".to_string(),
+            title: "Retracted full text".to_string(),
+            access_status: AccessStatus::OpenAccessFullText,
+            retracted: true,
+            retrieved_at: 123,
+        };
+
+        assert_eq!(
+            grade_for_forage_observation(&observation),
+            EvidenceGrade::Unsupported
+        );
+    }
+
+    #[test]
+    fn non_retracted_observation_keeps_source_grade() {
+        let observation = super::ForageObservation {
+            id: "event_1".to_string(),
+            source_id: "pubmed".to_string(),
+            external_id: "PMID:123".to_string(),
+            title: "Full text".to_string(),
+            access_status: AccessStatus::OpenAccessFullText,
+            retracted: false,
+            retrieved_at: 123,
+        };
+
+        assert_eq!(
+            grade_for_forage_observation(&observation),
+            grade_for_forage_source(observation.access_status, &observation.source_id)
+        );
+    }
+
+    #[test]
     fn forage_action_round_trips_payload_text() {
         for action in [
             ForageAction::ReadMap,
@@ -582,6 +634,7 @@ mod tests {
                 " PMID:123 ",
                 " Marker A supports pathway B ",
                 AccessStatus::OpenAccessFullText,
+                false,
             )
             .unwrap();
 
@@ -591,6 +644,7 @@ mod tests {
         assert_eq!(observation.external_id, "PMID:123");
         assert_eq!(observation.title, "Marker A supports pathway B");
         assert_eq!(observation.access_status, AccessStatus::OpenAccessFullText);
+        assert!(!observation.retracted);
         assert!(observation.retrieved_at > 0);
 
         let observations = store.list_forage_observations().unwrap();
@@ -632,6 +686,7 @@ mod tests {
         assert_eq!(inspected.external_id, "PMID:legacy");
         assert_eq!(inspected.title, "Legacy \"payload\"\nparses");
         assert_eq!(inspected.access_status, AccessStatus::AbstractAvailable);
+        assert!(!inspected.retracted);
 
         let _ = std::fs::remove_dir_all(path);
     }
@@ -644,12 +699,13 @@ mod tests {
             external_id: "PMID:123".to_string(),
             title: "Quote \" and newline\nslash \\ tab\t".to_string(),
             access_status: AccessStatus::AbstractAvailable,
+            retracted: false,
             retrieved_at: 123,
         };
 
         assert_eq!(
             observation.to_json(),
-            "{\"id\":\"event_1\",\"source_id\":\"pubmed\",\"external_id\":\"PMID:123\",\"title\":\"Quote \\\" and newline\\nslash \\\\ tab\\t\",\"access_status\":\"abstract_available\",\"retrieved_at\":123}"
+            "{\"id\":\"event_1\",\"source_id\":\"pubmed\",\"external_id\":\"PMID:123\",\"title\":\"Quote \\\" and newline\\nslash \\\\ tab\\t\",\"access_status\":\"abstract_available\",\"retracted\":false,\"retrieved_at\":123}"
         );
         assert_eq!(
             super::forage_action_payload_json(
@@ -665,8 +721,9 @@ mod tests {
                 " PMID:123 ",
                 " Title\nwith tab\t ",
                 AccessStatus::OpenAccessFullText,
+                false,
             ),
-            "{\"source_id\":\"pubmed\",\"external_id\":\"PMID:123\",\"title\":\"Title\\nwith tab\",\"access_status\":\"open_access_full_text\"}"
+            "{\"source_id\":\"pubmed\",\"external_id\":\"PMID:123\",\"title\":\"Title\\nwith tab\",\"access_status\":\"open_access_full_text\",\"retracted\":false}"
         );
     }
 
@@ -681,6 +738,7 @@ mod tests {
                 "PMID:789",
                 "Later paper",
                 AccessStatus::AbstractAvailable,
+                false,
             )
             .unwrap();
 
@@ -713,6 +771,7 @@ mod tests {
                 "doi:10.1/example",
                 "Quoted \"title\"\nwith slash \\ marker",
                 AccessStatus::AbstractAvailable,
+                false,
             )
             .unwrap();
 
@@ -741,6 +800,7 @@ mod tests {
                 " ",
                 "Some title",
                 AccessStatus::OpenAccessFullText,
+                false,
             )
             .unwrap_err();
         assert!(error.to_string().contains("forage observation external_id"));
@@ -762,6 +822,7 @@ mod tests {
                 "doi:10.1101/2026.01.01.123456",
                 "Full-text preprint",
                 AccessStatus::UserProvidedFullText,
+                false,
             )
             .unwrap();
 
@@ -803,6 +864,7 @@ mod tests {
                 "PMID:456",
                 "Abstract-only paper",
                 AccessStatus::AbstractAvailable,
+                false,
             )
             .unwrap();
         store
@@ -841,6 +903,7 @@ mod tests {
                     &format!("PMID:{index}"),
                     &format!("Full text paper {index}"),
                     AccessStatus::OpenAccessFullText,
+                    false,
                 )
                 .unwrap();
             store

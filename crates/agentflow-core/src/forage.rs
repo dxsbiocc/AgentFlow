@@ -120,6 +120,48 @@ pub fn grade_from_access(status: AccessStatus) -> EvidenceGrade {
     }
 }
 
+/// Preprint / non-peer-reviewed servers, matched case-insensitively as a
+/// substring of the source id (e.g. `biorxiv`, `bioRxiv:2024.01`). Full text
+/// from these is genuine literature but has not cleared peer review.
+const PREPRINT_SOURCES: &[&str] = &[
+    "biorxiv",
+    "medrxiv",
+    "arxiv",
+    "chemrxiv",
+    "techrxiv",
+    "researchsquare",
+    "research square",
+    "research_square",
+    "ssrn",
+    "preprints.org",
+    "preprint",
+    "osf.io",
+    "osf preprints",
+    "zenodo",
+];
+
+/// Whether a foraged source is a known preprint / non-peer-reviewed server.
+pub fn is_preprint_source(source_id: &str) -> bool {
+    let lowered = source_id.to_ascii_lowercase();
+    PREPRINT_SOURCES.iter().any(|name| lowered.contains(name))
+}
+
+/// Evidence grade for a foraged source, honest about peer-review status.
+///
+/// Broadening evidence beyond peer-reviewed databases (e.g. bioRxiv/medRxiv)
+/// must not inflate confidence: a preprint's full text is capped at
+/// `Hypothesis` — it can support a hypothesis but never earns the peer-reviewed
+/// `LiteratureSupported` grade. Non-preprint sources keep their access-based
+/// grade unchanged.
+pub fn grade_for_forage_source(status: AccessStatus, source_id: &str) -> EvidenceGrade {
+    let grade = grade_from_access(status);
+    if grade == EvidenceGrade::LiteratureSupported && is_preprint_source(source_id) {
+        EvidenceGrade::Hypothesis
+    } else {
+        grade
+    }
+}
+
 pub fn current_strength(strength0: f64, age_days: f64, half_life_days: u32) -> f64 {
     if half_life_days == 0 || age_days <= 0.0 {
         return strength0;
@@ -253,7 +295,7 @@ impl ProjectStore {
             hypothesis_id: hypothesis_id.to_string(),
             observation_id: Some(observation.id.clone()),
             source: Some(observation.external_id.clone()),
-            grade: grade_from_access(observation.access_status),
+            grade: grade_for_forage_source(observation.access_status, &observation.source_id),
             stance,
             note: note.to_string(),
         })
@@ -344,7 +386,10 @@ mod tests {
     use crate::hypothesis::HypothesisRequest;
     use crate::storage::{now_unix_seconds, EventRecord, ProjectStore, StorageError};
 
-    use super::{current_strength, grade_from_access, AccessStatus, ForageAction, ForagePolicy};
+    use super::{
+        current_strength, grade_for_forage_source, grade_from_access, is_preprint_source,
+        AccessStatus, ForageAction, ForagePolicy,
+    };
 
     fn temp_project_path(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -410,6 +455,57 @@ mod tests {
             assert_eq!(status.to_string(), status.as_str());
         }
         assert_eq!(AccessStatus::parse("full_text"), None);
+    }
+
+    #[test]
+    fn preprint_full_text_is_capped_below_peer_reviewed() {
+        // Recognized preprint servers, in mixed case and with id suffixes.
+        for source in [
+            "biorxiv",
+            "bioRxiv:2024.01.02.573210",
+            "medRxiv",
+            "arXiv:2401.00001",
+            "researchsquare",
+            "ssrn",
+            "preprints.org",
+        ] {
+            assert!(is_preprint_source(source), "{source} should be a preprint");
+            // Full text from a preprint can support a hypothesis but is never
+            // peer-reviewed `LiteratureSupported`.
+            assert_eq!(
+                grade_for_forage_source(AccessStatus::OpenAccessFullText, source),
+                EvidenceGrade::Hypothesis,
+                "{source} full text must be capped"
+            );
+            assert_eq!(
+                grade_for_forage_source(AccessStatus::UserProvidedFullText, source),
+                EvidenceGrade::Hypothesis
+            );
+            // Weaker access stays exactly where access alone puts it.
+            assert_eq!(
+                grade_for_forage_source(AccessStatus::AbstractAvailable, source),
+                EvidenceGrade::Hypothesis
+            );
+            assert_eq!(
+                grade_for_forage_source(AccessStatus::MetadataOnly, source),
+                EvidenceGrade::Unsupported
+            );
+        }
+
+        // Peer-reviewed / unknown sources keep the access-based grade.
+        for source in [
+            "pubmed",
+            "pmc",
+            "doi:10.1038/s41586-024-00001",
+            "cbioportal",
+        ] {
+            assert!(!is_preprint_source(source), "{source} is not a preprint");
+            assert_eq!(
+                grade_for_forage_source(AccessStatus::OpenAccessFullText, source),
+                EvidenceGrade::LiteratureSupported,
+                "{source} full text keeps peer-reviewed grade"
+            );
+        }
     }
 
     #[test]
@@ -687,7 +783,10 @@ mod tests {
             link.source.as_deref(),
             Some("doi:10.1101/2026.01.01.123456")
         );
-        assert_eq!(link.grade, EvidenceGrade::LiteratureSupported);
+        // A bioRxiv preprint's full text is genuine literature but not
+        // peer-reviewed, so it is capped at Hypothesis rather than the
+        // peer-reviewed LiteratureSupported grade.
+        assert_eq!(link.grade, EvidenceGrade::Hypothesis);
         assert_eq!(link.stance, Stance::Supports);
 
         let _ = std::fs::remove_dir_all(path);

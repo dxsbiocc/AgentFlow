@@ -7,6 +7,65 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-25
+
+The agent now builds and runs multi-step research flows itself, executes
+independent steps in parallel, and grades foraged literature honestly by source
+trust. The deterministic 0-LLM verdict core (`argument.rs`) is byte-identical to
+0.3.0 — every change preserves the honesty invariants.
+
+### Added — Autonomous flow construction
+
+- **Deterministic gene-param inference (#93):** a tool param declared
+  `infer: gene` is filled from the hypothesis with a gene symbol (0-LLM, mirrors
+  `infer: cohort`). The value is recorded as inferred, so an autonomous run stays
+  grade-capped and cannot affirm. This let the full autonomous loop run live end
+  to end (match tool → fill param → build flow → run real analysis → hand off).
+- **Multi-step backward chaining (#94):** when the matched tool needs an input
+  type with no available artifact, the agent drafts a producer that outputs it
+  and wires `producer.output` into the consumer, applying producers first.
+- **Multi-level backward chaining (#95):** the above is now recursive — a
+  producer whose own input is unavailable chains another producer (depth-bounded,
+  cycle-guarded, all-or-nothing grounding). Proven live with a 3-step
+  RawCounts → NormalizedCounts → ExpressionTable → survival ladder the agent built
+  itself.
+- **Answer-vs-intermediate tool ranking (#96):** for a hypothesis query, tools
+  that yield an observation rank strictly ahead of intermediate producers, so a
+  keyword-heavy producer can't steal the top branch slot.
+
+### Added — Parallel step execution (#97)
+
+- **`--max-parallel N`** on `run` and `agent run` (default sequential,
+  byte-identical). Independent steps in a scheduler wave run their tool
+  subprocesses concurrently while preparation and recording stay serial on the
+  main thread, so the single SQLite connection is never shared. A consistency
+  test asserts parallel runs produce byte-identical outputs to serial; a live
+  fan-out of four `sleep 1` steps dropped ~4.0s → ~1.0s.
+
+### Added — Evidence breadth, honestly graded
+
+- **Preprint grading (#99):** foraged full text from known preprint servers
+  (bioRxiv/medRxiv/arXiv/SSRN/…) is capped at `Hypothesis` rather than the
+  peer-reviewed `LiteratureSupported`, so breadth doesn't inflate confidence.
+- **Retraction awareness (#100):** `forage observe --retracted` flags a source;
+  retracted sources grade `Unsupported` regardless of access. Because
+  `Unsupported`/`Hypothesis` cannot affirm a verdict, preprint and retracted
+  evidence can never push a hypothesis to affirmed.
+
+### Fixed
+
+- **Strictly-monotonic entity IDs (#98):** `now_unix_nanos` (consolidated from
+  three copies) now returns `max(clock, last + 1)` under a mutex, so back-to-back
+  ID minting — newly observable in the parallel wave — can't collide on a UNIQUE
+  insert.
+
+### Project
+
+- `scripts/acceptance-session.sh`: a repeatable end-to-end acceptance — from one
+  hypothesis the agent builds a multi-level flow, runs it in parallel, foraged
+  literature is graded by source trust, and the deterministic verdict honestly
+  declines to affirm without observed support.
+
 ## [0.3.0] - 2026-06-23
 
 Nextflow-style multi-engine container execution, plus the first real-runtime

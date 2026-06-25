@@ -729,6 +729,8 @@ pub(crate) struct ForageObserveArgs {
     pub(crate) access: Vec<String>,
     #[arg(long)]
     pub(crate) retracted: bool,
+    #[arg(long, value_name = "published-id")]
+    pub(crate) published_as: Vec<String>,
     #[command(flatten)]
     pub(crate) project: PathJsonArgs,
 }

@@ -104,7 +104,7 @@ pub fn usage() -> String {
         "  agentflow decision pending [--json] [--path <path>]",
         "  agentflow decision show <decision-id> [--json] [--path <path>]",
         "  agentflow decision resolve <decision-id> --choose <index> --note <text> [--json] [--path <path>]",
-        "  agentflow forage observe --source <source> --external-id <external-id> --title <title> --access metadata_only|abstract_available|open_access_full_text|user_provided_full_text|subscription_connector_full_text|full_text_unavailable|retrieval_failed [--retracted] [--json] [--path <path>]",
+        "  agentflow forage observe --source <source> --external-id <external-id> --title <title> --access metadata_only|abstract_available|open_access_full_text|user_provided_full_text|subscription_connector_full_text|full_text_unavailable|retrieval_failed [--retracted] [--published-as <id>] [--json] [--path <path>]",
         "  agentflow forage list [--json] [--path <path>]",
         "  agentflow forage show <forage-obs-id> [--json] [--path <path>]",
         "  agentflow forage link --hypothesis <id> --observation <forage-obs-id> --stance supports|contradicts|neutral --note <text> [--json] [--path <path>]",

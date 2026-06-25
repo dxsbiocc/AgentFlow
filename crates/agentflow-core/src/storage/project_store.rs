@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection};
@@ -256,11 +257,23 @@ pub fn now_unix_seconds() -> i64 {
         .as_secs() as i64
 }
 
-fn now_unix_nanos() -> u128 {
-    SystemTime::now()
+/// Unix-epoch nanoseconds that are strictly increasing within a process.
+///
+/// Entity IDs (`run_…`, `attempt_…`, `event_…`, `artifact_…`, `project_…`) are
+/// formed from this value, so it must never repeat: the system clock has limited
+/// resolution and can step backwards, and steps prepared back-to-back (worse in
+/// a parallel wave) can otherwise read the same nanosecond and collide on a
+/// UNIQUE insert. A process-global guard returns `max(clock, last + 1)`.
+pub fn now_unix_nanos() -> u128 {
+    static LAST: Mutex<u128> = Mutex::new(0);
+    let clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos()
+        .as_nanos();
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let value = clock.max(last.saturating_add(1));
+    *last = value;
+    value
 }
 
 fn open_connection(db_path: &Path) -> Result<Connection, StorageError> {
@@ -302,6 +315,48 @@ fn escape_toml(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn now_unix_nanos_is_strictly_increasing_and_unique() {
+        // Even called back-to-back (as in a parallel wave's prepare phase),
+        // every value must be distinct and monotonically increasing so the IDs
+        // derived from it never collide on a UNIQUE insert.
+        let mut previous = now_unix_nanos();
+        let mut seen = std::collections::BTreeSet::new();
+        seen.insert(previous);
+        for _ in 0..100_000 {
+            let value = now_unix_nanos();
+            assert!(
+                value > previous,
+                "value {value} not greater than {previous}"
+            );
+            assert!(seen.insert(value), "duplicate value {value}");
+            previous = value;
+        }
+    }
+
+    #[test]
+    fn now_unix_nanos_is_unique_across_threads() {
+        use std::sync::Arc;
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let collected = Arc::clone(&collected);
+                scope.spawn(move || {
+                    let mut local = Vec::with_capacity(5_000);
+                    for _ in 0..5_000 {
+                        local.push(now_unix_nanos());
+                    }
+                    collected.lock().unwrap().extend(local);
+                });
+            }
+        });
+        let mut all = Arc::try_unwrap(collected).unwrap().into_inner().unwrap();
+        let total = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), total, "ids collided across threads");
+    }
 
     fn temp_project_path(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

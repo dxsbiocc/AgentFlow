@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::ArtifactKind;
 
 use super::project_store::{
-    now_unix_seconds, project_dir, EventRecord, ProjectStore, StorageError,
+    now_unix_nanos, now_unix_seconds, project_dir, EventRecord, ProjectStore, StorageError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -679,13 +679,6 @@ fn hash_file_fnv64(path: &Path) -> Result<String, StorageError> {
         }
     }
     Ok(format!("fnv64:{hash:016x}"))
-}
-
-fn now_unix_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
 }
 
 #[cfg(test)]

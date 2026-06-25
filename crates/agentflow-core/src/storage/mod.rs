@@ -16,8 +16,8 @@ pub use flow_registry::{
 };
 pub use migrations::MigrationRecord;
 pub use project_store::{
-    now_unix_seconds, project_db_path, project_dir, EventId, EventRecord, ProjectStore,
-    ProjectSummary, StorageError,
+    now_unix_nanos, now_unix_seconds, project_db_path, project_dir, EventId, EventRecord,
+    ProjectStore, ProjectSummary, StorageError,
 };
 pub use schema::{DEFERRED_TABLES, V0_TABLES};
 pub(crate) use tool_registry::validate_param_value;

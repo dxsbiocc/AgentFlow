@@ -3727,12 +3727,7 @@ fn env_key(value: &str) -> String {
         .collect()
 }
 
-fn now_unix_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-}
+use crate::storage::now_unix_nanos;
 
 #[cfg(test)]
 mod tests {

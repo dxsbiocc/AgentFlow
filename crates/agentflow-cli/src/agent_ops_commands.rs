@@ -103,6 +103,7 @@ struct ForageObserveOptions {
     title: Option<String>,
     access: Option<AccessStatus>,
     retracted: bool,
+    published_as: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -515,6 +516,7 @@ fn forage_observe_command(args: ForageObserveArgs) -> Result<String, CliError> {
         &title,
         access,
         options.retracted,
+        options.published_as.as_deref(),
     )?;
 
     if options.project.json {
@@ -2168,6 +2170,7 @@ impl TryFrom<ForageObserveArgs> for ForageObserveOptions {
                 .map(|access| parse_access_status(&access))
                 .transpose()?,
             retracted: args.retracted,
+            published_as: last_value(args.published_as),
         })
     }
 }
@@ -2668,25 +2671,32 @@ fn format_resolution(point: &DecisionPoint) -> String {
 
 fn format_forage_observation(heading: &str, observation: &ForageObservation) -> String {
     let retracted = if observation.retracted {
-        "\nRetracted: true"
+        "\nRetracted: true".to_string()
     } else {
-        ""
+        String::new()
+    };
+    let published_as = match &observation.published_as {
+        Some(published) => format!("\nPublished as: {published}"),
+        None => String::new(),
     };
     format!(
-        "{heading}\nId: {}\nSource: {}\nExternal id: {}\nTitle: {}\nAccess: {}{}\nRetrieved: {}",
+        "{heading}\nId: {}\nSource: {}\nExternal id: {}\nTitle: {}\nAccess: {}{}{}\nRetrieved: {}",
         observation.id,
         observation.source_id,
         observation.external_id,
         observation.title,
         observation.access_status,
         retracted,
+        published_as,
         observation.retrieved_at
     )
 }
 
 fn format_forage_observation_summary(observation: &ForageObservation) -> String {
-    let retracted = if observation.retracted {
+    let marker = if observation.retracted {
         " RETRACTED"
+    } else if observation.published_as.is_some() {
+        " PUBLISHED"
     } else {
         ""
     };
@@ -2694,7 +2704,7 @@ fn format_forage_observation_summary(observation: &ForageObservation) -> String 
         "{} [{}{}] {}\n  source: {}\n  external id: {}",
         observation.id,
         observation.access_status,
-        retracted,
+        marker,
         observation.title,
         observation.source_id,
         observation.external_id
@@ -2841,6 +2851,7 @@ fn ingest_forage_hits(
             &hit.title,
             hit.access_status,
             false,
+            None,
         )?);
     }
 
@@ -4915,6 +4926,74 @@ EOF
         .unwrap();
         assert!(link.contains("\"grade\":\"literature_supported\""));
         assert!(link.contains("\"stance\":\"supports\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn forage_observe_published_preprint_lifts_cap() {
+        let path = temp_project_path("forage-published");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis(&store);
+
+        // A bioRxiv preprint marked as since-published is no longer capped.
+        let observation = run(args(&[
+            "agentflow",
+            "forage",
+            "observe",
+            "--source",
+            "biorxiv",
+            "--external-id",
+            "doi:10.1101/2026.01.01",
+            "--title",
+            "Preprint later published",
+            "--access",
+            "user_provided_full_text",
+            "--published-as",
+            "PMID:40000001",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(observation.contains("\"published_as\":\"PMID:40000001\""));
+        let observation_id = json_id(&observation);
+
+        let list = run(args(&[
+            "agentflow",
+            "forage",
+            "list",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(
+            list.contains("PUBLISHED"),
+            "list should flag publication:\n{list}"
+        );
+
+        let link = run(args(&[
+            "agentflow",
+            "forage",
+            "link",
+            "--hypothesis",
+            &hypothesis_id,
+            "--observation",
+            &observation_id,
+            "--stance",
+            "supports",
+            "--note",
+            "published",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        // Cap lifted: peer-reviewed full text grades literature_supported, not hypothesis.
+        assert!(
+            link.contains("\"grade\":\"literature_supported\""),
+            "published preprint must grade literature_supported:\n{link}"
+        );
 
         let _ = std::fs::remove_dir_all(path);
     }

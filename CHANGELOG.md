@@ -7,6 +7,16 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+### Added
+
+- **Preprint publication upgrade:** a foraged observation can record that a
+  preprint has since been peer-reviewed/published (`forage observe
+  --published-as <id>`). A published preprint is no longer grade-capped — it is
+  graded on access like any peer-reviewed source. Combined with retraction
+  (which still dominates), a literature source now has a full honesty lifecycle:
+  preprint (`Hypothesis`) → published (`LiteratureSupported`) → retracted
+  (`Unsupported`).
+
 ## [0.3.1] - 2026-06-25
 
 The agent now builds and runs multi-step research flows itself, executes

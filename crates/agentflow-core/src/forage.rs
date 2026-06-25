@@ -95,6 +95,11 @@ pub struct ForageObservation {
     pub title: String,
     pub access_status: AccessStatus,
     pub retracted: bool,
+    /// If a preprint has since been peer-reviewed/published, the published
+    /// version's id (e.g. `PMID:…`/`doi:…`). When set, the preprint grade cap is
+    /// lifted — the source is graded on access like any peer-reviewed work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_as: Option<String>,
     pub retrieved_at: i64,
 }
 
@@ -165,7 +170,13 @@ pub fn grade_for_forage_source(status: AccessStatus, source_id: &str) -> Evidenc
 
 pub fn grade_for_forage_observation(observation: &ForageObservation) -> EvidenceGrade {
     if observation.retracted {
+        // A retracted source supports nothing, even if later published elsewhere.
         EvidenceGrade::Unsupported
+    } else if observation.published_as.is_some() {
+        // A preprint that has since been peer-reviewed/published is no longer a
+        // preprint for grading purposes — grade it on access alone, lifting the
+        // preprint cap. (For a non-preprint source this is already a no-op.)
+        grade_from_access(observation.access_status)
     } else {
         grade_for_forage_source(observation.access_status, &observation.source_id)
     }
@@ -206,6 +217,7 @@ impl ProjectStore {
         title: &str,
         access_status: AccessStatus,
         retracted: bool,
+        published_as: Option<&str>,
     ) -> Result<ForageObservation, StorageError> {
         validate_non_empty("observation source_id", source_id)?;
         validate_non_empty("observation external_id", external_id)?;
@@ -222,6 +234,7 @@ impl ProjectStore {
                 title,
                 access_status,
                 retracted,
+                published_as,
             ),
         })?;
         self.touch_project()?;
@@ -347,6 +360,8 @@ struct ForageObservationPayload {
     access_status: AccessStatus,
     #[serde(default)]
     retracted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_as: Option<String>,
 }
 
 fn forage_observation_payload_json(
@@ -355,6 +370,7 @@ fn forage_observation_payload_json(
     title: &str,
     access_status: AccessStatus,
     retracted: bool,
+    published_as: Option<&str>,
 ) -> String {
     serde_json::to_string(&ForageObservationPayload {
         source_id: source_id.trim().to_string(),
@@ -362,6 +378,10 @@ fn forage_observation_payload_json(
         title: title.trim().to_string(),
         access_status,
         retracted,
+        published_as: published_as
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
     })
     .expect("forage observation payload serializes to JSON")
 }
@@ -379,6 +399,7 @@ fn forage_observation_from_event(
         title: payload.title,
         access_status: payload.access_status,
         retracted: payload.retracted,
+        published_as: payload.published_as,
         retrieved_at: created_at,
     })
 }
@@ -533,6 +554,7 @@ mod tests {
             title: "Retracted full text".to_string(),
             access_status: AccessStatus::OpenAccessFullText,
             retracted: true,
+            published_as: None,
             retrieved_at: 123,
         };
 
@@ -551,12 +573,55 @@ mod tests {
             title: "Full text".to_string(),
             access_status: AccessStatus::OpenAccessFullText,
             retracted: false,
+            published_as: None,
             retrieved_at: 123,
         };
 
         assert_eq!(
             grade_for_forage_observation(&observation),
             grade_for_forage_source(observation.access_status, &observation.source_id)
+        );
+    }
+
+    #[test]
+    fn published_preprint_is_no_longer_capped() {
+        let base = super::ForageObservation {
+            id: "event_1".to_string(),
+            source_id: "biorxiv".to_string(),
+            external_id: "doi:10.1101/2026.01.01".to_string(),
+            title: "Preprint, later published".to_string(),
+            access_status: AccessStatus::OpenAccessFullText,
+            retracted: false,
+            published_as: None,
+            retrieved_at: 123,
+        };
+
+        // Before publication: a bioRxiv full text is capped at Hypothesis.
+        assert_eq!(
+            grade_for_forage_observation(&base),
+            EvidenceGrade::Hypothesis
+        );
+
+        // After publication: the preprint cap is lifted — full text now grades
+        // as peer-reviewed LiteratureSupported.
+        let published = super::ForageObservation {
+            published_as: Some("PMID:40000001".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(
+            grade_for_forage_observation(&published),
+            EvidenceGrade::LiteratureSupported
+        );
+
+        // Retraction dominates publication: a retracted-and-published source is
+        // still Unsupported.
+        let retracted = super::ForageObservation {
+            retracted: true,
+            ..published
+        };
+        assert_eq!(
+            grade_for_forage_observation(&retracted),
+            EvidenceGrade::Unsupported
         );
     }
 
@@ -635,6 +700,7 @@ mod tests {
                 " Marker A supports pathway B ",
                 AccessStatus::OpenAccessFullText,
                 false,
+                None,
             )
             .unwrap();
 
@@ -700,6 +766,7 @@ mod tests {
             title: "Quote \" and newline\nslash \\ tab\t".to_string(),
             access_status: AccessStatus::AbstractAvailable,
             retracted: false,
+            published_as: None,
             retrieved_at: 123,
         };
 
@@ -722,6 +789,7 @@ mod tests {
                 " Title\nwith tab\t ",
                 AccessStatus::OpenAccessFullText,
                 false,
+                            None,
             ),
             "{\"source_id\":\"pubmed\",\"external_id\":\"PMID:123\",\"title\":\"Title\\nwith tab\",\"access_status\":\"open_access_full_text\",\"retracted\":false}"
         );
@@ -739,6 +807,7 @@ mod tests {
                 "Later paper",
                 AccessStatus::AbstractAvailable,
                 false,
+                None,
             )
             .unwrap();
 
@@ -772,6 +841,7 @@ mod tests {
                 "Quoted \"title\"\nwith slash \\ marker",
                 AccessStatus::AbstractAvailable,
                 false,
+                None,
             )
             .unwrap();
 
@@ -801,6 +871,7 @@ mod tests {
                 "Some title",
                 AccessStatus::OpenAccessFullText,
                 false,
+                None,
             )
             .unwrap_err();
         assert!(error.to_string().contains("forage observation external_id"));
@@ -823,6 +894,7 @@ mod tests {
                 "Full-text preprint",
                 AccessStatus::UserProvidedFullText,
                 false,
+                None,
             )
             .unwrap();
 
@@ -865,6 +937,7 @@ mod tests {
                 "Abstract-only paper",
                 AccessStatus::AbstractAvailable,
                 false,
+                None,
             )
             .unwrap();
         store
@@ -904,6 +977,7 @@ mod tests {
                     &format!("Full text paper {index}"),
                     AccessStatus::OpenAccessFullText,
                     false,
+                    None,
                 )
                 .unwrap();
             store

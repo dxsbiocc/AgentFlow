@@ -727,6 +727,8 @@ pub(crate) struct ForageObserveArgs {
     pub(crate) title: Vec<String>,
     #[arg(long, value_name = "access")]
     pub(crate) access: Vec<String>,
+    #[arg(long)]
+    pub(crate) retracted: bool,
     #[command(flatten)]
     pub(crate) project: PathJsonArgs,
 }

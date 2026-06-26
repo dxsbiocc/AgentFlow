@@ -7,6 +7,14 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-06-26
+
+Completes the literature-evidence honesty lifecycle: a foraged source can move
+through preprint → published → retracted with the grade following honestly, and
+that status can be verified automatically by an external script while the core
+stays offline. The deterministic 0-LLM verdict core (`argument.rs`) remains
+byte-identical to 0.3.0.
+
 ### Added
 
 - **Preprint publication upgrade:** a foraged observation can record that a

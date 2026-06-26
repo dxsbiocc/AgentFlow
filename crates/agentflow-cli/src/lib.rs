@@ -1283,8 +1283,15 @@ fn flow_plan_command(args: FlowInspectArgs) -> Result<String, CliError> {
     let waves = store.plan_flow(&flow_id)?;
 
     if options.json {
-        let quote =
-            |value: &str| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""));
+        let quote = |value: &str| {
+            let escaped = value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            format!("\"{escaped}\"")
+        };
         let waves_json = waves
             .iter()
             .map(|wave| {

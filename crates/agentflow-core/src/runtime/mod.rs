@@ -774,8 +774,12 @@ impl ProjectStore {
     /// without running anything. Each inner vec is one scheduler wave: its steps
     /// have no dependency on each other (so they run together — concurrently
     /// under `--max-parallel`), and waves run in order. Already-completed steps
-    /// are excluded; a step whose dependencies can never complete is omitted.
-    /// Step local ids are returned in the order the scheduler would launch them.
+    /// (including `completed_with_warning`) are excluded; a step whose
+    /// dependencies can never complete is omitted — including the dependents of a
+    /// `running`-status step stranded by a crashed run, which is treated as not
+    /// done (reset it to `failed`/`draft` before re-planning if the plan looks
+    /// truncated). Step local ids are returned in the order the scheduler would
+    /// launch them.
     pub fn plan_flow(&self, flow_id: &str) -> Result<Vec<Vec<String>>, StorageError> {
         let flow = self.inspect_flow(flow_id)?;
         // Completed steps are prerequisites already satisfied. (We simulate the
@@ -2061,7 +2065,11 @@ fn run_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecordSum
 fn completed_step_ids(steps: &[StoredFlowStep]) -> BTreeSet<String> {
     steps
         .iter()
-        .filter(|step| step.status == StepStatus::Completed.as_str())
+        .filter(|step| {
+            // Both are terminal-success states whose dependents may proceed.
+            step.status == StepStatus::Completed.as_str()
+                || step.status == StepStatus::CompletedWithWarning.as_str()
+        })
         .map(|step| step.id.clone())
         .collect()
 }

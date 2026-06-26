@@ -7,6 +7,12 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-06-26
+
+Tooling release: working example scripts that make the v0.3.2 literature
+auto-verification usable against real services. No engine change — the compiled
+runtime (and the 0-LLM verdict core) is functionally identical to 0.3.2.
+
 ### Added
 
 - **Crossref literature verifier example** (`examples/forage/crossref_verify.py`):

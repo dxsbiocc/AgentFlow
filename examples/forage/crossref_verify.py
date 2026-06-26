@@ -21,13 +21,17 @@ Signals used (all from Crossref `message`):
   - retraction: a `RETRACTED` title prefix, or an `update-to` entry of
     `type: retraction`;
   - publication of a preprint: `relation.is-preprint-of[].id` (the published DOI);
-  - access: preprints (`type: posted-content`) and items carrying a license are
-    treated as open-access full text, otherwise abstract-only.
+  - access: when UNPAYWALL_EMAIL is set, each DOI is checked against Unpaywall
+    for a precise `is_oa` (OA full text -> open_access_full_text, else
+    abstract-only). Without it, a heuristic is used: preprints
+    (`type: posted-content`) and licensed items are treated as open-access full
+    text, otherwise abstract-only.
 
 NETWORK: AgentFlow stays offline — only this user-controlled script calls the
-network, under your egress policy. Set CROSSREF_MAILTO to use Crossref's polite
-pool. Run `python crossref_verify.py --self-test` to validate the parsing offline
-without any network call.
+network, under your egress policy. Set CROSSREF_MAILTO for Crossref's polite pool
+and UNPAYWALL_EMAIL (a real address — Unpaywall rejects placeholders) for precise
+OA detection. Run `python crossref_verify.py --self-test` to validate the parsing
+offline without any network call.
 
 Guidance: pass `forage fetch --source biorxiv` (or the server you searched) so a
 bare preprint is correctly preprint-graded; a published preprint lifts the cap
@@ -60,14 +64,20 @@ def published_doi(work: dict) -> "str | None":
     return None
 
 
-def access_status(work: dict) -> str:
-    # A preprint's full text is openly readable; a licensed item is treated as OA.
+def access_status(work: dict, is_oa: "bool | None" = None) -> str:
+    # Precise signal wins: Unpaywall's is_oa says whether OA full text exists.
+    if is_oa is True:
+        return "open_access_full_text"
+    if is_oa is False:
+        return "abstract_available"
+    # No Unpaywall signal — fall back to the Crossref heuristic: a preprint's full
+    # text is openly readable, and a licensed item is treated as OA.
     if work.get("type") == "posted-content" or work.get("license"):
         return "open_access_full_text"
     return "abstract_available"
 
 
-def to_hit(work: dict) -> "dict | None":
+def to_hit(work: dict, is_oa: "bool | None" = None) -> "dict | None":
     doi = work.get("DOI")
     if not doi:
         return None
@@ -75,7 +85,7 @@ def to_hit(work: dict) -> "dict | None":
     hit = {
         "external_id": "doi:" + doi,
         "title": title,
-        "access_status": access_status(work),
+        "access_status": access_status(work, is_oa),
     }
     if is_retracted(work):
         hit["retracted"] = True
@@ -96,6 +106,28 @@ def search(query: str, rows: int) -> list:
     )
     with urllib.request.urlopen(request, timeout=20) as response:
         return json.load(response)["message"]["items"]
+
+
+UNPAYWALL = "https://api.unpaywall.org/v2/"
+
+
+def unpaywall_is_oa(doi: str, email: str) -> "bool | None":
+    """Whether an OA full text exists for `doi`, per Unpaywall. None on any
+    failure (network, bad status, error body, missing field) — never raises, so
+    the caller falls back to the Crossref heuristic."""
+    url = UNPAYWALL + urllib.parse.quote(doi) + "?" + urllib.parse.urlencode({"email": email})
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "AgentFlow-forage-verify/0.1 (https://github.com/dxsbiocc/AgentFlow)"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.load(response)
+    except Exception:  # noqa: BLE001 - any failure means "unknown", fall back
+        return None
+    if not isinstance(data, dict) or data.get("error"):
+        return None
+    is_oa = data.get("is_oa")
+    return is_oa if isinstance(is_oa, bool) else None
 
 
 def self_test() -> int:
@@ -125,6 +157,9 @@ def self_test() -> int:
     assert b["access_status"] == "open_access_full_text", b
     c = to_hit(retracted)
     assert c["retracted"] is True and "published_as" not in c, c
+    # A precise Unpaywall signal overrides the heuristic.
+    assert access_status(retracted, is_oa=True) == "open_access_full_text"
+    assert access_status(bare_preprint, is_oa=False) == "abstract_available"
     print("crossref_verify self-test: ok")
     return 0
 
@@ -149,10 +184,17 @@ def main() -> int:
         sys.stderr.write(f"crossref query failed: {error}\n")
         return 1
 
+    # Precise OA via Unpaywall when an email is configured; else the heuristic.
+    email = os.environ.get("UNPAYWALL_EMAIL", "").strip()
+
     written = 0
     with open(args.out, "w") as handle:
         for work in items:
-            hit = to_hit(work)
+            is_oa = None
+            doi = work.get("DOI")
+            if email and doi:
+                is_oa = unpaywall_is_oa(doi, email)
+            hit = to_hit(work, is_oa)
             if hit:
                 handle.write(json.dumps(hit) + "\n")
                 written += 1

@@ -75,6 +75,7 @@ pub fn usage() -> String {
         "  agentflow flow validate <flow.yaml> [--json] [--path <path>]",
         "  agentflow flow approve <flow.yaml> [--path <path>]",
         "  agentflow flow inspect <flow-id> [--json] [--path <path>]",
+        "  agentflow flow plan <flow-id> [--json] [--path <path>]",
         "  agentflow run <flow-id> [--container-engine docker|podman|singularity|apptainer] [--container-runner <path>] [--max-parallel <n>] [--keep-going] [--path <path>]",
         "  agentflow run-step <step-id|flow.step|step:flow/step> [--path <path>]",
         "  agentflow report <flow-id> [--path <path>]",
@@ -1206,6 +1207,7 @@ fn flow_command(args: FlowArgs) -> Result<String, CliError> {
         FlowCommand::Validate(args) => flow_validate_command(args),
         FlowCommand::Approve(args) => flow_approve_command(args),
         FlowCommand::Inspect(args) => flow_inspect_command(args),
+        FlowCommand::Plan(args) => flow_plan_command(args),
     }
 }
 
@@ -1270,6 +1272,55 @@ fn flow_inspect_command(args: FlowInspectArgs) -> Result<String, CliError> {
             inspection.steps.len(),
             inspection.edges.len()
         ))
+    }
+}
+
+fn flow_plan_command(args: FlowInspectArgs) -> Result<String, CliError> {
+    let flow_id = args.flow_id;
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
+    let waves = store.plan_flow(&flow_id)?;
+
+    if options.json {
+        let quote = |value: &str| {
+            let escaped = value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            format!("\"{escaped}\"")
+        };
+        let waves_json = waves
+            .iter()
+            .map(|wave| {
+                let steps = wave
+                    .iter()
+                    .map(|step| quote(step))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("[{steps}]")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(format!(
+            "{{\"schema_version\":\"agentflow.flow_plan.v0\",\"flow_id\":{},\"waves\":[{}]}}",
+            quote(&flow_id),
+            waves_json
+        ))
+    } else if waves.is_empty() {
+        Ok(format!("Flow: {flow_id}\nNo runnable steps."))
+    } else {
+        let max_width = waves.iter().map(Vec::len).max().unwrap_or(0);
+        let mut out = format!(
+            "Flow: {flow_id}\nWaves: {} (max parallel width {max_width})",
+            waves.len()
+        );
+        for (index, wave) in waves.iter().enumerate() {
+            out.push_str(&format!("\n  wave {}: {}", index + 1, wave.join(", ")));
+        }
+        Ok(out)
     }
 }
 

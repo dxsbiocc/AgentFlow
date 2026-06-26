@@ -16,6 +16,12 @@ technical preview; the public API and CLI surface may change between minor versi
   (which still dominates), a literature source now has a full honesty lifecycle:
   preprint (`Hypothesis`) → published (`LiteratureSupported`) → retracted
   (`Unsupported`).
+- **Verified status on ingest:** forage hits JSONL (`forage ingest` /
+  `forage fetch --script` / `agent run --forage-script`) may carry `retracted`
+  and `published_as`, so an external verify script (PubMed/Crossref/Retraction
+  Watch) populates them automatically and AgentFlow grades them honestly on
+  ingest — the network stays in the user's script; the core stays offline. Adds
+  `examples/forage/verify_status.py` as a template.
 
 ## [0.3.1] - 2026-06-25
 

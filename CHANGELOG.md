@@ -7,6 +7,15 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+### Added
+
+- **Crossref literature verifier example** (`examples/forage/crossref_verify.py`):
+  a real, working forage fetch/verify script that queries the public Crossref API
+  to auto-detect retraction (`update-to` / `RETRACTED` title) and preprint
+  publication (`relation.is-preprint-of`), emitting hits whose status AgentFlow
+  grades honestly on ingest. The network stays in the script; the core stays
+  offline. Ships an offline `--self-test` for the parsing logic.
+
 ## [0.3.2] - 2026-06-26
 
 Completes the literature-evidence honesty lifecycle: a foraged source can move

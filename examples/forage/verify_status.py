@@ -23,7 +23,8 @@ published preprint -> peer-reviewed grade, a bare preprint -> capped Hypothesis.
 NETWORK: AgentFlow itself stays offline — only this user-controlled script
 touches the network, under your egress policy. Replace `verify_status()` below
 with a real query. The default implementation is an offline stub so the example
-runs deterministically.
+runs deterministically. For a real, working network implementation see the
+sibling `crossref_verify.py` (queries the public Crossref API).
 """
 
 import argparse

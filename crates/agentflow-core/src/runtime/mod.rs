@@ -775,9 +775,11 @@ impl ProjectStore {
     /// caller); each batch is prepared (DB reads + run/attempt inserts), its
     /// subprocesses run on `std::thread::scope` worker threads, then its results
     /// are recorded — preparation and recording stay on the main thread, so the
-    /// single SQLite connection is never shared across threads. Like the
-    /// sequential path, a batch that produces any failure stops the wave (later
-    /// batches are neither prepared nor launched, so no run rows are orphaned).
+    /// single SQLite connection is never shared across threads. In fail-fast mode
+    /// (the default), like the sequential path, a batch that produces any failure
+    /// stops the wave (later batches are neither prepared nor launched, so no run
+    /// rows are orphaned); with `config.keep_going` every batch is run regardless
+    /// and the caller skips terminally-failed steps' dependents in the next wave.
     /// Returned in ready order, identical to a serial run of the same
     /// (independent) steps on the success path.
     fn run_ready_wave_parallel(
@@ -4036,6 +4038,13 @@ steps:
         assert_eq!(fail_fast.failed_steps, 1);
         assert_eq!(fail_fast.completed_steps, 0);
         assert_eq!(fail_fast.attempts.len(), 1);
+        // The single attempt is `bad` (it has >= the downstream-unblock count of
+        // `good` and is declared first, so the scheduler runs it first).
+        assert!(
+            fail_fast.attempts[0].step_id.ends_with("/bad"),
+            "fail-fast should stop at `bad`, not {:?}",
+            fail_fast.attempts[0].step_id
+        );
 
         // Keep-going: `bad` fails but the independent `good` -> `good_tail` branch
         // still runs; `bad_tail` (dependent on the failed `bad`) is skipped.
@@ -4059,10 +4068,14 @@ steps:
         let parallel = run_keep_going_flow_with("keep-going-parallel", true, 4);
         assert_eq!(parallel.failed_steps, 1);
         assert_eq!(parallel.completed_steps, 2);
-        assert!(!parallel
+        let parallel_ran: Vec<&str> = parallel
             .attempts
             .iter()
-            .any(|attempt| attempt.step_id.ends_with("/bad_tail")));
+            .map(|attempt| attempt.step_id.as_str())
+            .collect();
+        assert!(parallel_ran.iter().any(|id| id.ends_with("/bad")));
+        assert!(parallel_ran.iter().any(|id| id.ends_with("/good_tail")));
+        assert!(!parallel_ran.iter().any(|id| id.ends_with("/bad_tail")));
     }
 
     fn run_schedule_flow_with(

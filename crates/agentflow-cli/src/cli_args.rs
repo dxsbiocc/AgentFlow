@@ -116,6 +116,8 @@ pub(crate) struct RunArgs {
     pub(crate) container_runner: Vec<PathBuf>,
     #[arg(long, value_name = "n")]
     pub(crate) max_parallel: Vec<usize>,
+    #[arg(long)]
+    pub(crate) keep_going: bool,
     #[command(flatten)]
     pub(crate) project: PathOnlyArgs,
 }
@@ -592,6 +594,8 @@ pub(crate) struct AgentArgs {
     pub(crate) container_runner: Vec<PathBuf>,
     #[arg(long, global = true, value_name = "n")]
     pub(crate) max_parallel: Vec<usize>,
+    #[arg(long, global = true)]
+    pub(crate) keep_going: bool,
     #[command(subcommand)]
     pub(crate) command: AgentCommand,
 }

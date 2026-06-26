@@ -7,6 +7,15 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+### Added
+
+- **`--keep-going` (continue-on-error) execution:** `run` / `agent run
+  --keep-going` keeps running independent steps when one fails instead of
+  stopping at the first failure. A failed step is terminal (not retried) and its
+  dependents are skipped, but unrelated ready steps still run — for fan-out flows
+  you get every independent result and see all failures in one pass. Default is
+  unchanged fail-fast. Holds on both the sequential and parallel paths.
+
 ## [0.3.3] - 2026-06-26
 
 Tooling release: working example scripts that make the v0.3.2 literature

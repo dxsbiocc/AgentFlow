@@ -49,6 +49,11 @@ pub struct RunConfig {
     /// default, byte-identical to the pre-parallel runtime). Only the subprocess
     /// overlaps; preparation and recording stay serial on the main thread.
     pub max_parallel: usize,
+    /// Continue running independent steps when one fails, instead of stopping the
+    /// run at the first failure. A failed step is terminal (not retried) and its
+    /// dependents are skipped, but unrelated ready steps still run. Default
+    /// `false` keeps the fail-fast behavior, byte-identical to before.
+    pub keep_going: bool,
 }
 
 thread_local! {
@@ -692,14 +697,20 @@ impl ProjectStore {
         let mut completed_steps = 0;
         let mut failed_steps = 0;
         let mut attempts = Vec::new();
+        // In keep-going mode a failed step is terminal: record its id so it is not
+        // re-offered as "ready" (ready_steps re-includes failed steps for retry).
+        let mut failed_ids: BTreeSet<String> = BTreeSet::new();
 
         loop {
             let flow = self.inspect_flow(flow_id)?;
             let mut completed = completed_step_ids(&flow.steps);
-            let ready = RuleBasedStepScheduler.order(
+            let mut ready = RuleBasedStepScheduler.order(
                 ready_steps(&flow.steps, &flow.edges, &completed),
                 &flow.edges,
             );
+            if config.keep_going {
+                ready.retain(|step| !failed_ids.contains(&step.id));
+            }
             if ready.is_empty() {
                 break;
             }
@@ -717,6 +728,7 @@ impl ProjectStore {
                         }
                         _ => {
                             failed_steps += 1;
+                            failed_ids.insert(attempt.step_id.clone());
                         }
                     }
                     attempts.push(attempt);
@@ -732,16 +744,20 @@ impl ProjectStore {
                         }
                         _ => {
                             failed_steps += 1;
+                            failed_ids.insert(attempt.step_id.clone());
                         }
                     }
                     attempts.push(attempt);
-                    if failed_steps > 0 {
+                    if !config.keep_going && failed_steps > 0 {
                         break;
                     }
                 }
             }
 
-            if failed_steps > 0 || !progressed {
+            if !config.keep_going && failed_steps > 0 {
+                break;
+            }
+            if !progressed {
                 break;
             }
         }
@@ -759,9 +775,11 @@ impl ProjectStore {
     /// caller); each batch is prepared (DB reads + run/attempt inserts), its
     /// subprocesses run on `std::thread::scope` worker threads, then its results
     /// are recorded — preparation and recording stay on the main thread, so the
-    /// single SQLite connection is never shared across threads. Like the
-    /// sequential path, a batch that produces any failure stops the wave (later
-    /// batches are neither prepared nor launched, so no run rows are orphaned).
+    /// single SQLite connection is never shared across threads. In fail-fast mode
+    /// (the default), like the sequential path, a batch that produces any failure
+    /// stops the wave (later batches are neither prepared nor launched, so no run
+    /// rows are orphaned); with `config.keep_going` every batch is run regardless
+    /// and the caller skips terminally-failed steps' dependents in the next wave.
     /// Returned in ready order, identical to a serial run of the same
     /// (independent) steps on the success path.
     fn run_ready_wave_parallel(
@@ -827,8 +845,9 @@ impl ProjectStore {
                 batch_results[slot] = Some(self.record_step(prepared, output)?);
             }
 
-            // Collect in ready order; stop the wave after any failure, matching the
-            // sequential path which breaks on the first failed step.
+            // Collect in ready order; in fail-fast mode stop the wave after any
+            // failure (matching the sequential path). In keep-going mode run every
+            // batch — the caller skips terminally-failed steps' dependents.
             let mut batch_failed = false;
             for summary in batch_results.into_iter().flatten() {
                 if !matches!(summary.status.as_str(), "succeeded" | "cache_hit") {
@@ -836,7 +855,7 @@ impl ProjectStore {
                 }
                 attempts.push(summary);
             }
-            if batch_failed {
+            if batch_failed && !config.keep_going {
                 break;
             }
         }
@@ -3956,6 +3975,107 @@ steps:
 
     fn run_schedule_flow(test_name: &str, serial: bool) -> (PathBuf, FlowRunSummary) {
         run_schedule_flow_with(test_name, serial, 0)
+    }
+
+    // A fan-out flow with a failing root `bad` (declared first, so it runs first)
+    // and an independent succeeding root `good` -> `good_tail`; `bad_tail` depends
+    // on the failed `bad`. Runs in a fresh project with the given keep_going.
+    fn run_keep_going_flow(test_name: &str, keep_going: bool) -> FlowRunSummary {
+        run_keep_going_flow_with(test_name, keep_going, 0)
+    }
+
+    fn run_keep_going_flow_with(
+        test_name: &str,
+        keep_going: bool,
+        max_parallel: usize,
+    ) -> FlowRunSummary {
+        let path = temp_project_path(test_name);
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Keep Going Demo")).unwrap();
+        let ok = write_note_script(&path);
+        let fail = path.join("fail_tool.sh");
+        fs::write(&fail, "echo boom 1>&2\nexit 1\n").unwrap();
+
+        register_tool(
+            &store,
+            format!(
+                "schema_version: agentflow.tool.v0\nnamespace: kg\nname: emit_note\nversion: 0.1.0\nmaturity: wrapped\ndescription: Emit a note\nparams:\n  label:\n    type: string\n    required: true\noutputs:\n  note:\n    type: Text\nruntime:\n  backend: local\n  command:\n    - /bin/sh\n    - {}\n",
+                ok.display()
+            ),
+        );
+        register_tool(
+            &store,
+            format!(
+                "schema_version: agentflow.tool.v0\nnamespace: kg\nname: fail\nversion: 0.1.0\nmaturity: wrapped\ndescription: Always fails\noutputs:\n  note:\n    type: Text\nruntime:\n  backend: local\n  command:\n    - /bin/sh\n    - {}\n",
+                fail.display()
+            ),
+        );
+
+        let flow = FlowDraft::from_simple_yaml(
+            "schema_version: agentflow.flow.v0\nid: kg_demo\nname: Keep going demo\nsteps:\n  - id: bad\n    tool: kg/fail\n    needs: []\n    outputs:\n      note: bad_note\n  - id: good\n    tool: kg/emit_note\n    needs: []\n    params:\n      label: good\n    outputs:\n      note: good_note\n  - id: good_tail\n    tool: kg/emit_note\n    needs: [good]\n    params:\n      label: good_tail\n    outputs:\n      note: good_tail_note\n  - id: bad_tail\n    tool: kg/emit_note\n    needs: [bad]\n    params:\n      label: bad_tail\n    outputs:\n      note: bad_tail_note\n",
+        )
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+        let summary = store
+            .run_flow_with(
+                "kg_demo",
+                &RunConfig {
+                    keep_going,
+                    max_parallel,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let _ = fs::remove_dir_all(&path);
+        summary
+    }
+
+    #[test]
+    fn keep_going_runs_independent_steps_after_a_failure() {
+        // Fail-fast (default): stop at the first failure — `bad` runs and fails,
+        // nothing else is attempted.
+        let fail_fast = run_keep_going_flow("keep-going-off", false);
+        assert_eq!(fail_fast.failed_steps, 1);
+        assert_eq!(fail_fast.completed_steps, 0);
+        assert_eq!(fail_fast.attempts.len(), 1);
+        // The single attempt is `bad` (it has >= the downstream-unblock count of
+        // `good` and is declared first, so the scheduler runs it first).
+        assert!(
+            fail_fast.attempts[0].step_id.ends_with("/bad"),
+            "fail-fast should stop at `bad`, not {:?}",
+            fail_fast.attempts[0].step_id
+        );
+
+        // Keep-going: `bad` fails but the independent `good` -> `good_tail` branch
+        // still runs; `bad_tail` (dependent on the failed `bad`) is skipped.
+        let keep_going = run_keep_going_flow("keep-going-on", true);
+        assert_eq!(keep_going.failed_steps, 1);
+        assert_eq!(keep_going.completed_steps, 2);
+        let ran: Vec<&str> = keep_going
+            .attempts
+            .iter()
+            .map(|attempt| attempt.step_id.as_str())
+            .collect();
+        assert!(ran.iter().any(|id| id.ends_with("/good")));
+        assert!(ran.iter().any(|id| id.ends_with("/good_tail")));
+        assert!(
+            !ran.iter().any(|id| id.ends_with("/bad_tail")),
+            "dependent of a failed step must be skipped: {ran:?}"
+        );
+
+        // Keep-going holds on the parallel path too (run_ready_wave_parallel does
+        // not stop the wave on a batch failure when keep_going is set).
+        let parallel = run_keep_going_flow_with("keep-going-parallel", true, 4);
+        assert_eq!(parallel.failed_steps, 1);
+        assert_eq!(parallel.completed_steps, 2);
+        let parallel_ran: Vec<&str> = parallel
+            .attempts
+            .iter()
+            .map(|attempt| attempt.step_id.as_str())
+            .collect();
+        assert!(parallel_ran.iter().any(|id| id.ends_with("/bad")));
+        assert!(parallel_ran.iter().any(|id| id.ends_with("/good_tail")));
+        assert!(!parallel_ran.iter().any(|id| id.ends_with("/bad_tail")));
     }
 
     fn run_schedule_flow_with(

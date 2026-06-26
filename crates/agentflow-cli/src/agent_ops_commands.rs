@@ -2828,6 +2828,8 @@ struct ForageHit {
     external_id: String,
     title: String,
     access_status: AccessStatus,
+    retracted: bool,
+    published_as: Option<String>,
 }
 
 fn ingest_forage_hits(
@@ -2850,8 +2852,8 @@ fn ingest_forage_hits(
             &hit.external_id,
             &hit.title,
             hit.access_status,
-            false,
-            None,
+            hit.retracted,
+            hit.published_as.as_deref(),
         )?);
     }
 
@@ -2859,10 +2861,6 @@ fn ingest_forage_hits(
 }
 
 fn parse_forage_hit(line: &str, line_number: usize) -> Result<ForageHit, CliError> {
-    // Retraction status is intentionally not read from the hits JSONL: ingested
-    // hits default to non-retracted, and retraction is asserted deliberately via
-    // `forage observe --retracted`. If fetch scripts start carrying retraction
-    // data, wire it through here.
     let external_id = required_jsonl_string(line, "external_id", line_number)?;
     let title = required_jsonl_string(line, "title", line_number)?;
     let access_status_value = required_jsonl_string(line, "access_status", line_number)?;
@@ -2871,12 +2869,33 @@ fn parse_forage_hit(line: &str, line_number: usize) -> Result<ForageHit, CliErro
             "hits JSONL line {line_number} has invalid access_status: {access_status_value}"
         ))
     })?;
+    // Optional verified status from the fetch/verify script (e.g. a PubMed /
+    // Crossref / Retraction-Watch lookup): absent fields default to
+    // non-retracted / not-yet-published, preserving prior behavior.
+    let retracted = json_bool_field(line, "retracted").unwrap_or(false);
+    let published_as = json_string_field(line, "published_as").filter(|value| !value.is_empty());
 
     Ok(ForageHit {
         external_id,
         title,
         access_status,
+        retracted,
+        published_as,
     })
+}
+
+/// Parse a JSON boolean field (`"name": true|false`) from a single-line object.
+fn json_bool_field(json: &str, field: &str) -> Option<bool> {
+    let marker = format!("\"{field}\"");
+    let start = json.find(&marker)? + marker.len();
+    let rest = json[start..].trim_start().strip_prefix(':')?.trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn required_jsonl_string(line: &str, field: &str, line_number: usize) -> Result<String, CliError> {
@@ -5133,6 +5152,94 @@ EOF
         assert!(list.contains("\"source_id\":\"pubmed\""));
         assert!(list.contains("\"external_id\":\"PMID:39000001\""));
         assert!(list.contains("\"external_id\":\"PMID:39000002\""));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn forage_ingest_carries_verified_retraction_and_publication_status() {
+        let path = temp_project_path("forage-ingest-status");
+        let store = init_project(&path);
+        let hypothesis_id = record_hypothesis(&store);
+        let hits = path.join("hits.jsonl");
+        // A fetch/verify script (PubMed/Crossref/Retraction-Watch lookup) emits the
+        // verified status alongside each hit; ingestion grades it honestly.
+        std::fs::write(
+            &hits,
+            concat!(
+                "{\"external_id\":\"PMID:R\",\"title\":\"Retracted\",\"access_status\":\"open_access_full_text\",\"retracted\":true}\n",
+                "{\"external_id\":\"doi:10.1101/P\",\"title\":\"Published preprint\",\"access_status\":\"user_provided_full_text\",\"published_as\":\"PMID:40000003\"}\n",
+                "{\"external_id\":\"doi:10.1101/X\",\"title\":\"Bare preprint\",\"access_status\":\"user_provided_full_text\"}\n",
+            ),
+        )
+        .unwrap();
+
+        run(args(&[
+            "agentflow",
+            "forage",
+            "ingest",
+            hits.to_str().unwrap(),
+            "--source",
+            "biorxiv",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        // The verified flags round-trip into the recorded observations.
+        let list = run(args(&[
+            "agentflow",
+            "forage",
+            "list",
+            "--json",
+            "--path",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(
+            list.contains("\"retracted\":true"),
+            "retraction recorded:\n{list}"
+        );
+        assert!(
+            list.contains("\"published_as\":\"PMID:40000003\""),
+            "publication recorded:\n{list}"
+        );
+
+        // And drive honest grades when linked.
+        let mut grades = std::collections::BTreeSet::new();
+        for observation in store.list_forage_observations().unwrap() {
+            let link = run(args(&[
+                "agentflow",
+                "forage",
+                "link",
+                "--hypothesis",
+                &hypothesis_id,
+                "--observation",
+                &observation.id,
+                "--stance",
+                "supports",
+                "--note",
+                "n",
+                "--json",
+                "--path",
+                path.to_str().unwrap(),
+            ]))
+            .unwrap();
+            let grade = link
+                .split("\"grade\":\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap();
+            grades.insert(grade.to_string());
+        }
+        assert!(grades.contains("unsupported"), "retracted -> unsupported");
+        assert!(
+            grades.contains("literature_supported"),
+            "published preprint -> literature_supported"
+        );
+        assert!(grades.contains("hypothesis"), "bare preprint -> hypothesis");
 
         let _ = std::fs::remove_dir_all(path);
     }

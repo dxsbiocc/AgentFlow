@@ -14,7 +14,10 @@ technical preview; the public API and CLI surface may change between minor versi
   to auto-detect retraction (`update-to` / `RETRACTED` title) and preprint
   publication (`relation.is-preprint-of`), emitting hits whose status AgentFlow
   grades honestly on ingest. The network stays in the script; the core stays
-  offline. Ships an offline `--self-test` for the parsing logic.
+  offline. Ships an offline `--self-test` for the parsing logic. When
+  `UNPAYWALL_EMAIL` is set it also resolves precise open-access status per DOI via
+  Unpaywall (`is_oa`), falling back to the Crossref heuristic on any lookup
+  failure.
 
 ## [0.3.2] - 2026-06-26
 

@@ -7,6 +7,13 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+### Added
+
+- **`flow plan <flow-id>`:** prints the scheduler's wave-by-wave execution plan
+  (which steps run in each wave, i.e. the parallelism width and topological
+  levels) without running anything — a dry-run view of how `run` / `agent run`
+  would execute the flow. `--json` supported.
+
 ## [0.3.4] - 2026-06-26
 
 Adds opt-in continue-on-error execution. The deterministic 0-LLM verdict core

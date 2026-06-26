@@ -7,6 +7,15 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+### Added
+
+- **PubMed literature verifier example** (`examples/forage/pubmed_verify.py`): a
+  real forage fetch/verify script that queries NCBI E-utilities and flags
+  retractions via PubMed's `Retracted Publication` type (PMID-native;
+  complements the DOI-native `crossref_verify.py`), resolving DOIs and marking
+  PMC full text as open access. The network stays in the script; the core stays
+  offline. Ships an offline `--self-test`.
+
 ## [0.3.4] - 2026-06-26
 
 Adds opt-in continue-on-error execution. The deterministic 0-LLM verdict core

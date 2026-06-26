@@ -42,7 +42,7 @@ import urllib.request
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 
 
-def record_to_hit(record: dict, pmid: str) -> "dict | None":
+def record_to_hit(record: dict, pmid: str) -> dict:
     article_ids = record.get("articleids", []) or []
     doi = next(
         (a.get("value") for a in article_ids if a.get("idtype") == "doi" and a.get("value")),
@@ -88,14 +88,20 @@ def esearch(query: str, retmax: int) -> list:
     return data.get("esearchresult", {}).get("idlist", [])
 
 
+ESUMMARY_BATCH = 200
+
+
 def esummary(pmids: list) -> dict:
-    if not pmids:
-        return {}
-    data = _get(
-        "esummary.fcgi",
-        _eutils_params({"db": "pubmed", "id": ",".join(pmids), "retmode": "json"}),
-    )
-    return data.get("result", {})
+    # Batch ids (NCBI recommends <= 200 per esummary call) to stay under URL limits.
+    result = {}
+    for start in range(0, len(pmids), ESUMMARY_BATCH):
+        batch = pmids[start : start + ESUMMARY_BATCH]
+        data = _get(
+            "esummary.fcgi",
+            _eutils_params({"db": "pubmed", "id": ",".join(batch), "retmode": "json"}),
+        )
+        result.update(data.get("result", {}))
+    return result
 
 
 def self_test() -> int:
@@ -119,6 +125,7 @@ def self_test() -> int:
     }
     a = record_to_hit(retracted, "1")
     assert a["external_id"] == "doi:10.1371/journal.pone.0341816", a
+    assert a["title"] == "RETRACTED: NFIC suppressed glioma", a
     assert a["retracted"] is True and a["access_status"] == "open_access_full_text", a
     b = record_to_hit(open_paper, "2")
     assert "retracted" not in b and b["access_status"] == "open_access_full_text", b

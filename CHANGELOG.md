@@ -7,6 +7,12 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-06-26
+
+Adds opt-in continue-on-error execution. The deterministic 0-LLM verdict core
+(`argument.rs`) remains byte-identical to 0.3.0, and the default run behavior is
+unchanged (fail-fast).
+
 ### Added
 
 - **`--keep-going` (continue-on-error) execution:** `run` / `agent run

@@ -140,6 +140,9 @@ pub struct FlowRunSummary {
     pub flow_id: String,
     pub completed_steps: usize,
     pub failed_steps: usize,
+    /// Steps that never ran (still `draft`/`ready`) — skipped because a
+    /// dependency failed, or because a fail-fast run stopped early.
+    pub skipped_steps: usize,
     pub attempts: Vec<AttemptSummary>,
 }
 
@@ -762,10 +765,20 @@ impl ProjectStore {
             }
         }
 
+        // Steps still in a not-yet-run state never executed — skipped because a
+        // dependency failed (keep-going) or because a fail-fast run stopped early.
+        let skipped_steps = self
+            .inspect_flow(flow_id)?
+            .steps
+            .iter()
+            .filter(|step| matches!(step.status.as_str(), "draft" | "ready"))
+            .count();
+
         Ok(FlowRunSummary {
             flow_id: flow_id.to_string(),
             completed_steps,
             failed_steps,
+            skipped_steps,
             attempts,
         })
     }
@@ -1080,6 +1093,7 @@ impl ProjectStore {
             flow_id,
             completed_steps,
             failed_steps,
+            skipped_steps: 0,
             attempts: vec![attempt],
         })
     }
@@ -4124,6 +4138,8 @@ steps:
         let fail_fast = run_keep_going_flow("keep-going-off", false);
         assert_eq!(fail_fast.failed_steps, 1);
         assert_eq!(fail_fast.completed_steps, 0);
+        // Stopping at the first failure leaves the other three steps unrun.
+        assert_eq!(fail_fast.skipped_steps, 3);
         assert_eq!(fail_fast.attempts.len(), 1);
         // The single attempt is `bad` (it has >= the downstream-unblock count of
         // `good` and is declared first, so the scheduler runs it first).
@@ -4138,6 +4154,8 @@ steps:
         let keep_going = run_keep_going_flow("keep-going-on", true);
         assert_eq!(keep_going.failed_steps, 1);
         assert_eq!(keep_going.completed_steps, 2);
+        // Only `bad_tail` (dependent on the failed `bad`) is skipped.
+        assert_eq!(keep_going.skipped_steps, 1);
         let ran: Vec<&str> = keep_going
             .attempts
             .iter()
@@ -4155,6 +4173,7 @@ steps:
         let parallel = run_keep_going_flow_with("keep-going-parallel", true, 4);
         assert_eq!(parallel.failed_steps, 1);
         assert_eq!(parallel.completed_steps, 2);
+        assert_eq!(parallel.skipped_steps, 1);
         let parallel_ran: Vec<&str> = parallel
             .attempts
             .iter()

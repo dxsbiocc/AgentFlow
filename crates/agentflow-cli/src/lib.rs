@@ -175,10 +175,11 @@ fn run_command(args: RunArgs) -> Result<String, CliError> {
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let summary = store.run_flow_with(&flow_id, &run_config)?;
     Ok(format!(
-        "Run complete\nFlow: {}\nCompleted steps: {}\nFailed steps: {}\nAttempts:\n{}",
+        "Run complete\nFlow: {}\nCompleted steps: {}\nFailed steps: {}\nSkipped steps: {}\nAttempts:\n{}",
         summary.flow_id,
         summary.completed_steps,
         summary.failed_steps,
+        summary.skipped_steps,
         format_attempts(&summary.attempts)
     ))
 }

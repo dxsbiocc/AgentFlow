@@ -7,6 +7,11 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-06-27
+
+Adds skipped-step visibility to flow runs. The deterministic 0-LLM verdict core
+(`argument.rs`) remains byte-identical to 0.3.0, and run semantics are unchanged.
+
 ### Added
 
 - **Run summaries now report skipped steps.** `run` (and any `run_flow_with`

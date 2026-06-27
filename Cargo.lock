@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentflow-cli"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "agentflow-core",
  "agentflow-schemas",
@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "agentflow-core"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "agentflow-schemas",
  "regex",
@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "agentflow-schemas"
-version = "0.3.6"
+version = "0.3.7"
 
 [[package]]
 name = "ahash"

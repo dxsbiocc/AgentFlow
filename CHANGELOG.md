@@ -7,6 +7,13 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+### Added
+
+- **Run summaries now report skipped steps.** `run` (and any `run_flow_with`
+  execution) counts steps that never ran — skipped because a dependency failed
+  (`--keep-going`) or because a fail-fast run stopped early — and prints
+  `Skipped steps: N`. Reporting only; run semantics are unchanged.
+
 ## [0.3.6] - 2026-06-27
 
 Makes the agent's autonomous producer-chaining depth tunable. The deterministic

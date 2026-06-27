@@ -98,7 +98,7 @@ pub fn usage() -> String {
         "  agentflow evidence list --hypothesis <id> [--json] [--path <path>]",
         "  agentflow verdict render --hypothesis <id> [--json] [--path <path>] [--gate-supports <text> --gate-against <text> --gate-alternatives <text> --gate-data-risks <text> --gate-assumptions <text> --gate-falsifier <text> --gate-claim-basis observed|inferred|speculative --gate-not-yet <text>]",
         "  agentflow verdict show --hypothesis <id> [--json] [--path <path>]",
-        "  agentflow agent run [--apply] [--no-apply] [--auto-run] [--no-auto-run] [--dry-run] [--flow <flow-id>] [--max-apply <n>] [--propose-synth] [--auto-synth] [--no-auto-synth] [--infer-params] [--no-infer-params] [--semantic-match] [--no-semantic-match] [--synthesizer <cmd>] [--auto-forage] [--no-auto-forage] [--forage-max <n>] [--forage-script <path>] [--python <bin>] [--container-engine docker|podman|singularity|apptainer] [--container-runner <path>] [--max-parallel <n>] [--keep-going] [--json] [--path <path>]",
+        "  agentflow agent run [--apply] [--no-apply] [--auto-run] [--no-auto-run] [--dry-run] [--flow <flow-id>] [--max-apply <n>] [--max-chain-depth <n>] [--propose-synth] [--auto-synth] [--no-auto-synth] [--infer-params] [--no-infer-params] [--semantic-match] [--no-semantic-match] [--synthesizer <cmd>] [--auto-forage] [--no-auto-forage] [--forage-max <n>] [--forage-script <path>] [--python <bin>] [--container-engine docker|podman|singularity|apptainer] [--container-runner <path>] [--max-parallel <n>] [--keep-going] [--json] [--path <path>]",
         "  agentflow branch candidates [--json] [--path <path>]",
         "  agentflow branch select [--explore] [--json] [--path <path>]",
         "  agentflow decision list [--json] [--path <path>]",

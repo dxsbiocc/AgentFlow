@@ -164,6 +164,7 @@ fn cohort_inferred_marker_param_caps_verified_evidence_and_cannot_affirm() {
                 flow: None,
                 max_apply: 5,
                 propose_synth: false,
+                ..Default::default()
             },
             &NoopParamInferer,
             &NoopRelevanceScorer,

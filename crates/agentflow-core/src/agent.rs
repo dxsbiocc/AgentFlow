@@ -75,6 +75,9 @@ impl EnrichedProposal {
     }
 }
 
+/// Default depth bound for autonomous producer chaining (`chain_producer_steps`).
+pub const DEFAULT_MAX_CHAIN_DEPTH: usize = 4;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyConfig {
     pub apply: bool,
@@ -82,6 +85,10 @@ pub struct ApplyConfig {
     pub flow: Option<String>,
     pub max_apply: u32,
     pub propose_synth: bool,
+    /// How many levels deep the agent may chain producer steps to satisfy a
+    /// matched tool's missing inputs. `0` disables chaining (a tool runs only if
+    /// its inputs are directly available); the default is `DEFAULT_MAX_CHAIN_DEPTH`.
+    pub max_chain_depth: usize,
 }
 
 impl Default for ApplyConfig {
@@ -92,6 +99,7 @@ impl Default for ApplyConfig {
             flow: None,
             max_apply: 5,
             propose_synth: false,
+            max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
         }
     }
 }
@@ -730,6 +738,7 @@ impl ProjectStore {
                         inferer,
                         &cycle_scorer,
                         cohort_inferer,
+                        config.max_chain_depth,
                     )?;
                     let mut auto_synth_tool_ref = None;
                     let mut synthesized_capability_need = None;
@@ -1200,6 +1209,7 @@ impl ProjectStore {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn enrich_branch_proposal(
         &self,
         decision: BranchDecision,
@@ -1208,6 +1218,7 @@ impl ProjectStore {
         inferer: &dyn ParamInferer,
         scorer: &dyn RelevanceScorer,
         cohort_inferer: &dyn CohortInferer,
+        max_chain_depth: usize,
     ) -> Result<(EnrichedProposal, Vec<String>), StorageError> {
         let query = CapabilityQuery {
             desired_output_type: None,
@@ -1257,8 +1268,12 @@ impl ProjectStore {
         // Backward-chain: any required input the consumer could not bind to an
         // available artifact is satisfied by drafting a producer step that
         // outputs that type, rewiring the consumer input to producer.output.
-        let prerequisite_steps =
-            self.chain_producer_steps(&candidate.tool_ref, &mut drafted_step, available)?;
+        let prerequisite_steps = self.chain_producer_steps(
+            &candidate.tool_ref,
+            &mut drafted_step,
+            available,
+            max_chain_depth,
+        )?;
         let needs = self.infer_step_needs(&drafted_step)?;
         let drafted_step = ProposedStep {
             needs,
@@ -1288,9 +1303,10 @@ impl ProjectStore {
         consumer_ref: &str,
         consumer_step: &mut ProposedStep,
         available: &[(String, String)],
+        max_chain_depth: usize,
     ) -> Result<Vec<ProposedStep>, StorageError> {
         let mut visited = BTreeSet::from([consumer_ref.to_string()]);
-        self.chain_producer_steps_rec(consumer_step, available, &mut visited, 0)
+        self.chain_producer_steps_rec(consumer_step, available, &mut visited, 0, max_chain_depth)
     }
 
     /// Recursively satisfy a step's `artifact_REPLACE_*` inputs by drafting
@@ -1308,9 +1324,9 @@ impl ProjectStore {
         available: &[(String, String)],
         visited: &mut BTreeSet<String>,
         depth: usize,
+        max_chain_depth: usize,
     ) -> Result<Vec<ProposedStep>, StorageError> {
-        const MAX_CHAIN_DEPTH: usize = 4;
-        if depth >= MAX_CHAIN_DEPTH {
+        if depth >= max_chain_depth {
             return Ok(Vec::new());
         }
         let available_types = available
@@ -1361,6 +1377,7 @@ impl ProjectStore {
                     available,
                     visited,
                     depth + 1,
+                    max_chain_depth,
                 )?;
                 let grounded = producer_step
                     .inputs
@@ -1491,7 +1508,14 @@ impl ProjectStore {
         // alternative answer — so it must not count as an equivalent branch.
         let available_set: BTreeSet<&str> = available_types.iter().map(String::as_str).collect();
         let mut top_step = self.draft_step_for(&top.tool_ref, available)?;
-        let chain = self.chain_producer_steps(&top.tool_ref, &mut top_step, available)?;
+        // The equivalence check just needs the chain's consumed types, so the
+        // default depth is sufficient here regardless of the apply-time setting.
+        let chain = self.chain_producer_steps(
+            &top.tool_ref,
+            &mut top_step,
+            available,
+            DEFAULT_MAX_CHAIN_DEPTH,
+        )?;
         let mut chain_unmet_types: BTreeSet<String> = BTreeSet::new();
         for step in std::iter::once(&top_step).chain(chain.iter()) {
             for input in self.executable_tool(&step.tool)?.inputs.values() {
@@ -3059,7 +3083,7 @@ mod tests {
         proposal_keywords, AppliedAction, ApplyConfig, ApplyFailure, CohortInferer, CycleOutcome,
         NoopCohortInferer, NoopOutputGroundingScorer, NoopParamInferer, NoopRelevanceScorer,
         NoopToolSynthesizer, OutputGroundingScorer, ParamInferer, RelevanceScorer,
-        StanceAssessmentOutputs, ToolSynthesisOutcome, ToolSynthesizer,
+        StanceAssessmentOutputs, ToolSynthesisOutcome, ToolSynthesizer, DEFAULT_MAX_CHAIN_DEPTH,
     };
 
     fn temp_project_path(test_name: &str) -> PathBuf {
@@ -4358,6 +4382,7 @@ steps:
                 flow: None,
                 max_apply: 5,
                 propose_synth: false,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
 
@@ -4399,6 +4424,7 @@ steps:
                 flow: Some("auto_flow".to_string()),
                 max_apply: 5,
                 propose_synth: false,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
 
@@ -4463,6 +4489,7 @@ steps:
                 flow: Some("auto_flow".to_string()),
                 max_apply: 5,
                 propose_synth: false,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
 
@@ -4508,6 +4535,7 @@ steps:
                 flow: Some("auto_flow".to_string()),
                 max_apply: 5,
                 propose_synth: false,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
 
@@ -4581,6 +4609,7 @@ steps:
                     flow: Some("auto_flow".to_string()),
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &NoopRelevanceScorer,
@@ -4637,6 +4666,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &StubParamInferer,
                 &NoopRelevanceScorer,
@@ -4691,6 +4721,7 @@ steps:
                         flow: Some("auto_flow".to_string()),
                         max_apply: 5,
                         propose_synth: false,
+                        max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                     },
                     &NoopParamInferer,
                     &NoopRelevanceScorer,
@@ -4918,6 +4949,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &StubParamInferer,
             )
@@ -4995,6 +5027,7 @@ steps:
                 flow: Some("auto_flow".to_string()),
                 max_apply: 5,
                 propose_synth: false,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
 
@@ -5035,6 +5068,7 @@ steps:
                     flow: None,
                     max_apply: 1,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &StubParamInferer,
             )
@@ -5088,6 +5122,7 @@ steps:
             flow: None,
             max_apply: 5,
             propose_synth: false,
+            max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
         };
 
         let first = store
@@ -5142,6 +5177,7 @@ steps:
                 flow: Some("auto_flow".to_string()),
                 max_apply: 5,
                 propose_synth: false,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
         assert_eq!(report.raised_decisions.len(), 1);
@@ -5216,6 +5252,7 @@ steps:
                 flow: Some("auto_flow".to_string()),
                 max_apply: 5,
                 propose_synth: false,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
 
@@ -5270,6 +5307,7 @@ steps:
                 flow: Some("auto_flow".to_string()),
                 max_apply: 10,
                 propose_synth: false,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
 
@@ -5319,6 +5357,7 @@ steps:
                 flow: Some("unused_flow".to_string()),
                 max_apply: 5,
                 propose_synth: false,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
 
@@ -5364,6 +5403,7 @@ steps:
                 flow: None,
                 max_apply: 1,
                 propose_synth: false,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
 
@@ -5405,6 +5445,7 @@ steps:
                 flow: None,
                 max_apply: 5,
                 propose_synth: false,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
         assert_eq!(
@@ -5486,6 +5527,7 @@ steps:
                 flow: None,
                 max_apply: 5,
                 propose_synth: true,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
 
@@ -5535,6 +5577,7 @@ steps:
                 flow: None,
                 max_apply: 5,
                 propose_synth: false,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
 
@@ -5564,6 +5607,7 @@ steps:
             flow: None,
             max_apply: 5,
             propose_synth: true,
+            max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
         };
 
         let first = store.run_cycle_with_apply_config(config.clone()).unwrap();
@@ -5604,6 +5648,7 @@ steps:
                 flow: None,
                 max_apply: 5,
                 propose_synth: true,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
 
@@ -5777,6 +5822,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &NoopRelevanceScorer,
@@ -5887,6 +5933,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &NoopRelevanceScorer,
@@ -5932,6 +5979,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &NoopRelevanceScorer,
@@ -5953,6 +6001,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &NoopRelevanceScorer,
@@ -6001,6 +6050,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &NoopRelevanceScorer,
@@ -6052,6 +6102,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &NoopRelevanceScorer,
@@ -6162,6 +6213,7 @@ steps:
                 flow: None,
                 max_apply: 5,
                 propose_synth: true,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
         assert_eq!(
@@ -6183,6 +6235,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &NoopRelevanceScorer,
@@ -6232,6 +6285,7 @@ steps:
                     flow: None,
                     max_apply: 0,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &NoopRelevanceScorer,
@@ -6263,6 +6317,7 @@ steps:
                 flow: None,
                 max_apply: 5,
                 propose_synth: false,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
 
@@ -6700,6 +6755,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &scorer,
@@ -6745,6 +6801,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &scorer,
@@ -6783,6 +6840,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &scorer,
@@ -6834,6 +6892,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &scorer,
@@ -6886,6 +6945,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &scorer,
@@ -6922,6 +6982,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &scorer,
@@ -7116,6 +7177,7 @@ steps:
                     flow: Some("auto_flow".to_string()),
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &StubParamInferer,
             )
@@ -7348,6 +7410,7 @@ steps:
                     flow: None,
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &NoopParamInferer,
                 &NoopRelevanceScorer,
@@ -7428,6 +7491,7 @@ steps:
                     flow: Some("auto_flow".to_string()),
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &StubParamInferer,
             )
@@ -7473,6 +7537,7 @@ steps:
                 flow: Some("auto_flow".to_string()),
                 max_apply: 5,
                 propose_synth: false,
+                max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             })
             .unwrap();
 
@@ -7549,6 +7614,7 @@ steps:
                     flow: Some("auto_flow".to_string()),
                     max_apply: 5,
                     propose_synth: false,
+                    max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
                 },
                 &InvalidParamInferer,
             )

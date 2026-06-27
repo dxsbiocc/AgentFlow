@@ -622,6 +622,8 @@ pub(crate) struct AgentRunArgs {
     pub(crate) flow: Vec<String>,
     #[arg(long, value_name = "n")]
     pub(crate) max_apply: Vec<String>,
+    #[arg(long, value_name = "n")]
+    pub(crate) max_chain_depth: Vec<String>,
     #[arg(long)]
     pub(crate) propose_synth: bool,
     #[arg(long)]

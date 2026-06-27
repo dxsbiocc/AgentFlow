@@ -770,6 +770,55 @@ impl ProjectStore {
         })
     }
 
+    /// The wave-by-wave execution plan the scheduler would follow, computed
+    /// without running anything. Each inner vec is one scheduler wave: its steps
+    /// have no dependency on each other (so they run together — concurrently
+    /// under `--max-parallel`), and waves run in order. Already-completed steps
+    /// (including `completed_with_warning`) are excluded; a step whose
+    /// dependencies can never complete is omitted — including the dependents of a
+    /// `running`-status step stranded by a crashed run, which is treated as not
+    /// done (reset it to `failed`/`draft` before re-planning if the plan looks
+    /// truncated). Step local ids are returned in the order the scheduler would
+    /// launch them.
+    pub fn plan_flow(&self, flow_id: &str) -> Result<Vec<Vec<String>>, StorageError> {
+        let flow = self.inspect_flow(flow_id)?;
+        // Completed steps are prerequisites already satisfied. (We simulate the
+        // plan rather than reuse `ready_steps`, which excludes done steps by their
+        // DB status — without running, statuses never change, so we track a local
+        // `done` set and drop planned steps from `remaining` each wave instead.)
+        let mut done = completed_step_ids(&flow.steps);
+        let mut remaining: Vec<StoredFlowStep> = flow
+            .steps
+            .iter()
+            .filter(|step| matches!(step.status.as_str(), "draft" | "ready" | "failed"))
+            .filter(|step| !done.contains(&step.id))
+            .cloned()
+            .collect();
+        let mut waves = Vec::new();
+        while !remaining.is_empty() {
+            let ready: Vec<StoredFlowStep> = remaining
+                .iter()
+                .filter(|step| {
+                    flow.edges
+                        .iter()
+                        .filter(|edge| edge.to_step_id == step.id)
+                        .all(|edge| done.contains(&edge.from_step_id))
+                })
+                .cloned()
+                .collect();
+            if ready.is_empty() {
+                // The remaining steps depend on something that never completes.
+                break;
+            }
+            let ordered = RuleBasedStepScheduler.order(ready, &flow.edges);
+            let ready_ids: BTreeSet<String> = ordered.iter().map(|step| step.id.clone()).collect();
+            done.extend(ready_ids.iter().cloned());
+            remaining.retain(|step| !ready_ids.contains(&step.id));
+            waves.push(ordered.into_iter().map(|step| step.local_id).collect());
+        }
+        Ok(waves)
+    }
+
     /// Run one scheduler wave with the tool subprocesses overlapping. Steps are
     /// taken in batches of at most `config.max_parallel` (guaranteed > 1 by the
     /// caller); each batch is prepared (DB reads + run/attempt inserts), its
@@ -2016,7 +2065,11 @@ fn run_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecordSum
 fn completed_step_ids(steps: &[StoredFlowStep]) -> BTreeSet<String> {
     steps
         .iter()
-        .filter(|step| step.status == StepStatus::Completed.as_str())
+        .filter(|step| {
+            // Both are terminal-success states whose dependents may proceed.
+            step.status == StepStatus::Completed.as_str()
+                || step.status == StepStatus::CompletedWithWarning.as_str()
+        })
         .map(|step| step.id.clone())
         .collect()
 }
@@ -3975,6 +4028,40 @@ steps:
 
     fn run_schedule_flow(test_name: &str, serial: bool) -> (PathBuf, FlowRunSummary) {
         run_schedule_flow_with(test_name, serial, 0)
+    }
+
+    #[test]
+    fn plan_flow_returns_topological_waves_without_running() {
+        let path = temp_project_path("plan-flow");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Plan Demo")).unwrap();
+        let script = write_note_script(&path);
+        register_tool(
+            &store,
+            format!(
+                "schema_version: agentflow.tool.v0\nnamespace: pl\nname: noop\nversion: 0.1.0\nmaturity: wrapped\ndescription: noop\nparams:\n  label:\n    type: string\n    required: true\noutputs:\n  note:\n    type: Text\nruntime:\n  backend: local\n  command:\n    - /bin/sh\n    - {}\n",
+                script.display()
+            ),
+        );
+        // Diamond: root -> {a, b} -> join.
+        let flow = FlowDraft::from_simple_yaml(
+            "schema_version: agentflow.flow.v0\nid: plan_demo\nname: Plan demo\nsteps:\n  - id: root\n    tool: pl/noop\n    needs: []\n    params:\n      label: root\n    outputs:\n      note: root_note\n  - id: a\n    tool: pl/noop\n    needs: [root]\n    params:\n      label: a\n    outputs:\n      note: a_note\n  - id: b\n    tool: pl/noop\n    needs: [root]\n    params:\n      label: b\n    outputs:\n      note: b_note\n  - id: join\n    tool: pl/noop\n    needs: [a, b]\n    params:\n      label: join\n    outputs:\n      note: join_note\n",
+        )
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+
+        let waves = store.plan_flow("plan_demo").unwrap();
+        let waves: Vec<Vec<&str>> = waves
+            .iter()
+            .map(|wave| wave.iter().map(String::as_str).collect())
+            .collect();
+        assert_eq!(
+            waves,
+            vec![vec!["root"], vec!["a", "b"], vec!["join"]],
+            "plan should be three topological waves with a||b in the middle"
+        );
+
+        let _ = fs::remove_dir_all(path);
     }
 
     // A fan-out flow with a failing root `bad` (declared first, so it runs first)

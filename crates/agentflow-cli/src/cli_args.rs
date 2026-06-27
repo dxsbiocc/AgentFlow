@@ -330,6 +330,7 @@ pub(crate) enum FlowCommand {
     Validate(FlowValidateArgs),
     Approve(FlowApproveArgs),
     Inspect(FlowInspectArgs),
+    Plan(FlowInspectArgs),
 }
 
 #[derive(Debug, Args)]

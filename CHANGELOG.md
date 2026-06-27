@@ -9,6 +9,10 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **`flow plan <flow-id>`:** prints the scheduler's wave-by-wave execution plan
+  (which steps run in each wave, i.e. the parallelism width and topological
+  levels) without running anything — a dry-run view of how `run` / `agent run`
+  would execute the flow. `--json` supported.
 - **PubMed literature verifier example** (`examples/forage/pubmed_verify.py`): a
   real forage fetch/verify script that queries NCBI E-utilities and flags
   retractions via PubMed's `Retracted Publication` type (PMID-native;

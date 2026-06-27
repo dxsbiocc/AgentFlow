@@ -7,6 +7,14 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+### Added
+
+- **`agent run --max-chain-depth N`:** bounds how many levels deep the agent will
+  chain producer steps to satisfy a matched tool's missing inputs (default 4).
+  `0` disables chaining entirely — a tool runs only if its inputs are directly
+  available (a strict, no-synthesis mode); higher values allow longer producer
+  ladders.
+
 ## [0.3.5] - 2026-06-27
 
 Adds a dry-run plan view of how a flow would execute, plus a second real

@@ -455,3 +455,113 @@ fn agent_backward_chains_multiple_producer_levels() {
         "flow should have two chain edges\n{inspect}"
     );
 }
+
+#[test]
+fn agent_max_chain_depth_bounds_producer_chaining() {
+    // The same two-level ladder (RawCounts -> MidCounts -> ExpressionTable), but
+    // `--max-chain-depth 1` only allows a one-level chain — the upper producer
+    // itself needs a second level (MidCounts), so the chain cannot form and the
+    // consumer's ExpressionTable input is left unsatisfied.
+    let project = TempProject::new("chain-depth");
+    let path = project.path.to_string_lossy().to_string();
+
+    run_agentflow(["init", "--name", "ChainDepth", "--path", &path]);
+    let lower = write_passthrough_producer(
+        &project.path,
+        "lower",
+        "counts",
+        "RawCounts",
+        "mid",
+        "MidCounts",
+    );
+    let upper = write_passthrough_producer(
+        &project.path,
+        "upper",
+        "mid",
+        "MidCounts",
+        "expression",
+        "ExpressionTable",
+    );
+    let consumer = write_consumer_tool(&project.path);
+    run_agentflow([
+        "tools",
+        "register",
+        &lower.to_string_lossy(),
+        "--path",
+        &path,
+    ]);
+    run_agentflow([
+        "tools",
+        "register",
+        &upper.to_string_lossy(),
+        "--path",
+        &path,
+    ]);
+    run_agentflow([
+        "tools",
+        "register",
+        &consumer.to_string_lossy(),
+        "--path",
+        &path,
+    ]);
+
+    let (counts, survival) = write_input_tables(&project.path);
+    run_agentflow([
+        "import",
+        &counts.to_string_lossy(),
+        "--type",
+        "RawCounts",
+        "--mode",
+        "copy",
+        "--path",
+        &path,
+    ]);
+    run_agentflow([
+        "import",
+        &survival.to_string_lossy(),
+        "--type",
+        "SurvivalTable",
+        "--mode",
+        "copy",
+        "--path",
+        &path,
+    ]);
+    run_agentflow([
+        "hypothesis",
+        "create",
+        "--statement",
+        "M1 shows a survival association in the imported cohort",
+        "--origin",
+        "user_goal",
+        "--goal",
+        "g1",
+        "--path",
+        &path,
+    ]);
+
+    let output = run_agentflow([
+        "agent",
+        "run",
+        "--apply",
+        "--auto-run",
+        "--max-chain-depth",
+        "1",
+        "--no-auto-synth",
+        "--no-auto-forage",
+        "--no-semantic-match",
+        "--path",
+        &path,
+    ]);
+
+    // With depth 1 the two-level chain does not form, so neither the second-level
+    // producer nor the consumer (whose ExpressionTable stays unsatisfied) runs —
+    // unlike the default-depth run above, which produces a 3-step flow.
+    assert!(
+        !output.contains("step_upper ran"),
+        "depth 1 must not reach the second-level producer\n{output}"
+    );
+    assert!(
+        !output.contains("step_marker_emit ran"),
+        "the consumer cannot run without its chained input at depth 1\n{output}"
+    );
+}

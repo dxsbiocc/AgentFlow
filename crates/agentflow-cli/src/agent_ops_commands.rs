@@ -7,7 +7,7 @@ use agentflow_core::agent::{
     AppliedAction, ApplyConfig, CohortInferer, CycleReport, EnrichedProposal,
     GeneralizationCandidate, NoopCohortInferer, NoopOutputGroundingScorer, NoopParamInferer,
     NoopRelevanceScorer, OutputGroundingScorer, ParamInferer, RelevanceScorer,
-    ToolSynthesisOutcome, ToolSynthesizer,
+    ToolSynthesisOutcome, ToolSynthesizer, DEFAULT_MAX_CHAIN_DEPTH,
 };
 use agentflow_core::argument::{EvidenceLink, Stance, VerdictSummary, VerdictTag};
 use agentflow_core::branch::{
@@ -42,6 +42,7 @@ struct AgentRunOptions {
     auto_run: bool,
     flow: Option<String>,
     max_apply: u32,
+    max_chain_depth: usize,
     propose_synth: bool,
     auto_synth: bool,
     infer_params: bool,
@@ -68,6 +69,7 @@ impl Default for AgentRunOptions {
             auto_run: true,
             flow: None,
             max_apply: 5,
+            max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             propose_synth: false,
             auto_synth: true,
             infer_params: true,
@@ -213,6 +215,7 @@ fn agent_run_command(args: AgentRunArgs) -> Result<String, CliError> {
         flow: options.flow,
         max_apply: options.max_apply,
         propose_synth: options.propose_synth,
+        max_chain_depth: options.max_chain_depth,
     };
     let synthesizer =
         synth_commands::configured_or_default_synthesizer(store.root_path(), options.synthesizer)?;
@@ -2098,6 +2101,7 @@ impl TryFrom<AgentRunArgs> for AgentRunOptions {
             auto_run: !args.no_auto_run,
             flow: last_value(args.flow),
             max_apply: 5,
+            max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
             propose_synth: args.propose_synth,
             auto_synth: !args.no_auto_synth,
             infer_params: !args.no_infer_params,
@@ -2124,6 +2128,9 @@ impl TryFrom<AgentRunArgs> for AgentRunOptions {
                     "--max-apply must fit in an unsigned 32-bit integer".to_string(),
                 )
             })?;
+        }
+        if let Some(value) = last_value(args.max_chain_depth) {
+            options.max_chain_depth = parse_usize_value("--max-chain-depth", &value)?;
         }
         if let Some(value) = last_value(args.forage_max) {
             options.forage_max = parse_u32_value("--forage-max", &value)?;
@@ -3035,6 +3042,7 @@ mod tests {
             dry_run: false,
             flow: Vec::new(),
             max_apply: Vec::new(),
+            max_chain_depth: Vec::new(),
             propose_synth: false,
             auto_synth: false,
             no_auto_synth: false,

@@ -18,8 +18,23 @@ permissions:
   contents: write
 
 jobs:
+  # Create (or reuse) the GitHub Release once, before the platform builds, so the
+  # parallel build jobs only upload assets. Previously each matrix job ran
+  # action-gh-release with "create if missing", which raced: two jobs could each
+  # create a release for the tag, and the loser failed to finalize with
+  # "tag_name already_exists", leaving a platform's binaries on an orphan draft.
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure the release exists
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+
   build:
     name: Build ${{ matrix.target }}
+    needs: create-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

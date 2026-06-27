@@ -13,6 +13,12 @@ technical preview; the public API and CLI surface may change between minor versi
   (which steps run in each wave, i.e. the parallelism width and topological
   levels) without running anything — a dry-run view of how `run` / `agent run`
   would execute the flow. `--json` supported.
+- **PubMed literature verifier example** (`examples/forage/pubmed_verify.py`): a
+  real forage fetch/verify script that queries NCBI E-utilities and flags
+  retractions via PubMed's `Retracted Publication` type (PMID-native;
+  complements the DOI-native `crossref_verify.py`), resolving DOIs and marking
+  PMC full text as open access. The network stays in the script; the core stays
+  offline. Ships an offline `--self-test`.
 
 ## [0.3.4] - 2026-06-26
 

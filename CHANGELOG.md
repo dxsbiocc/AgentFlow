@@ -7,6 +7,12 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-06-27
+
+Adds a dry-run plan view of how a flow would execute, plus a second real
+literature verifier. The deterministic 0-LLM verdict core (`argument.rs`) remains
+byte-identical to 0.3.0.
+
 ### Added
 
 - **`flow plan <flow-id>`:** prints the scheduler's wave-by-wave execution plan

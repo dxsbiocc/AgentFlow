@@ -7,6 +7,12 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-06-27
+
+Makes the agent's autonomous producer-chaining depth tunable. The deterministic
+0-LLM verdict core (`argument.rs`) remains byte-identical to 0.3.0, and the
+default behavior is unchanged.
+
 ### Added
 
 - **`agent run --max-chain-depth N`:** bounds how many levels deep the agent will

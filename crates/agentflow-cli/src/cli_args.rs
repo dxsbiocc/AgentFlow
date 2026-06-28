@@ -118,6 +118,8 @@ pub(crate) struct RunArgs {
     pub(crate) max_parallel: Vec<usize>,
     #[arg(long)]
     pub(crate) keep_going: bool,
+    #[arg(long, value_name = "n")]
+    pub(crate) retries: Vec<usize>,
     #[command(flatten)]
     pub(crate) project: PathOnlyArgs,
 }

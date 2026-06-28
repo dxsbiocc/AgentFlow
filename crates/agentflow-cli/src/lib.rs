@@ -76,7 +76,7 @@ pub fn usage() -> String {
         "  agentflow flow approve <flow.yaml> [--path <path>]",
         "  agentflow flow inspect <flow-id> [--json] [--path <path>]",
         "  agentflow flow plan <flow-id> [--json] [--path <path>]",
-        "  agentflow run <flow-id> [--container-engine docker|podman|singularity|apptainer] [--container-runner <path>] [--max-parallel <n>] [--keep-going] [--path <path>]",
+        "  agentflow run <flow-id> [--container-engine docker|podman|singularity|apptainer] [--container-runner <path>] [--max-parallel <n>] [--keep-going] [--retries <n>] [--path <path>]",
         "  agentflow run-step <step-id|flow.step|step:flow/step> [--path <path>]",
         "  agentflow report <flow-id> [--path <path>]",
         "  agentflow report research [--path <path>]",
@@ -171,6 +171,7 @@ fn run_command(args: RunArgs) -> Result<String, CliError> {
         run_config_from_container_args(args.container_engine, args.container_runner)?;
     run_config.max_parallel = max_parallel;
     run_config.keep_going = args.keep_going;
+    run_config.retries = last_value(args.retries).unwrap_or(0);
     let project_path = project_path_from_only(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let summary = store.run_flow_with(&flow_id, &run_config)?;

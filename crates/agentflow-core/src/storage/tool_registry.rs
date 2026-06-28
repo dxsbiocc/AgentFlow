@@ -1684,8 +1684,44 @@ fn validate_runtime_backend(runtime: &ToolRuntimeSpec) -> Result<(), StorageErro
             })?;
             Ok(())
         }
+        "nextflow" => {
+            if runtime.env_name.is_some()
+                || runtime.env_prefix.is_some()
+                || runtime.env_file.is_some()
+                || runtime.image.is_some()
+            {
+                return Err(StorageError::InvalidInput(
+                    "nextflow runtime must not declare env_name, env_prefix, env_file, or image"
+                        .to_string(),
+                ));
+            }
+            let runner = runtime.runner.as_deref().ok_or_else(|| {
+                StorageError::InvalidInput("nextflow runtime must declare runner".to_string())
+            })?;
+            validate_runtime_path("runtime.runner", runner)?;
+            if !Path::new(runner).is_absolute() {
+                return Err(StorageError::InvalidInput(
+                    "runtime.runner must be an absolute executable path".to_string(),
+                ));
+            }
+            // command[0] is the .nf module passed to `nextflow run`; it is
+            // resolved at exec time from the managed step workdir, so a relative
+            // path would not resolve. Require it absolute, like the local backend.
+            let module = runtime.command.first().ok_or_else(|| {
+                StorageError::InvalidInput(
+                    "nextflow runtime.command must declare the .nf module path".to_string(),
+                )
+            })?;
+            if !Path::new(module).is_absolute() {
+                return Err(StorageError::InvalidInput(
+                    "nextflow runtime.command[0] must be an absolute path to the .nf module"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
         other => Err(StorageError::InvalidInput(format!(
-            "unsupported runtime.backend {other}; supported backends are local, conda, micromamba, isolated-micromamba, container"
+            "unsupported runtime.backend {other}; supported backends are local, conda, micromamba, isolated-micromamba, container, nextflow"
         ))),
     }
 }
@@ -2469,6 +2505,82 @@ runtime:
         .unwrap_err();
 
         assert!(err.to_string().contains("local runtime must not declare"));
+    }
+
+    #[test]
+    fn accepts_nextflow_runtime_with_absolute_runner_and_module() {
+        let spec = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: nf_ok
+version: 0.1.0
+maturity: wrapped
+description: valid nextflow tool
+outputs:
+  table:
+    type: RawCounts
+runtime:
+  backend: nextflow
+  runner: /usr/local/bin/nextflow
+  command:
+    - /opt/agentflow/tools/mod.nf
+    - -profile
+    - standard
+"#,
+        )
+        .unwrap();
+        assert_eq!(spec.runtime.backend, "nextflow");
+    }
+
+    #[test]
+    fn rejects_nextflow_runtime_with_relative_module_path() {
+        // command[0] is resolved from the managed step workdir at run time, so a
+        // relative .nf path must be rejected at registration.
+        let err = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: nf_relative
+version: 0.1.0
+maturity: wrapped
+description: relative module path
+outputs:
+  table:
+    type: RawCounts
+runtime:
+  backend: nextflow
+  runner: /usr/local/bin/nextflow
+  command:
+    - mod.nf
+"#,
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("nextflow runtime.command[0] must be an absolute path"));
+    }
+
+    #[test]
+    fn rejects_nextflow_runtime_without_runner() {
+        let err = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: nf_no_runner
+version: 0.1.0
+maturity: wrapped
+description: missing runner
+outputs:
+  table:
+    type: RawCounts
+runtime:
+  backend: nextflow
+  command:
+    - /opt/agentflow/tools/mod.nf
+"#,
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("nextflow runtime must declare runner"));
     }
 
     #[test]

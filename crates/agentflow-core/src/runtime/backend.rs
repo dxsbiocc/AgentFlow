@@ -132,6 +132,30 @@ impl ToolExecutionBackend for IsolatedMicromambaBackend {
     }
 }
 
+/// Runs a Nextflow module through `nextflow run <module.nf> [...]`.
+struct NextflowBackend;
+
+impl ToolExecutionBackend for NextflowBackend {
+    fn prepare_command(
+        &self,
+        runtime: &ToolRuntimeSpec,
+        _ctx: &ExecContext,
+    ) -> Result<PreparedRuntimeCommand, StorageError> {
+        let runner = runtime.runner.as_ref().ok_or_else(|| {
+            StorageError::InvalidInput("nextflow runtime must declare runner".to_string())
+        })?;
+        let module = runtime.command.first().ok_or_else(|| {
+            StorageError::InvalidInput("runtime.command must not be empty".to_string())
+        })?;
+        let mut args = vec!["run".to_string(), module.clone()];
+        args.extend(runtime.command.iter().skip(1).cloned());
+        Ok(PreparedRuntimeCommand {
+            executable: runner.clone(),
+            args,
+        })
+    }
+}
+
 pub(super) trait ContainerEngine {
     fn build(
         &self,
@@ -265,6 +289,7 @@ pub(super) fn backend_for(backend: &str) -> Option<Box<dyn ToolExecutionBackend>
         })),
         "isolated-micromamba" => Some(Box::new(IsolatedMicromambaBackend)),
         "container" => Some(Box::new(ContainerBackend)),
+        "nextflow" => Some(Box::new(NextflowBackend)),
         _ => None,
     }
 }
@@ -497,5 +522,67 @@ mod tests {
             &prepared.args[prepared.args.len() - command.len()..],
             command.as_slice()
         );
+    }
+
+    #[test]
+    fn nextflow_backend_builds_run_argv() {
+        let runtime = ToolRuntimeSpec {
+            backend: "nextflow".to_string(),
+            command: vec![
+                "/abs/mod.nf".to_string(),
+                "-profile".to_string(),
+                "standard".to_string(),
+            ],
+            timeout_seconds: None,
+            env_name: None,
+            env_prefix: None,
+            env_file: None,
+            runner: Some("/usr/local/bin/nextflow".to_string()),
+            image: None,
+        };
+        let staged_inputs = BTreeMap::new();
+        let ctx = ExecContext {
+            workdir: Path::new("/tmp/af-step-work"),
+            staged_inputs: &staged_inputs,
+            output_dir: Path::new("/tmp/af-step-work/outputs"),
+            env_names: &[],
+            container_engine: None,
+        };
+
+        let prepared = NextflowBackend.prepare_command(&runtime, &ctx).unwrap();
+
+        assert_eq!(prepared.executable, "/usr/local/bin/nextflow");
+        assert_eq!(
+            prepared.args,
+            vec!["run", "/abs/mod.nf", "-profile", "standard"]
+        );
+    }
+
+    #[test]
+    fn nextflow_backend_missing_runner_is_error() {
+        let runtime = ToolRuntimeSpec {
+            backend: "nextflow".to_string(),
+            command: vec!["/abs/mod.nf".to_string()],
+            timeout_seconds: None,
+            env_name: None,
+            env_prefix: None,
+            env_file: None,
+            runner: None,
+            image: None,
+        };
+        let staged_inputs = BTreeMap::new();
+        let ctx = ExecContext {
+            workdir: Path::new("/tmp/af-step-work"),
+            staged_inputs: &staged_inputs,
+            output_dir: Path::new("/tmp/af-step-work/outputs"),
+            env_names: &[],
+            container_engine: None,
+        };
+
+        let err = NextflowBackend.prepare_command(&runtime, &ctx).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("nextflow runtime must declare runner"));
     }
 }

@@ -1,0 +1,28 @@
+schema_version: agentflow.tool.v0
+namespace: local
+name: nextflow_passthrough
+version: 0.1.0
+# Example artifact, not core engine code: a Nextflow module registered as a
+# normal AgentFlow RawCounts -> RawCounts passthrough tool.
+maturity: wrapped
+description: Copy a RawCounts table through a Nextflow process using AgentFlow env paths.
+inputs:
+  table:
+    type: RawCounts
+    required: true
+    required_columns: sample
+outputs:
+  table:
+    type: RawCounts
+    required_columns: sample
+    min_rows: 1
+runtime:
+  backend: nextflow
+  # Absolute path to the `nextflow` launcher (a wrapper is recommended so it can
+  # set up JAVA/HOME/NXF_HOME — the step runs with a cleared env; see the proof doc).
+  runner: /usr/local/bin/nextflow
+  command:
+    # Absolute path to the installed .nf module. The step runs from a managed
+    # workdir, so a relative path will NOT resolve — registration rejects it.
+    # Replace with wherever you deploy nextflow_passthrough.nf.
+    - /opt/agentflow/tools/nextflow_passthrough.nf

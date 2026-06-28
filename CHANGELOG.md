@@ -7,6 +7,18 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+### Added
+
+- **`nextflow` tool-execution backend.** A Nextflow module can be registered as
+  an ordinary AgentFlow tool (`runtime.backend: nextflow`, absolute `runner` =
+  the `nextflow` launcher, `command[0]` = the absolute `.nf` module path). It
+  wraps `nextflow run <module> [args]` and reuses the existing
+  `AGENTFLOW_INPUT_*/PARAM_*/OUTPUT_*` env convention, so the agent can run a
+  module-tool on its own or backward-chain several of them with zero agent or
+  scheduler changes. Registration requires the runner and module paths to be
+  absolute. Runs are synchronous and egress is the user's responsibility (see
+  `docs/status/nextflow-backend-proof.md`).
+
 ## [0.3.8] - 2026-06-28
 
 Adds an auto-retry budget for transient step failures, on both the manual and

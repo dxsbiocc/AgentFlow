@@ -60,6 +60,7 @@ enum TopCommand {
     Env(EnvArgs),
     Import(ImportArgs),
     Artifacts(ArtifactsArgs),
+    Module(ModuleArgs),
     Flow(FlowArgs),
     Run(RunArgs),
     #[command(name = "run-step")]
@@ -321,6 +322,24 @@ pub(crate) struct ArtifactInspectArgs {
     pub(crate) artifact_id: String,
     #[command(flatten)]
     pub(crate) project: PathJsonArgs,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ModuleArgs {
+    #[command(subcommand)]
+    pub(crate) command: ModuleCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ModuleCommand {
+    Validate(ModuleFileArgs),
+    Show(ModuleFileArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ModuleFileArgs {
+    #[arg(value_name = "file")]
+    pub(crate) path: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -988,6 +1007,7 @@ fn dispatch(cli: Cli) -> Result<String, CliError> {
         TopCommand::Env(args) => crate::env_command(args),
         TopCommand::Import(args) => crate::import_command(args),
         TopCommand::Artifacts(args) => crate::artifacts_command(args),
+        TopCommand::Module(args) => crate::module_command(args),
         TopCommand::Flow(args) => crate::flow_command(args),
         TopCommand::Run(args) => crate::run_command(args),
         TopCommand::RunStep(args) => crate::run_step_command(args),
@@ -1042,5 +1062,18 @@ mod tests {
     #[test]
     fn retries_flag_rejects_non_numeric() {
         assert!(Cli::try_parse_from(["agentflow", "run", "flow-1", "--retries", "abc"]).is_err());
+    }
+
+    #[test]
+    fn module_validate_parses_file_path() {
+        let cli = Cli::try_parse_from(["agentflow", "module", "validate", "m.yaml"])
+            .expect("module validate should parse");
+        let TopCommand::Module(args) = cli.command else {
+            panic!("expected the module subcommand");
+        };
+        let ModuleCommand::Validate(args) = args.command else {
+            panic!("expected the validate subcommand");
+        };
+        assert_eq!(args.path, PathBuf::from("m.yaml"));
     }
 }

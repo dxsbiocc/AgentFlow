@@ -2,6 +2,7 @@ mod agent_commands;
 mod agent_ops_commands;
 mod cli_args;
 mod llm_commands;
+mod module_commands;
 mod synth_commands;
 
 use std::ffi::OsString;
@@ -10,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use crate::cli_args::*;
 use agentflow_core::runtime::{ContainerEngineKind, ContainerEngineSelection, RunConfig};
+
+pub(crate) use module_commands::module_command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliError {
@@ -64,6 +67,8 @@ pub fn usage() -> String {
         "  agentflow tools inspect <tool-ref> [--json] [--path <path>]",
         "  agentflow tools match [--output <type>] [--input <type>]... [--keyword <kw>]... [--json] [--path <path>]",
         "  agentflow tools draft-step <tool-ref> [--input <type>:<artifact-id>]... [--hypothesis <id>] [--infer-params] [--synthesizer <cmd>] [--json] [--path <path>]",
+        "  agentflow module validate <path>",
+        "  agentflow module show <path>",
         "  agentflow synth --name <n> --description <text> --fixture <input-file> --expect <substring> [--synthesizer <cmd>] [--path <path>]",
         "  agentflow llm config --provider anthropic|openai|gemini|deepseek (--api-key <key>|--api-key-env <env-var>) [--model <model>] [--base-url <url>] [--synthesizer <cmd>] [--json] [--path <path>]",
         "  agentflow env check <tool-ref> [--json] [--path <path>]",

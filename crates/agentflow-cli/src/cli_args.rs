@@ -121,6 +121,8 @@ pub(crate) struct RunArgs {
     pub(crate) keep_going: bool,
     #[arg(long, value_name = "n")]
     pub(crate) retries: Vec<usize>,
+    #[arg(long, value_name = "seconds")]
+    pub(crate) retry_backoff: Vec<usize>,
     #[command(flatten)]
     pub(crate) project: PathOnlyArgs,
 }
@@ -620,6 +622,8 @@ pub(crate) struct AgentArgs {
     pub(crate) keep_going: bool,
     #[arg(long, global = true, value_name = "n")]
     pub(crate) retries: Vec<usize>,
+    #[arg(long, global = true, value_name = "seconds")]
+    pub(crate) retry_backoff: Vec<usize>,
     #[command(subcommand)]
     pub(crate) command: AgentCommand,
 }

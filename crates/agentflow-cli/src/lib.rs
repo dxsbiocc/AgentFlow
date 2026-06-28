@@ -81,7 +81,7 @@ pub fn usage() -> String {
         "  agentflow flow approve <flow.yaml> [--path <path>]",
         "  agentflow flow inspect <flow-id> [--json] [--path <path>]",
         "  agentflow flow plan <flow-id> [--json] [--path <path>]",
-        "  agentflow run <flow-id> [--container-engine docker|podman|singularity|apptainer] [--container-runner <path>] [--max-parallel <n>] [--keep-going] [--retries <n>] [--path <path>]",
+        "  agentflow run <flow-id> [--container-engine docker|podman|singularity|apptainer] [--container-runner <path>] [--max-parallel <n>] [--keep-going] [--retries <n>] [--retry-backoff <seconds>] [--path <path>]",
         "  agentflow run-step <step-id|flow.step|step:flow/step> [--path <path>]",
         "  agentflow report <flow-id> [--path <path>]",
         "  agentflow report research [--path <path>]",
@@ -103,7 +103,7 @@ pub fn usage() -> String {
         "  agentflow evidence list --hypothesis <id> [--json] [--path <path>]",
         "  agentflow verdict render --hypothesis <id> [--json] [--path <path>] [--gate-supports <text> --gate-against <text> --gate-alternatives <text> --gate-data-risks <text> --gate-assumptions <text> --gate-falsifier <text> --gate-claim-basis observed|inferred|speculative --gate-not-yet <text>]",
         "  agentflow verdict show --hypothesis <id> [--json] [--path <path>]",
-        "  agentflow agent run [--apply] [--no-apply] [--auto-run] [--no-auto-run] [--dry-run] [--flow <flow-id>] [--max-apply <n>] [--max-chain-depth <n>] [--propose-synth] [--auto-synth] [--no-auto-synth] [--infer-params] [--no-infer-params] [--semantic-match] [--no-semantic-match] [--synthesizer <cmd>] [--auto-forage] [--no-auto-forage] [--forage-max <n>] [--forage-script <path>] [--python <bin>] [--container-engine docker|podman|singularity|apptainer] [--container-runner <path>] [--max-parallel <n>] [--keep-going] [--retries <n>] [--json] [--path <path>]",
+        "  agentflow agent run [--apply] [--no-apply] [--auto-run] [--no-auto-run] [--dry-run] [--flow <flow-id>] [--max-apply <n>] [--max-chain-depth <n>] [--propose-synth] [--auto-synth] [--no-auto-synth] [--infer-params] [--no-infer-params] [--semantic-match] [--no-semantic-match] [--synthesizer <cmd>] [--auto-forage] [--no-auto-forage] [--forage-max <n>] [--forage-script <path>] [--python <bin>] [--container-engine docker|podman|singularity|apptainer] [--container-runner <path>] [--max-parallel <n>] [--keep-going] [--retries <n>] [--retry-backoff <seconds>] [--json] [--path <path>]",
         "  agentflow branch candidates [--json] [--path <path>]",
         "  agentflow branch select [--explore] [--json] [--path <path>]",
         "  agentflow decision list [--json] [--path <path>]",
@@ -177,6 +177,8 @@ fn run_command(args: RunArgs) -> Result<String, CliError> {
     run_config.max_parallel = max_parallel;
     run_config.keep_going = args.keep_going;
     run_config.retries = last_value(args.retries).unwrap_or(0);
+    run_config.retry_backoff =
+        std::time::Duration::from_secs(last_value(args.retry_backoff).unwrap_or(0) as u64);
     let project_path = project_path_from_only(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let summary = store.run_flow_with(&flow_id, &run_config)?;
@@ -197,6 +199,7 @@ fn agent_command(args: AgentArgs) -> Result<String, CliError> {
         max_parallel,
         keep_going,
         retries,
+        retry_backoff,
         command,
     } = args;
     let max_parallel = last_value(max_parallel).unwrap_or(0);
@@ -204,12 +207,15 @@ fn agent_command(args: AgentArgs) -> Result<String, CliError> {
     run_config.max_parallel = max_parallel;
     run_config.keep_going = keep_going;
     run_config.retries = last_value(retries).unwrap_or(0);
+    run_config.retry_backoff =
+        std::time::Duration::from_secs(last_value(retry_backoff).unwrap_or(0) as u64);
     let args = AgentArgs {
         container_engine: Vec::new(),
         container_runner: Vec::new(),
         max_parallel: Vec::new(),
         keep_going: false,
         retries: Vec::new(),
+        retry_backoff: Vec::new(),
         command,
     };
     agentflow_core::runtime::with_run_config(&run_config, || {

@@ -16,6 +16,10 @@ technical preview; the public API and CLI surface may change between minor versi
   backoff), bounded, and apply on both the serial and parallel paths. Default
   `0` keeps the original behavior. Intended for flaky tools (network calls,
   external scripts).
+- **`agent run --retries N`:** the same retry budget is now available on the
+  autonomous run path, joining the existing global `--max-parallel` /
+  `--keep-going` flags. It is threaded into the `RunConfig` the agent uses to
+  auto-run the flows it builds. Default `0` keeps the original behavior.
 
 ## [0.3.7] - 2026-06-27
 

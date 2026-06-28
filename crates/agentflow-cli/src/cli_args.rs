@@ -599,6 +599,8 @@ pub(crate) struct AgentArgs {
     pub(crate) max_parallel: Vec<usize>,
     #[arg(long, global = true)]
     pub(crate) keep_going: bool,
+    #[arg(long, global = true, value_name = "n")]
+    pub(crate) retries: Vec<usize>,
     #[command(subcommand)]
     pub(crate) command: AgentCommand,
 }
@@ -1003,5 +1005,38 @@ fn dispatch(cli: Cli) -> Result<String, CliError> {
         TopCommand::Compare(args) => crate::compare_command(args),
         TopCommand::Runs(args) => crate::runs_command(args),
         TopCommand::Logs(args) => crate::logs_command(args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `run --retries N` and `agent run --retries N` (a global flag) both parse
+    // into the retries field, so the value reaches the run configuration.
+    #[test]
+    fn run_parses_retries_flag() {
+        let cli = Cli::try_parse_from(["agentflow", "run", "flow-1", "--retries", "3"])
+            .expect("run --retries should parse");
+        let TopCommand::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(args.retries, vec![3]);
+    }
+
+    #[test]
+    fn agent_run_parses_retries_global_flag() {
+        let cli = Cli::try_parse_from(["agentflow", "agent", "run", "--apply", "--retries", "2"])
+            .expect("agent run --retries should parse");
+        let TopCommand::Agent(agent) = cli.command else {
+            panic!("expected the agent subcommand");
+        };
+        assert_eq!(agent.retries, vec![2]);
+        assert!(matches!(agent.command, AgentCommand::Run(_)));
+    }
+
+    #[test]
+    fn retries_flag_rejects_non_numeric() {
+        assert!(Cli::try_parse_from(["agentflow", "run", "flow-1", "--retries", "abc"]).is_err());
     }
 }

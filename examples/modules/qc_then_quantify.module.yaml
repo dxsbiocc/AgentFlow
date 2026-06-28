@@ -1,0 +1,33 @@
+schema_version: agentflow.module.v0
+namespace: bio
+name: qc_then_quantify
+version: 0.1.0
+description: >
+  Reusable two-step sub-flow: QC a RawCounts table, then quantify it into an
+  ExpressionTable. Registered once and composed into flows by inline expansion.
+# External input ports — all data a module touches enters through declared ports.
+inputs:
+  counts:
+    type: RawCounts
+# External output ports — each maps to an artifact produced by an internal step.
+outputs:
+  expression:
+    type: ExpressionTable
+    from: quant_out
+# Internal steps: ordinary flow steps referencing tools, wired by artifact name.
+# `counts` (an input value) is the external port; `qc_clean`/`quant_out` are
+# internal artifacts namespaced per instance at expansion time.
+steps:
+  - id: qc
+    tool: bio/qc
+    inputs:
+      counts: counts
+    outputs:
+      clean: qc_clean
+  - id: quant
+    tool: bio/quantify
+    needs: [qc]
+    inputs:
+      counts: qc_clean
+    outputs:
+      expression: quant_out

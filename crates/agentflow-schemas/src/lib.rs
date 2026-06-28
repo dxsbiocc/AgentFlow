@@ -9,6 +9,7 @@ pub const TOOL_INSPECTION_JSON_SCHEMA_V0: &str = "agentflow.tool_inspection.v0";
 pub const ARTIFACT_LIST_JSON_SCHEMA_V0: &str = "agentflow.artifact_list.v0";
 pub const ARTIFACT_INSPECTION_JSON_SCHEMA_V0: &str = "agentflow.artifact_inspection.v0";
 pub const FLOW_SCHEMA_V0: &str = "agentflow.flow.v0";
+pub const MODULE_SCHEMA_V0: &str = "agentflow.module.v0";
 pub const FLOW_VALIDATION_JSON_SCHEMA_V0: &str = "agentflow.flow_validation.v0";
 pub const FLOW_INSPECTION_JSON_SCHEMA_V0: &str = "agentflow.flow_inspection.v0";
 pub const STATUS_JSON_SCHEMA_V0: &str = "agentflow.status.v0";
@@ -53,6 +54,7 @@ pub fn known_schemas() -> &'static [&'static str] {
         ARTIFACT_LIST_JSON_SCHEMA_V0,
         ARTIFACT_INSPECTION_JSON_SCHEMA_V0,
         FLOW_SCHEMA_V0,
+        MODULE_SCHEMA_V0,
         FLOW_VALIDATION_JSON_SCHEMA_V0,
         FLOW_INSPECTION_JSON_SCHEMA_V0,
         STATUS_JSON_SCHEMA_V0,

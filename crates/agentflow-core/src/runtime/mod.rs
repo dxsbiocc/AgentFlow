@@ -54,6 +54,14 @@ pub struct RunConfig {
     /// dependents are skipped, but unrelated ready steps still run. Default
     /// `false` keeps the fail-fast behavior, byte-identical to before.
     pub keep_going: bool,
+    /// How many times a failed step is re-run before its failure is treated as
+    /// terminal. `0` (default) keeps the original behavior — a failure is
+    /// terminal immediately. With `retries = n`, a step is attempted up to
+    /// `n + 1` times; once it succeeds the run proceeds normally, and only after
+    /// the budget is exhausted does the failure count and trip fail-fast. Retries
+    /// are immediate (no backoff) and apply on both the serial and parallel
+    /// paths. Intended for flaky tools (network calls, external scripts).
+    pub retries: usize,
 }
 
 thread_local! {
@@ -703,6 +711,9 @@ impl ProjectStore {
         // In keep-going mode a failed step is terminal: record its id so it is not
         // re-offered as "ready" (ready_steps re-includes failed steps for retry).
         let mut failed_ids: BTreeSet<String> = BTreeSet::new();
+        // Per-step failed-attempt counts, so a step's failure only becomes
+        // terminal once it has exhausted its `config.retries` budget.
+        let mut retry_counts: BTreeMap<String, usize> = BTreeMap::new();
 
         loop {
             let flow = self.inspect_flow(flow_id)?;
@@ -719,6 +730,10 @@ impl ProjectStore {
             }
 
             let mut progressed = false;
+            // Set when a step failed but still has retry budget left, so the run
+            // should keep looping (the step is re-offered next wave) rather than
+            // stopping on a no-progress wave.
+            let mut retrying = false;
             if config.max_parallel > 1 {
                 // Parallel wave: prepare + record stay serial on the main thread
                 // (single connection); only the tool subprocesses overlap.
@@ -730,8 +745,15 @@ impl ProjectStore {
                             progressed = true;
                         }
                         _ => {
-                            failed_steps += 1;
-                            failed_ids.insert(attempt.step_id.clone());
+                            if record_step_failure(
+                                &attempt.step_id,
+                                config.retries,
+                                &mut retry_counts,
+                                &mut failed_ids,
+                                &mut failed_steps,
+                            ) {
+                                retrying = true;
+                            }
                         }
                     }
                     attempts.push(attempt);
@@ -746,8 +768,15 @@ impl ProjectStore {
                             progressed = true;
                         }
                         _ => {
-                            failed_steps += 1;
-                            failed_ids.insert(attempt.step_id.clone());
+                            if record_step_failure(
+                                &attempt.step_id,
+                                config.retries,
+                                &mut retry_counts,
+                                &mut failed_ids,
+                                &mut failed_steps,
+                            ) {
+                                retrying = true;
+                            }
                         }
                     }
                     attempts.push(attempt);
@@ -760,7 +789,7 @@ impl ProjectStore {
             if !config.keep_going && failed_steps > 0 {
                 break;
             }
-            if !progressed {
+            if !progressed && !retrying {
                 break;
             }
         }
@@ -2004,6 +2033,29 @@ impl ProjectStore {
                 "step ref {step_ref} is ambiguous; use flow.step or step:flow/step"
             ))),
         }
+    }
+}
+
+/// Record a failed step attempt against its retry budget. Returns `true` when the
+/// failure is transient (budget remains, so the caller should re-offer the step),
+/// or `false` when the budget is exhausted and the failure is now terminal — in
+/// which case `failed_ids` and `failed_steps` are updated.
+fn record_step_failure(
+    step_id: &str,
+    retries: usize,
+    retry_counts: &mut BTreeMap<String, usize>,
+    failed_ids: &mut BTreeSet<String>,
+    failed_steps: &mut usize,
+) -> bool {
+    let tries = retry_counts.entry(step_id.to_string()).or_insert(0);
+    *tries += 1;
+    if *tries <= retries {
+        true
+    } else {
+        if failed_ids.insert(step_id.to_string()) {
+            *failed_steps += 1;
+        }
+        false
     }
 }
 
@@ -4182,6 +4234,82 @@ steps:
         assert!(parallel_ran.iter().any(|id| id.ends_with("/bad")));
         assert!(parallel_ran.iter().any(|id| id.ends_with("/good_tail")));
         assert!(!parallel_ran.iter().any(|id| id.ends_with("/bad_tail")));
+    }
+
+    /// Run a single-step flow whose tool fails (via an embedded counter file) on
+    /// every attempt before `success_on`, then succeeds. Returns the run summary.
+    fn run_flaky_flow(test_name: &str, retries: usize, success_on: usize) -> FlowRunSummary {
+        let path = temp_project_path(test_name);
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Retry Demo")).unwrap();
+
+        let counter = path.join("attempts.count");
+        let script = path.join("flaky.sh");
+        fs::write(
+            &script,
+            format!(
+                "COUNTER=\"{}\"\n\
+                 n=0\n\
+                 if [ -f \"$COUNTER\" ]; then n=$(cat \"$COUNTER\"); fi\n\
+                 n=$((n + 1))\n\
+                 printf '%s' \"$n\" > \"$COUNTER\"\n\
+                 if [ \"$n\" -lt {} ]; then echo \"transient fail $n\" 1>&2; exit 1; fi\n\
+                 printf 'ok on attempt %s\\n' \"$n\" > \"$AGENTFLOW_OUTPUT_NOTE\"\n",
+                counter.display(),
+                success_on
+            ),
+        )
+        .unwrap();
+
+        register_tool(
+            &store,
+            format!(
+                "schema_version: agentflow.tool.v0\nnamespace: rt\nname: flaky\nversion: 0.1.0\nmaturity: wrapped\ndescription: Fails a few times then succeeds\noutputs:\n  note:\n    type: Text\nruntime:\n  backend: local\n  command:\n    - /bin/sh\n    - {}\n",
+                script.display()
+            ),
+        );
+
+        let flow = FlowDraft::from_simple_yaml(
+            "schema_version: agentflow.flow.v0\nid: rt_demo\nname: Retry demo\nsteps:\n  - id: flaky\n    tool: rt/flaky\n    needs: []\n    outputs:\n      note: flaky_note\n",
+        )
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+        let summary = store
+            .run_flow_with(
+                "rt_demo",
+                &RunConfig {
+                    retries,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let _ = fs::remove_dir_all(&path);
+        summary
+    }
+
+    #[test]
+    fn retries_re_run_a_transient_step_failure() {
+        // Without retries a single failure is terminal: one attempt, the run fails.
+        let no_retry = run_flaky_flow("retry-off", 0, 2);
+        assert_eq!(no_retry.completed_steps, 0);
+        assert_eq!(no_retry.failed_steps, 1);
+        assert_eq!(no_retry.attempts.len(), 1);
+
+        // With one retry the second attempt succeeds — the transient failure does
+        // not count, and the run completes. Both attempts are recorded.
+        let recovered = run_flaky_flow("retry-recovers", 1, 2);
+        assert_eq!(recovered.completed_steps, 1);
+        assert_eq!(recovered.failed_steps, 0);
+        assert_eq!(recovered.skipped_steps, 0);
+        assert_eq!(recovered.attempts.len(), 2);
+
+        // Retries are bounded: a step that needs 5 attempts but is allowed only
+        // 1 retry (2 attempts) exhausts its budget and fails terminally.
+        let exhausted = run_flaky_flow("retry-exhausted", 1, 5);
+        assert_eq!(exhausted.completed_steps, 0);
+        assert_eq!(exhausted.failed_steps, 1);
+        assert_eq!(exhausted.attempts.len(), 2);
     }
 
     fn run_schedule_flow_with(

@@ -7,6 +7,16 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+### Added
+
+- **`run --retries N`:** auto-retry transient step failures. A failed step is
+  re-run up to `N` times (so up to `N + 1` attempts) before its failure becomes
+  terminal; once it succeeds the run proceeds normally, and only an exhausted
+  budget counts as a failure and trips fail-fast. Retries are immediate (no
+  backoff), bounded, and apply on both the serial and parallel paths. Default
+  `0` keeps the original behavior. Intended for flaky tools (network calls,
+  external scripts).
+
 ## [0.3.7] - 2026-06-27
 
 Adds skipped-step visibility to flow runs. The deterministic 0-LLM verdict core

@@ -59,9 +59,11 @@ pub struct RunConfig {
     /// terminal immediately. With `retries = n`, a step is attempted up to
     /// `n + 1` times; once it succeeds the run proceeds normally, and only after
     /// the budget is exhausted does the failure count and trip fail-fast. Retries
-    /// are immediate (no backoff) and apply on both the serial and parallel
-    /// paths. Intended for flaky tools (network calls, external scripts).
+    /// are immediate by default and apply on both the serial and parallel paths.
+    /// Intended for flaky tools (network calls, external scripts).
     pub retries: usize,
+    /// Delay before a failed-but-retried step is re-offered. Default zero = immediate (unchanged).
+    pub retry_backoff: std::time::Duration,
 }
 
 thread_local! {
@@ -788,6 +790,9 @@ impl ProjectStore {
 
             if !config.keep_going && failed_steps > 0 {
                 break;
+            }
+            if retrying && !config.retry_backoff.is_zero() {
+                std::thread::sleep(config.retry_backoff);
             }
             if !progressed && !retrying {
                 break;
@@ -4239,6 +4244,21 @@ steps:
     /// Run a single-step flow whose tool fails (via an embedded counter file) on
     /// every attempt before `success_on`, then succeeds. Returns the run summary.
     fn run_flaky_flow(test_name: &str, retries: usize, success_on: usize) -> FlowRunSummary {
+        run_flaky_flow_with_config(
+            test_name,
+            RunConfig {
+                retries,
+                ..Default::default()
+            },
+            success_on,
+        )
+    }
+
+    fn run_flaky_flow_with_config(
+        test_name: &str,
+        config: RunConfig,
+        success_on: usize,
+    ) -> FlowRunSummary {
         let path = temp_project_path(test_name);
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
@@ -4275,15 +4295,7 @@ steps:
         )
         .unwrap();
         store.approve_flow(flow, None).unwrap();
-        let summary = store
-            .run_flow_with(
-                "rt_demo",
-                &RunConfig {
-                    retries,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let summary = store.run_flow_with("rt_demo", &config).unwrap();
         let _ = fs::remove_dir_all(&path);
         summary
     }
@@ -4310,6 +4322,20 @@ steps:
         assert_eq!(exhausted.completed_steps, 0);
         assert_eq!(exhausted.failed_steps, 1);
         assert_eq!(exhausted.attempts.len(), 2);
+    }
+
+    #[test]
+    fn retry_backoff_retries_transient_step_failure() {
+        let recovered = run_flaky_flow_with_config(
+            "retry-backoff-recovers",
+            RunConfig {
+                retries: 1,
+                retry_backoff: std::time::Duration::from_millis(10),
+                ..Default::default()
+            },
+            2,
+        );
+        assert_eq!(recovered.completed_steps, 1);
     }
 
     fn run_schedule_flow_with(

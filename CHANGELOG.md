@@ -9,6 +9,13 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **`run --retry-backoff <seconds>` / `agent run --retry-backoff <seconds>`.** An
+  optional delay before a failed-but-retried step is re-offered (pairs with
+  `--retries`). `RunConfig.retry_backoff` defaults to zero (immediate retry,
+  unchanged); the sleep only fires when the run is actually going to retry.
+
+### Added
+
 - **First-class modules — inline-expansion engine (foundation).** A `ModuleSpec`
   (`agentflow.module.v0`) is a reusable, typed sub-flow: declared external
   input/output ports plus internal steps. `ModuleSpec::expand` inlines a module

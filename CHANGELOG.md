@@ -9,6 +9,17 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **First-class modules — inline-expansion engine (foundation).** A `ModuleSpec`
+  (`agentflow.module.v0`) is a reusable, typed sub-flow: declared external
+  input/output ports plus internal steps. `ModuleSpec::expand` inlines a module
+  instance into ordinary flow steps — namespacing internal ids/artifacts per
+  instance, rewiring external input ports to the caller's bound artifacts, and
+  exposing output ports — so the existing scheduler runs the flattened DAG with
+  no changes. Validation rejects dangling refs, duplicate producers, port/artifact
+  name collisions, missing `needs` on internal producers, and dependency cycles.
+  Library primitive only; storage, CLI, and agent composition follow in later
+  slices (see `docs/status/module-expansion-proof.md`).
+
 - **`nextflow` tool-execution backend.** A Nextflow module can be registered as
   an ordinary AgentFlow tool (`runtime.backend: nextflow`, absolute `runner` =
   the `nextflow` launcher, `command[0]` = the absolute `.nf` module path). It

@@ -1,6 +1,7 @@
 mod artifact_registry;
 mod flow_registry;
 mod migrations;
+mod module_registry;
 mod project_store;
 mod schema;
 mod tool_registry;
@@ -15,6 +16,7 @@ pub use flow_registry::{
     FlowValidationReport, StoredFlowEdge, StoredFlowStep,
 };
 pub use migrations::MigrationRecord;
+pub use module_registry::{ModuleExpansion, ModuleOutput, ModulePort, ModuleSpec};
 pub use project_store::{
     now_unix_nanos, now_unix_seconds, project_db_path, project_dir, EventId, EventRecord,
     ProjectStore, ProjectSummary, StorageError,

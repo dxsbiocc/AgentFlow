@@ -9,6 +9,14 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **`module validate <file>` / `module show <file>` CLI.** Author and inspect
+  `agentflow.module.v0` module specs from the command line: `validate` parses and
+  validates a module YAML (reporting the ref, version, and port/step counts, or
+  the validation error), and `show` pretty-prints its input/output ports and
+  steps. Built on the merged `ModuleSpec` primitive; no storage yet.
+
+### Added
+
 - **First-class modules — inline-expansion engine (foundation).** A `ModuleSpec`
   (`agentflow.module.v0`) is a reusable, typed sub-flow: declared external
   input/output ports plus internal steps. `ModuleSpec::expand` inlines a module

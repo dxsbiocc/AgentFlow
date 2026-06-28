@@ -7,6 +7,12 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-06-28
+
+Adds an auto-retry budget for transient step failures, on both the manual and
+autonomous run paths. The deterministic 0-LLM verdict core (`argument.rs`)
+remains byte-identical to 0.3.0, and the default behavior is unchanged.
+
 ### Added
 
 - **`run --retries N`:** auto-retry transient step failures. A failed step is

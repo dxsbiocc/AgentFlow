@@ -77,8 +77,8 @@ pub fn usage() -> String {
         "  agentflow import <file> --type <artifact-type> [--mode reference|copy] [--allow-external-reference] [--path <path>]",
         "  agentflow artifacts list [--json] [--path <path>]",
         "  agentflow artifacts inspect <artifact-id> [--json] [--path <path>]",
-        "  agentflow flow validate <flow.yaml> [--json] [--path <path>]",
-        "  agentflow flow approve <flow.yaml> [--path <path>]",
+        "  agentflow flow validate <flow.yaml> [--module <path>]... [--json] [--path <path>]",
+        "  agentflow flow approve <flow.yaml> [--module <path>]... [--path <path>]",
         "  agentflow flow inspect <flow-id> [--json] [--path <path>]",
         "  agentflow flow plan <flow-id> [--json] [--path <path>]",
         "  agentflow run <flow-id> [--container-engine docker|podman|singularity|apptainer] [--container-runner <path>] [--max-parallel <n>] [--keep-going] [--retries <n>] [--retry-backoff <seconds>] [--path <path>]",
@@ -1227,12 +1227,35 @@ fn flow_command(args: FlowArgs) -> Result<String, CliError> {
     }
 }
 
+fn load_flow_modules(
+    paths: &[std::path::PathBuf],
+) -> Result<std::collections::BTreeMap<String, agentflow_core::storage::ModuleSpec>, CliError> {
+    let mut modules = std::collections::BTreeMap::new();
+    for path in paths {
+        let source = fs::read_to_string(path)?;
+        let spec = agentflow_core::storage::ModuleSpec::from_simple_yaml(&source)?;
+        let module_ref = spec.module_ref();
+        if modules.insert(module_ref.clone(), spec).is_some() {
+            return Err(CliError::Core(format!(
+                "module {module_ref} supplied more than once"
+            )));
+        }
+    }
+    Ok(modules)
+}
+
 fn flow_validate_command(args: FlowValidateArgs) -> Result<String, CliError> {
-    let flow_path = args.flow_yaml;
-    let options = ProjectOptions::from(args.project);
+    let FlowValidateArgs {
+        flow_yaml: flow_path,
+        module,
+        project,
+    } = args;
+    let modules = load_flow_modules(&module)?;
+    let options = ProjectOptions::from(project);
     let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let source = fs::read_to_string(&flow_path)?;
-    let draft = agentflow_core::storage::FlowDraft::from_simple_yaml(&source)?;
+    let draft =
+        agentflow_core::storage::FlowDraft::from_simple_yaml_with_modules(&source, &modules)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let report = store.validate_flow(&draft);
 
@@ -1257,10 +1280,16 @@ fn flow_validate_command(args: FlowValidateArgs) -> Result<String, CliError> {
 }
 
 fn flow_approve_command(args: FlowApproveArgs) -> Result<String, CliError> {
-    let flow_path = args.flow_yaml;
-    let project_path = project_path_from_only(args.project)?;
+    let FlowApproveArgs {
+        flow_yaml: flow_path,
+        module,
+        project,
+    } = args;
+    let modules = load_flow_modules(&module)?;
+    let project_path = project_path_from_only(project)?;
     let source = fs::read_to_string(&flow_path)?;
-    let draft = agentflow_core::storage::FlowDraft::from_simple_yaml(&source)?;
+    let draft =
+        agentflow_core::storage::FlowDraft::from_simple_yaml_with_modules(&source, &modules)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let approval = store.approve_flow(draft, Some(PathBuf::from(&flow_path).as_path()))?;
 

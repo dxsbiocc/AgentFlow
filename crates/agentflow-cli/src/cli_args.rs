@@ -360,6 +360,8 @@ pub(crate) enum FlowCommand {
 pub(crate) struct FlowValidateArgs {
     #[arg(value_name = "flow.yaml")]
     pub(crate) flow_yaml: PathBuf,
+    #[arg(long, value_name = "path")]
+    pub(crate) module: Vec<PathBuf>,
     #[command(flatten)]
     pub(crate) project: PathJsonArgs,
 }
@@ -368,6 +370,8 @@ pub(crate) struct FlowValidateArgs {
 pub(crate) struct FlowApproveArgs {
     #[arg(value_name = "flow.yaml")]
     pub(crate) flow_yaml: PathBuf,
+    #[arg(long, value_name = "path")]
+    pub(crate) module: Vec<PathBuf>,
     #[command(flatten)]
     pub(crate) project: PathOnlyArgs,
 }

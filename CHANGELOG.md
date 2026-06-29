@@ -9,6 +9,16 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **The agent composes registered modules (slice 4b-2).** When the autonomous
+  loop backward-chains to satisfy a step's missing input type and no tool can
+  produce it, it now falls back to a registered **module** whose output port
+  yields that type and whose inputs are all already available (a High-fit atomic
+  producer): the module is inline-expanded into the flow and wired to the
+  consumer. Tools are still tried first; default behavior is unchanged when no
+  module applies.
+
+### Added
+
 - **Module discovery for the agent (`match_modules`).** `ProjectStore::match_modules`
   ranks registered modules that can produce a desired artifact type (atomic
   `High`-fit producers — every input already available — first), the discovery

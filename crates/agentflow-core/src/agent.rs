@@ -20,8 +20,8 @@ use crate::handoff::{
 };
 use crate::hypothesis::{HypothesisRequest, HypothesisStatus};
 use crate::storage::{
-    validate_param_value, ArtifactSummary, EventRecord, FlowDraft, FlowStepDraft, ParamInferKind,
-    ProjectStore, StorageError, ToolParamSpec,
+    validate_param_value, ArtifactSummary, EventRecord, FlowDraft, FlowStepDraft, ModuleExpansion,
+    ParamInferKind, ProjectStore, StorageError, ToolParamSpec,
 };
 use crate::tool_select::{extract_stored_string_field, CapabilityQuery, Fit, ToolCandidate};
 
@@ -1124,6 +1124,86 @@ fn fit_rank(fit: Fit) -> u8 {
     }
 }
 
+fn module_producer_steps(
+    expansion: &ModuleExpansion,
+    output_port: &str,
+) -> Option<(Vec<ProposedStep>, String, String)> {
+    // The producing step for an output artifact is unique: `ModuleSpec::validate`
+    // rejects two steps that emit the same artifact name, so `find_map` matches
+    // exactly one step.
+    let artifact = expansion.outputs.get(output_port)?;
+    let (producing_step_id, producing_output_port) = expansion.steps.iter().find_map(|step| {
+        step.outputs
+            .iter()
+            .find(|(_, output_artifact)| *output_artifact == artifact)
+            .map(|(port, _)| (step.id.clone(), port.clone()))
+    })?;
+
+    let proposed_steps = expansion
+        .steps
+        .iter()
+        .map(|step| ProposedStep {
+            id: step.id.clone(),
+            tool: step.tool_ref.clone(),
+            needs: step.needs.clone(),
+            inputs: step
+                .inputs
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            params: step
+                .params
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            outputs: step
+                .outputs
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        })
+        .collect();
+
+    Some((proposed_steps, producing_step_id, producing_output_port))
+}
+
+fn rewrite_module_internal_inputs_for_graph_patch(steps: &mut [ProposedStep]) {
+    let artifact_sources = steps
+        .iter()
+        .flat_map(|step| {
+            step.outputs.iter().map(|(port, output_artifact)| {
+                (output_artifact.clone(), (step.id.clone(), port.clone()))
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for step in steps {
+        for (_, value) in &mut step.inputs {
+            if let Some((step_id, output_port)) = artifact_sources.get(value) {
+                *value = format!("{step_id}.{output_port}");
+            }
+        }
+    }
+}
+
+fn sanitize_module_instance_id(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "module".to_string()
+    } else {
+        sanitized
+    }
+}
+
 impl ProjectStore {
     pub fn capability_fingerprint(
         &self,
@@ -1355,6 +1435,7 @@ impl ProjectStore {
             // Candidates are score-sorted, so a Fit::High producer (all of its
             // own inputs already available) is tried before one that itself
             // needs chaining. Each candidate is grounded all-or-nothing.
+            let mut grounded_input = false;
             for candidate in self.match_tools(&query)? {
                 if visited.contains(&candidate.tool_ref) {
                     continue;
@@ -1400,6 +1481,65 @@ impl ProjectStore {
                 {
                     producers.push(producer_step);
                 }
+                grounded_input = true;
+                break;
+            }
+            if grounded_input {
+                continue;
+            }
+
+            for candidate in self.match_modules(&desired_type, &available_types)? {
+                if candidate.fit != Fit::High || visited.contains(&candidate.module_ref) {
+                    continue;
+                }
+
+                let snapshot = visited.clone();
+                visited.insert(candidate.module_ref.clone());
+                let spec = self.get_module(&candidate.module_ref)?;
+                let mut bindings = BTreeMap::new();
+                let mut bound_all_inputs = true;
+                for (port_name, port) in &spec.inputs {
+                    let Some((_, artifact_id)) = available
+                        .iter()
+                        .find(|(type_name, _)| type_name == &port.type_name)
+                    else {
+                        bound_all_inputs = false;
+                        break;
+                    };
+                    bindings.insert(port_name.clone(), artifact_id.clone());
+                }
+                if !bound_all_inputs {
+                    *visited = snapshot;
+                    continue;
+                }
+
+                let instance_id =
+                    sanitize_module_instance_id(&format!("{}__{}", step.id, input_name));
+                let Ok(expansion) = spec.expand(&instance_id, &bindings) else {
+                    *visited = snapshot;
+                    continue;
+                };
+                let Some((mut module_steps, producing_step_id, producing_output_port)) =
+                    module_producer_steps(&expansion, &candidate.output_port)
+                else {
+                    *visited = snapshot;
+                    continue;
+                };
+
+                *value = format!("{producing_step_id}.{producing_output_port}");
+                rewrite_module_internal_inputs_for_graph_patch(&mut module_steps);
+                for module_step in module_steps {
+                    if !producers
+                        .iter()
+                        .any(|existing| existing.id == module_step.id)
+                    {
+                        producers.push(module_step);
+                    }
+                }
+                // No `grounded_input = true` here: the module loop is the terminal
+                // action for this input, so the flag is never read again before the
+                // next input iteration re-declares it (setting it would be a dead
+                // assignment under `-D warnings`).
                 break;
             }
         }
@@ -3075,7 +3215,7 @@ mod tests {
     use crate::hypothesis::{Confidence, HypothesisRequest, HypothesisStatus};
     use crate::storage::{
         now_unix_seconds, ArtifactImportMode, ArtifactImportRequest, ComputedArtifactRequest,
-        FlowDraft, ProjectStore, ToolSpec,
+        FlowDraft, FlowStepDraft, ModuleExpansion, ProjectStore, ToolSpec,
     };
     use crate::tool_select::{Fit, ToolCandidate};
 
@@ -3135,6 +3275,69 @@ mod tests {
             }),
             prerequisite_steps: Vec::new(),
         }
+    }
+
+    #[test]
+    fn module_producer_steps_maps_expanded_steps_and_external_output_port() {
+        let expansion = ModuleExpansion {
+            steps: vec![
+                FlowStepDraft {
+                    id: "step_marker__expression_table__qc".to_string(),
+                    tool_ref: "bio/qc".to_string(),
+                    needs: Vec::new(),
+                    reason: None,
+                    inputs: std::collections::BTreeMap::from([(
+                        "counts".to_string(),
+                        "artifact_raw".to_string(),
+                    )]),
+                    params: std::collections::BTreeMap::new(),
+                    outputs: std::collections::BTreeMap::from([(
+                        "clean".to_string(),
+                        "step_marker__expression_table__qc_clean".to_string(),
+                    )]),
+                },
+                FlowStepDraft {
+                    id: "step_marker__expression_table__quant".to_string(),
+                    tool_ref: "bio/quantify".to_string(),
+                    needs: vec!["step_marker__expression_table__qc".to_string()],
+                    reason: None,
+                    inputs: std::collections::BTreeMap::from([(
+                        "counts".to_string(),
+                        "step_marker__expression_table__qc_clean".to_string(),
+                    )]),
+                    params: std::collections::BTreeMap::new(),
+                    outputs: std::collections::BTreeMap::from([(
+                        "expression".to_string(),
+                        "step_marker__expression_table__quant_out".to_string(),
+                    )]),
+                },
+            ],
+            outputs: std::collections::BTreeMap::from([(
+                "expression".to_string(),
+                "step_marker__expression_table__quant_out".to_string(),
+            )]),
+        };
+
+        let (steps, producer_step_id, producer_port) =
+            super::module_producer_steps(&expansion, "expression").unwrap();
+
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].id, "step_marker__expression_table__qc");
+        assert_eq!(steps[1].id, "step_marker__expression_table__quant");
+        assert_eq!(steps[1].tool, "bio/quantify");
+        assert_eq!(
+            steps[1].needs,
+            vec!["step_marker__expression_table__qc".to_string()]
+        );
+        assert_eq!(
+            steps[1].inputs,
+            vec![(
+                "counts".to_string(),
+                "step_marker__expression_table__qc_clean".to_string()
+            )]
+        );
+        assert_eq!(producer_step_id, "step_marker__expression_table__quant");
+        assert_eq!(producer_port, "expression");
     }
 
     #[test]

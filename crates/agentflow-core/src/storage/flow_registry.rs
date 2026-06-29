@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::StepStatus;
 
+use super::module_registry::ModuleSpec;
 use super::project_store::{now_unix_seconds, EventRecord, ProjectStore, StorageError};
 use super::tool_registry::{validate_param_value, ExecutableToolSpec};
 use super::yaml;
@@ -20,7 +21,20 @@ pub struct FlowDraft {
 }
 
 impl FlowDraft {
+    /// Parse a flow draft. Any step that references a `module:` is rejected
+    /// (use [`FlowDraft::from_simple_yaml_with_modules`] to supply the modules).
     pub fn from_simple_yaml(source_text: &str) -> Result<Self, StorageError> {
+        Self::from_simple_yaml_with_modules(source_text, &BTreeMap::new())
+    }
+
+    /// Parse a flow draft, inline-expanding any `module: <ref>` step using the
+    /// supplied modules (keyed by `namespace/name`). After expansion the returned
+    /// draft contains only tool steps, so the existing scheduler/runtime run it
+    /// unchanged.
+    pub fn from_simple_yaml_with_modules(
+        source_text: &str,
+        modules: &BTreeMap<String, ModuleSpec>,
+    ) -> Result<Self, StorageError> {
         let raw = yaml::parse_yaml::<RawFlowDraft>("flow", source_text)?;
         let schema_version =
             required_flow_field(raw.schema_version.clone(), "schema_version", source_text)?;
@@ -51,7 +65,7 @@ impl FlowDraft {
             schema_version,
             id,
             name,
-            steps: raw.into_steps(source_text)?,
+            steps: resolve_flow_steps(raw.steps, modules, source_text)?,
             source_text: source_text.to_string(),
         })
     }
@@ -80,15 +94,6 @@ struct RawFlowDraft {
     steps: Vec<RawFlowStepDraft>,
 }
 
-impl RawFlowDraft {
-    fn into_steps(self, source_text: &str) -> Result<Vec<FlowStepDraft>, StorageError> {
-        self.steps
-            .into_iter()
-            .map(|step| step.into_step(source_text))
-            .collect()
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawFlowStepDraft {
@@ -100,6 +105,12 @@ struct RawFlowStepDraft {
         deserialize_with = "yaml::deserialize_optional_scalar_string"
     )]
     tool_ref: Option<String>,
+    #[serde(
+        rename = "module",
+        default,
+        deserialize_with = "yaml::deserialize_optional_scalar_string"
+    )]
+    module_ref: Option<String>,
     #[serde(
         rename = "type",
         default,
@@ -148,6 +159,166 @@ fn finalize_raw_step(
         ));
     }
     Ok(step)
+}
+
+/// Per module-instance bookkeeping needed to rewire the rest of the flow.
+struct ModuleInstance {
+    /// External output port -> (exposed instance-prefixed artifact name, the
+    /// inlined step that produces it). Kept as a pair so a consumer rewrite can
+    /// never resolve the artifact without also adding the producer `needs` edge.
+    outputs: BTreeMap<String, (String, String)>,
+    /// Steps a `needs: [instance]` ordering edge should point at (the producers
+    /// of the exposed outputs, or every inlined step if nothing is exposed).
+    sink_step_ids: Vec<String>,
+}
+
+/// Resolve raw flow steps into tool-only [`FlowStepDraft`]s, inline-expanding any
+/// `module:` step and rewiring cross-instance `needs`/output references so the
+/// flattened flow runs on the existing scheduler unchanged.
+fn resolve_flow_steps(
+    raw_steps: Vec<RawFlowStepDraft>,
+    modules: &BTreeMap<String, ModuleSpec>,
+    source_text: &str,
+) -> Result<Vec<FlowStepDraft>, StorageError> {
+    let mut steps: Vec<FlowStepDraft> = Vec::new();
+    let mut instances: BTreeMap<String, ModuleInstance> = BTreeMap::new();
+
+    for raw in raw_steps {
+        let id = raw.id.clone().unwrap_or_default();
+        if id.trim().is_empty() {
+            return Err(yaml::invalid_input_at_field(
+                source_text,
+                "id",
+                "flow step is missing id",
+            ));
+        }
+        let has_tool = raw
+            .tool_ref
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty());
+        let module_ref = raw
+            .module_ref
+            .as_deref()
+            .filter(|m| !m.trim().is_empty())
+            .map(str::to_string);
+
+        let Some(module_ref) = module_ref else {
+            // Ordinary tool step (or a tool-less step the flow validator rejects).
+            steps.push(raw.into_step(source_text)?);
+            continue;
+        };
+        if has_tool {
+            return Err(StorageError::InvalidInput(format!(
+                "flow step {id} declares both tool and module"
+            )));
+        }
+        // A module instance id is the `head` of `instance.port` input references,
+        // which are split on the first '.', so it must not contain one.
+        if id.contains('.') {
+            return Err(StorageError::InvalidInput(format!(
+                "module step id {id} must not contain '.' (reserved for instance.port references)"
+            )));
+        }
+
+        let spec = modules.get(&module_ref).ok_or_else(|| {
+            StorageError::InvalidInput(format!(
+                "flow step {id} references module {module_ref}, which was not provided"
+            ))
+        })?;
+        // The module step's `inputs` are the bindings for the module's input
+        // ports; its `needs` become the upstream dependency of the instance's
+        // source steps.
+        let expansion = spec.expand(&id, &raw.inputs)?;
+        let module_needs = raw.needs.clone();
+
+        // Map each inlined artifact name to its producing step (artifact names are
+        // unique within an instance — guaranteed by ModuleSpec::validate).
+        let mut artifact_producer: BTreeMap<&str, &str> = BTreeMap::new();
+        for inlined in &expansion.steps {
+            for artifact in inlined.outputs.values() {
+                artifact_producer.insert(artifact.as_str(), inlined.id.as_str());
+            }
+        }
+        // Pair each exposed output port with (artifact, producer step) together so
+        // a downstream rewrite always gets both — they can never decouple.
+        let mut outputs: BTreeMap<String, (String, String)> = BTreeMap::new();
+        for (port, artifact) in &expansion.outputs {
+            let producer = artifact_producer.get(artifact.as_str()).ok_or_else(|| {
+                StorageError::InvalidInput(format!(
+                    "module {module_ref} output port {port} maps to {artifact}, which no \
+                     inlined step produces"
+                ))
+            })?;
+            outputs.insert(port.clone(), (artifact.clone(), (*producer).to_string()));
+        }
+        let mut sink_step_ids: Vec<String> = outputs
+            .values()
+            .map(|(_, producer)| producer.clone())
+            .collect();
+        dedupe_in_place(&mut sink_step_ids);
+        if sink_step_ids.is_empty() {
+            // A module with no exposed outputs: a `needs: [instance]` edge orders
+            // after the whole module, so depend on every inlined step.
+            sink_step_ids = expansion.steps.iter().map(|s| s.id.clone()).collect();
+        }
+
+        for mut inlined in expansion.steps {
+            // Source-step detection relies on ModuleSpec::validate() requiring every
+            // internal artifact consumer to declare needs on its producer: after
+            // expand(), `needs.is_empty()` iff the step is a topological source.
+            // Such sources inherit the module step's upstream needs; deeper steps
+            // already depend through them.
+            if inlined.needs.is_empty() && !module_needs.is_empty() {
+                inlined.needs = module_needs.clone();
+            }
+            steps.push(inlined);
+        }
+        instances.insert(
+            id,
+            ModuleInstance {
+                outputs,
+                sink_step_ids,
+            },
+        );
+    }
+
+    // Second pass: rewire references to module instances across every step.
+    for step in &mut steps {
+        let mut needs: Vec<String> = Vec::new();
+        for need in std::mem::take(&mut step.needs) {
+            match instances.get(&need) {
+                Some(instance) => needs.extend(instance.sink_step_ids.iter().cloned()),
+                None => needs.push(need),
+            }
+        }
+        for value in step.inputs.values_mut() {
+            let Some((head, port)) = value.split_once('.') else {
+                continue;
+            };
+            let Some(instance) = instances.get(head) else {
+                continue;
+            };
+            let (artifact, producer) = instance.outputs.get(port).ok_or_else(|| {
+                StorageError::InvalidInput(format!(
+                    "flow step {} input references {head}.{port}, but module instance {head} \
+                     has no output port {port}",
+                    step.id
+                ))
+            })?;
+            *value = artifact.clone();
+            needs.push(producer.clone());
+        }
+        dedupe_in_place(&mut needs);
+        step.needs = needs;
+    }
+
+    Ok(steps)
+}
+
+/// Remove duplicates while preserving first-seen order.
+fn dedupe_in_place(items: &mut Vec<String>) {
+    let mut seen = BTreeSet::new();
+    items.retain(|item| seen.insert(item.clone()));
 }
 
 fn required_flow_field(
@@ -1351,5 +1522,216 @@ steps:
             serde_json::from_str("{\"flow_id\":\"flow_1\",\"step_count\":1,\"edge_count\":0}")
                 .unwrap();
         assert_eq!(payload.flow_id, "flow_1");
+    }
+
+    const QC_QUANTIFY_MODULE: &str = r#"
+schema_version: agentflow.module.v0
+namespace: bio
+name: qc_then_quantify
+version: 0.1.0
+description: QC then quantify.
+inputs:
+  counts:
+    type: RawCounts
+outputs:
+  expression:
+    type: ExpressionTable
+    from: quant_out
+steps:
+  - id: qc
+    tool: bio/qc
+    inputs:
+      counts: counts
+    outputs:
+      clean: qc_clean
+  - id: quant
+    tool: bio/quantify
+    needs: [qc]
+    inputs:
+      counts: qc_clean
+    outputs:
+      expression: quant_out
+"#;
+
+    fn qc_module_map() -> BTreeMap<String, ModuleSpec> {
+        let spec = ModuleSpec::from_simple_yaml(QC_QUANTIFY_MODULE).unwrap();
+        BTreeMap::from([(spec.module_ref(), spec)])
+    }
+
+    fn step<'a>(draft: &'a FlowDraft, id: &str) -> &'a FlowStepDraft {
+        draft.steps.iter().find(|s| s.id == id).unwrap_or_else(|| {
+            panic!(
+                "expanded flow should contain step {id}; got {:?}",
+                draft
+                    .steps
+                    .iter()
+                    .map(|s| s.id.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
+    }
+
+    #[test]
+    fn expands_a_module_step_and_wires_a_downstream_consumer() {
+        let flow = r#"
+schema_version: agentflow.flow.v0
+id: f1
+name: Flow with module
+steps:
+  - id: prep
+    module: bio/qc_then_quantify
+    inputs:
+      counts: artifact_raw
+  - id: analyze
+    tool: bio/analyze
+    needs: [prep]
+    inputs:
+      expression: prep.expression
+    outputs:
+      report: analyze_report
+"#;
+        let draft = FlowDraft::from_simple_yaml_with_modules(flow, &qc_module_map()).unwrap();
+        // prep expands to two prefixed tool steps; analyze stays.
+        assert_eq!(draft.steps.len(), 3);
+
+        let qc = step(&draft, "prep__qc");
+        assert_eq!(qc.tool_ref, "bio/qc");
+        assert_eq!(qc.inputs["counts"], "artifact_raw"); // external port -> binding
+        assert_eq!(qc.outputs["clean"], "prep__qc_clean");
+        assert!(qc.needs.is_empty());
+
+        let quant = step(&draft, "prep__quant");
+        assert_eq!(quant.needs, vec!["prep__qc".to_string()]);
+        assert_eq!(quant.inputs["counts"], "prep__qc_clean");
+        assert_eq!(quant.outputs["expression"], "prep__quant_out");
+
+        let analyze = step(&draft, "analyze");
+        // `prep.expression` -> the exposed artifact; needs -> the producer.
+        assert_eq!(analyze.inputs["expression"], "prep__quant_out");
+        assert_eq!(analyze.needs, vec!["prep__quant".to_string()]);
+    }
+
+    #[test]
+    fn module_step_upstream_needs_propagate_to_source_steps() {
+        let flow = r#"
+schema_version: agentflow.flow.v0
+id: f2
+name: Flow with upstream
+steps:
+  - id: importer
+    tool: bio/import
+    outputs:
+      counts: importer_out
+  - id: prep
+    module: bio/qc_then_quantify
+    needs: [importer]
+    inputs:
+      counts: importer_out
+"#;
+        let draft = FlowDraft::from_simple_yaml_with_modules(flow, &qc_module_map()).unwrap();
+        // The source step (qc) inherits the module step's upstream need; the
+        // deeper step (quant) depends through qc.
+        assert_eq!(step(&draft, "prep__qc").needs, vec!["importer".to_string()]);
+        assert_eq!(
+            step(&draft, "prep__quant").needs,
+            vec!["prep__qc".to_string()]
+        );
+        assert_eq!(step(&draft, "prep__qc").inputs["counts"], "importer_out");
+    }
+
+    #[test]
+    fn two_module_instances_do_not_collide() {
+        let flow = r#"
+schema_version: agentflow.flow.v0
+id: f3
+name: Two instances
+steps:
+  - id: a
+    module: bio/qc_then_quantify
+    inputs:
+      counts: artifact_a
+  - id: b
+    module: bio/qc_then_quantify
+    inputs:
+      counts: artifact_b
+"#;
+        let draft = FlowDraft::from_simple_yaml_with_modules(flow, &qc_module_map()).unwrap();
+        assert_eq!(draft.steps.len(), 4);
+        assert_eq!(step(&draft, "a__qc").inputs["counts"], "artifact_a");
+        assert_eq!(step(&draft, "b__qc").inputs["counts"], "artifact_b");
+        assert_eq!(
+            step(&draft, "a__quant").outputs["expression"],
+            "a__quant_out"
+        );
+        assert_eq!(
+            step(&draft, "b__quant").outputs["expression"],
+            "b__quant_out"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_module_reference() {
+        let flow = r#"
+schema_version: agentflow.flow.v0
+id: f4
+name: Unknown module
+steps:
+  - id: prep
+    module: bio/missing
+    inputs:
+      counts: artifact_raw
+"#;
+        let err = FlowDraft::from_simple_yaml_with_modules(flow, &qc_module_map()).unwrap_err();
+        assert!(err.to_string().contains("which was not provided"));
+    }
+
+    #[test]
+    fn rejects_step_declaring_both_tool_and_module() {
+        let flow = r#"
+schema_version: agentflow.flow.v0
+id: f5
+name: Both
+steps:
+  - id: prep
+    tool: bio/qc
+    module: bio/qc_then_quantify
+    inputs:
+      counts: artifact_raw
+"#;
+        let err = FlowDraft::from_simple_yaml_with_modules(flow, &qc_module_map()).unwrap_err();
+        assert!(err.to_string().contains("declares both tool and module"));
+    }
+
+    #[test]
+    fn rejects_dotted_module_step_id() {
+        // A '.' in a module instance id would break `instance.port` parsing.
+        let flow = r#"
+schema_version: agentflow.flow.v0
+id: f7
+name: Dotted id
+steps:
+  - id: prep.v2
+    module: bio/qc_then_quantify
+    inputs:
+      counts: artifact_raw
+"#;
+        let err = FlowDraft::from_simple_yaml_with_modules(flow, &qc_module_map()).unwrap_err();
+        assert!(err.to_string().contains("must not contain '.'"));
+    }
+
+    #[test]
+    fn plain_parse_rejects_a_module_step() {
+        let flow = r#"
+schema_version: agentflow.flow.v0
+id: f6
+name: No modules provided
+steps:
+  - id: prep
+    module: bio/qc_then_quantify
+    inputs:
+      counts: artifact_raw
+"#;
+        let err = FlowDraft::from_simple_yaml(flow).unwrap_err();
+        assert!(err.to_string().contains("which was not provided"));
     }
 }

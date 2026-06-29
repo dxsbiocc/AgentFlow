@@ -9,6 +9,17 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **Flows can compose modules (`module: <ref>` step).** A flow step may reference
+  a module instead of a tool; it is inline-expanded at parse time
+  (`FlowDraft::from_simple_yaml_with_modules`) into ordinary tool steps —
+  namespacing the module's internal steps per instance, binding its input ports
+  to the step's `inputs`, exposing its outputs as `instance.port` references, and
+  rewiring cross-instance `needs`. The flattened flow runs on the existing
+  scheduler unchanged. (CLI wiring to load modules for `flow create` is a
+  follow-up.)
+
+### Added
+
 - **`run --retry-backoff <seconds>` / `agent run --retry-backoff <seconds>`.** An
   optional delay before a failed-but-retried step is re-offered (pairs with
   `--retries`). `RunConfig.retry_backoff` defaults to zero (immediate retry,

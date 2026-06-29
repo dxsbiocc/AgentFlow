@@ -7,6 +7,13 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-06-29
+
+Introduces first-class **modules** — reusable, typed sub-flows composed into flows
+by inline expansion — end to end (author, validate, reference, expand), plus a
+retry backoff. The deterministic 0-LLM verdict core (`argument.rs`) remains
+byte-identical to 0.3.0 and the scheduler/runtime are unchanged.
+
 ### Added
 
 - **`flow validate` / `flow approve` accept `--module <file>` (repeatable).** Supply

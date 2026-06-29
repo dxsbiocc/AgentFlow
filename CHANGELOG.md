@@ -9,6 +9,15 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **Module discovery for the agent (`match_modules`).** `ProjectStore::match_modules`
+  ranks registered modules that can produce a desired artifact type (atomic
+  `High`-fit producers — every input already available — first), the discovery
+  primitive the autonomous loop will use to compose modules. Pure, not yet wired
+  into the agent loop; see `docs/design/agent-module-composition-design.md` for
+  the phased plan (slice 4b).
+
+### Added
+
 - **Persistent modules — `module register <file>` / `module list`.** Modules can
   now be registered into a project's database (migration v2 adds a `modules`
   table) and listed, mirroring the tool registry: `register_module` /

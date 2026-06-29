@@ -9,6 +9,14 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **`flow validate` / `flow approve` accept `--module <file>` (repeatable).** Supply
+  the module specs a flow references so its `module: <ref>` steps are inline-expanded
+  when the flow is parsed; duplicate module refs are rejected. No `--module` is the
+  unchanged behavior (a flow that references a module without supplying it still
+  errors).
+
+### Added
+
 - **Flows can compose modules (`module: <ref>` step).** A flow step may reference
   a module instead of a tool; it is inline-expanded at parse time
   (`FlowDraft::from_simple_yaml_with_modules`) into ordinary tool steps —

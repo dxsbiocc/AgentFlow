@@ -7,6 +7,15 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+### Added
+
+- **Persistent modules — `module register <file>` / `module list`.** Modules can
+  now be registered into a project's database (migration v2 adds a `modules`
+  table) and listed, mirroring the tool registry: `register_module` /
+  `list_modules` / `get_module` on the store, and the two CLI commands (`list`
+  supports `--json` with a `schema_version` envelope). This is the foundation for
+  the agent to discover and compose modules.
+
 ## [0.3.9] - 2026-06-29
 
 Introduces first-class **modules** — reusable, typed sub-flows composed into flows

@@ -16,7 +16,9 @@ pub use flow_registry::{
     FlowValidationReport, StoredFlowEdge, StoredFlowStep,
 };
 pub use migrations::MigrationRecord;
-pub use module_registry::{ModuleExpansion, ModuleOutput, ModulePort, ModuleSpec};
+pub use module_registry::{
+    ModuleExpansion, ModuleOutput, ModulePort, ModuleRegistration, ModuleSpec, ModuleSummary,
+};
 pub use project_store::{
     now_unix_nanos, now_unix_seconds, project_db_path, project_dir, EventId, EventRecord,
     ProjectStore, ProjectSummary, StorageError,

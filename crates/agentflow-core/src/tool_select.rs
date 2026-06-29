@@ -48,6 +48,17 @@ pub struct ToolCandidate {
     pub answer_priority: bool,
 }
 
+/// A registered module that can produce a desired artifact type, ranked like a
+/// tool producer. `output_port` is the module output port carrying that type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleCandidate {
+    pub module_ref: String,
+    pub output_port: String,
+    pub fit: Fit,
+    pub score: i32,
+    pub reason: String,
+}
+
 impl ProjectStore {
     pub fn match_tools(&self, query: &CapabilityQuery) -> Result<Vec<ToolCandidate>, StorageError> {
         let available_types = query
@@ -180,6 +191,73 @@ impl ProjectStore {
         Ok(candidates)
     }
 
+    /// Registered modules that can produce `desired_output_type`, ranked like
+    /// tool producers (highest score first, then module ref). A module is a
+    /// candidate only if one of its output ports carries the desired type; its
+    /// Fit is `High` when every input port is already available (an atomic
+    /// producer that needs no further chaining) and `Medium` otherwise. This is
+    /// the discovery primitive the autonomous loop composes (slice 4b-2); see
+    /// docs/design/agent-module-composition-design.md.
+    pub fn match_modules(
+        &self,
+        desired_output_type: &str,
+        available_input_types: &[String],
+    ) -> Result<Vec<ModuleCandidate>, StorageError> {
+        let available = available_input_types
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut candidates = Vec::new();
+
+        for summary in self.list_modules()? {
+            let spec = self.get_module(&summary.module_ref)?;
+            let Some(output_port) = spec
+                .outputs
+                .iter()
+                .find(|(_, output)| output.type_name == desired_output_type)
+                .map(|(name, _)| name.clone())
+            else {
+                continue;
+            };
+
+            let mut score = SCORE_OUTPUT_TYPE;
+            let mut reasons = vec![format!("output:{desired_output_type}")];
+            let mut satisfied_inputs = 0usize;
+            for (name, port) in &spec.inputs {
+                if available.contains(port.type_name.as_str()) {
+                    satisfied_inputs += 1;
+                    score += SCORE_REQUIRED_INPUT;
+                    reasons.push(format!("input:{name}:{}", port.type_name));
+                }
+            }
+            let all_inputs_available = satisfied_inputs == spec.inputs.len();
+            let fit = if all_inputs_available {
+                Fit::High
+            } else {
+                Fit::Medium
+            };
+
+            candidates.push(ModuleCandidate {
+                module_ref: summary.module_ref,
+                output_port,
+                fit,
+                score,
+                reason: reason_text(reasons),
+            });
+        }
+
+        // Atomic producers (High = every input already available, no further
+        // chaining) rank ahead of those still needing inputs, then by score, then
+        // by ref for a stable order.
+        candidates.sort_by(|left, right| {
+            module_fit_rank(left.fit)
+                .cmp(&module_fit_rank(right.fit))
+                .then_with(|| right.score.cmp(&left.score))
+                .then_with(|| left.module_ref.cmp(&right.module_ref))
+        });
+        Ok(candidates)
+    }
+
     pub fn draft_step_for(
         &self,
         tool_ref: &str,
@@ -241,6 +319,16 @@ impl ProjectStore {
             }
         }
         Ok(needs.into_iter().collect())
+    }
+}
+
+/// Orders module producer fit so `High` (all inputs available, atomic) sorts
+/// before `Medium`/`Low`.
+fn module_fit_rank(fit: Fit) -> u8 {
+    match fit {
+        Fit::High => 0,
+        Fit::Medium => 1,
+        Fit::Low => 2,
     }
 }
 
@@ -349,6 +437,112 @@ mod tests {
     fn register_tool(store: &ProjectStore, yaml: &str) {
         let spec = ToolSpec::from_simple_yaml(yaml).unwrap();
         store.register_tool(spec).unwrap();
+    }
+
+    fn register_module(store: &ProjectStore, yaml: &str) {
+        let spec = crate::storage::ModuleSpec::from_simple_yaml(yaml).unwrap();
+        store.register_module(spec).unwrap();
+    }
+
+    const QC_QUANT_MODULE: &str = r#"
+schema_version: agentflow.module.v0
+namespace: bio
+name: qc_then_quantify
+version: 0.1.0
+description: QC raw counts then quantify into an expression table.
+inputs:
+  counts:
+    type: RawCounts
+outputs:
+  expression:
+    type: ExpressionTable
+    from: quant_out
+steps:
+  - id: qc
+    tool: bio/qc
+    inputs:
+      counts: counts
+    outputs:
+      clean: qc_clean
+  - id: quant
+    tool: bio/quantify
+    needs: [qc]
+    inputs:
+      counts: qc_clean
+    outputs:
+      expression: quant_out
+"#;
+
+    #[test]
+    fn match_modules_ranks_producers_of_the_desired_type() {
+        let (_path, store) = init_store("match-modules");
+        register_module(&store, QC_QUANT_MODULE);
+
+        // Input available -> High fit, output port reported.
+        let high = store
+            .match_modules("ExpressionTable", &["RawCounts".to_string()])
+            .unwrap();
+        assert_eq!(high.len(), 1);
+        assert_eq!(high[0].module_ref, "bio/qc_then_quantify");
+        assert_eq!(high[0].output_port, "expression");
+        assert_eq!(high[0].fit, Fit::High);
+        assert!(high[0].reason.contains("input:counts:RawCounts"));
+
+        // Input NOT available -> still a candidate, but Medium fit.
+        let medium = store.match_modules("ExpressionTable", &[]).unwrap();
+        assert_eq!(medium.len(), 1);
+        assert_eq!(medium[0].fit, Fit::Medium);
+
+        // A type no module produces -> no candidates.
+        let none = store
+            .match_modules("SurvivalTable", &["RawCounts".to_string()])
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn match_modules_sorts_higher_score_first() {
+        let (_path, store) = init_store("match-modules-sort");
+        register_module(&store, QC_QUANT_MODULE);
+        // A second producer of ExpressionTable that needs an extra, unavailable
+        // input — fewer satisfied inputs, so it scores below the first.
+        register_module(
+            &store,
+            r#"
+schema_version: agentflow.module.v0
+namespace: bio
+name: needs_two
+version: 0.1.0
+description: Needs counts and a reference to make an expression table.
+inputs:
+  counts:
+    type: RawCounts
+  reference:
+    type: ReferenceGenome
+outputs:
+  expression:
+    type: ExpressionTable
+    from: out
+steps:
+  - id: build
+    tool: bio/build
+    inputs:
+      counts: counts
+      reference: reference
+    outputs:
+      expression: out
+"#,
+        );
+
+        let ranked = store
+            .match_modules("ExpressionTable", &["RawCounts".to_string()])
+            .unwrap();
+        assert_eq!(ranked.len(), 2);
+        // qc_then_quantify has all inputs available (High); needs_two does not.
+        assert_eq!(ranked[0].module_ref, "bio/qc_then_quantify");
+        assert_eq!(ranked[0].fit, Fit::High);
+        assert_eq!(ranked[1].module_ref, "bio/needs_two");
+        assert_eq!(ranked[1].fit, Fit::Medium);
     }
 
     fn tool_yaml(

@@ -67,6 +67,8 @@ pub fn usage() -> String {
         "  agentflow tools inspect <tool-ref> [--json] [--path <path>]",
         "  agentflow tools match [--output <type>] [--input <type>]... [--keyword <kw>]... [--json] [--path <path>]",
         "  agentflow tools draft-step <tool-ref> [--input <type>:<artifact-id>]... [--hypothesis <id>] [--infer-params] [--synthesizer <cmd>] [--json] [--path <path>]",
+        "  agentflow module register <module.yaml> [--path <path>]",
+        "  agentflow module list [--json] [--path <path>]",
         "  agentflow module validate <path>",
         "  agentflow module show <path>",
         "  agentflow synth --name <n> --description <text> --fixture <input-file> --expect <substring> [--synthesizer <cmd>] [--path <path>]",

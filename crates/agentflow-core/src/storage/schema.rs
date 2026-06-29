@@ -159,3 +159,18 @@ CREATE TABLE IF NOT EXISTS reports (
     created_at INTEGER NOT NULL
 );
 "#;
+
+pub const MODULES_TABLE_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS modules (
+    id TEXT PRIMARY KEY,
+    namespace TEXT NOT NULL,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    description TEXT NOT NULL,
+    source_text TEXT NOT NULL,
+    spec_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+"#;

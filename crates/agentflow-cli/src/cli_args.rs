@@ -332,8 +332,24 @@ pub(crate) struct ModuleArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ModuleCommand {
+    Register(ModuleRegisterArgs),
+    List(ModuleListArgs),
     Validate(ModuleFileArgs),
     Show(ModuleFileArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ModuleRegisterArgs {
+    #[arg(value_name = "module.yaml")]
+    pub(crate) module_yaml: PathBuf,
+    #[command(flatten)]
+    pub(crate) project: PathOnlyArgs,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ModuleListArgs {
+    #[command(flatten)]
+    pub(crate) project: PathJsonArgs,
 }
 
 #[derive(Debug, Args)]

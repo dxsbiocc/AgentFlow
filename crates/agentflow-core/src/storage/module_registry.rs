@@ -13,8 +13,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rusqlite::{params, OptionalExtension};
+
 use super::flow_registry::FlowStepDraft;
-use super::project_store::StorageError;
+use super::migrations;
+use super::project_store::{now_unix_seconds, ProjectStore, StorageError};
 use super::yaml;
 
 const DEFAULT_NAMESPACE: &str = "local";
@@ -48,6 +51,23 @@ pub struct ModuleSpec {
     pub source_text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleRegistration {
+    pub module_ref: String,
+    pub version: String,
+    pub spec_hash: String,
+    pub replaced_existing: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleSummary {
+    pub module_ref: String,
+    pub namespace: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+}
+
 /// The result of expanding one module instance into a flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleExpansion {
@@ -57,6 +77,101 @@ pub struct ModuleExpansion {
     /// Map of the module's external output port name -> the (namespaced)
     /// internal artifact name that carries it, for the caller to wire onward.
     pub outputs: BTreeMap<String, String>,
+}
+
+impl ProjectStore {
+    pub fn register_module(&self, spec: ModuleSpec) -> Result<ModuleRegistration, StorageError> {
+        let module_ref = spec.module_ref();
+        let spec_hash = migrations::checksum(&spec.source_text);
+        let now = now_unix_seconds();
+
+        // `replaced_existing` is read non-atomically before the upsert (matching
+        // the tool registry). A ProjectStore owns a single connection used
+        // serially, so the flag is reliable in practice; the INSERT ... ON
+        // CONFLICT below is authoritative regardless.
+        let existing = self
+            .connection()
+            .query_row(
+                "SELECT id FROM modules WHERE id = ?1",
+                params![&module_ref],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let replaced_existing = existing.is_some();
+
+        self.connection().execute(
+            "INSERT INTO modules
+             (id, namespace, name, version, schema_version, description, source_text, spec_hash,
+              created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+               namespace = excluded.namespace,
+               name = excluded.name,
+               version = excluded.version,
+               schema_version = excluded.schema_version,
+               description = excluded.description,
+               source_text = excluded.source_text,
+               spec_hash = excluded.spec_hash,
+               updated_at = excluded.updated_at",
+            params![
+                &module_ref,
+                &spec.namespace,
+                &spec.name,
+                &spec.version,
+                &spec.schema_version,
+                &spec.description,
+                &spec.source_text,
+                &spec_hash,
+                now,
+                now
+            ],
+        )?;
+        self.touch_project()?;
+
+        Ok(ModuleRegistration {
+            module_ref,
+            version: spec.version,
+            spec_hash,
+            replaced_existing,
+        })
+    }
+
+    pub fn list_modules(&self) -> Result<Vec<ModuleSummary>, StorageError> {
+        let mut stmt = self.connection().prepare(
+            "SELECT id, namespace, name, version, description
+             FROM modules
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ModuleSummary {
+                module_ref: row.get(0)?,
+                namespace: row.get(1)?,
+                name: row.get(2)?,
+                version: row.get(3)?,
+                description: row.get(4)?,
+            })
+        })?;
+
+        let mut modules = Vec::new();
+        for row in rows {
+            modules.push(row?);
+        }
+        Ok(modules)
+    }
+
+    pub fn get_module(&self, module_ref: &str) -> Result<ModuleSpec, StorageError> {
+        let source_text = self
+            .connection()
+            .query_row(
+                "SELECT source_text FROM modules WHERE id = ?1",
+                params![module_ref],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::NotFound(format!("module {module_ref}")))?;
+
+        ModuleSpec::from_simple_yaml(&source_text)
+    }
 }
 
 impl ModuleSpec {
@@ -523,6 +638,99 @@ steps:
     outputs:
       expression: quant_out
 "#;
+
+    fn temp_project_path(test_name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "agentflow-module-registry-{test_name}-{}-{}",
+            std::process::id(),
+            now_unix_seconds()
+        ))
+    }
+
+    fn module_with_version(version: &str) -> String {
+        TWO_STEP_MODULE.replace("version: 0.1.0", &format!("version: {version}"))
+    }
+
+    #[test]
+    fn registers_and_lists_module() {
+        let path = temp_project_path("register-list");
+        let store = ProjectStore::init(&path, Some("Modules")).unwrap();
+
+        let registration = store
+            .register_module(ModuleSpec::from_simple_yaml(TWO_STEP_MODULE).unwrap())
+            .unwrap();
+        assert_eq!(registration.module_ref, "bio/qc_then_quantify");
+        assert_eq!(registration.version, "0.1.0");
+        assert!(!registration.replaced_existing);
+        assert_eq!(
+            registration.spec_hash,
+            migrations::checksum(TWO_STEP_MODULE)
+        );
+
+        let modules = store.list_modules().unwrap();
+        assert_eq!(
+            modules,
+            vec![ModuleSummary {
+                module_ref: "bio/qc_then_quantify".to_string(),
+                namespace: "bio".to_string(),
+                name: "qc_then_quantify".to_string(),
+                version: "0.1.0".to_string(),
+                description: "QC raw counts then quantify into an expression table.".to_string(),
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn get_module_round_trips_registered_source() {
+        let path = temp_project_path("get-round-trip");
+        let store = ProjectStore::init(&path, Some("Modules")).unwrap();
+        let original = ModuleSpec::from_simple_yaml(TWO_STEP_MODULE).unwrap();
+        store.register_module(original.clone()).unwrap();
+
+        let stored = store.get_module("bio/qc_then_quantify").unwrap();
+        assert_eq!(stored, original);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn reregistering_same_module_ref_replaces_existing_row() {
+        let path = temp_project_path("replace-existing");
+        let store = ProjectStore::init(&path, Some("Modules")).unwrap();
+        let first = store
+            .register_module(ModuleSpec::from_simple_yaml(&module_with_version("0.1.0")).unwrap())
+            .unwrap();
+        let second = store
+            .register_module(ModuleSpec::from_simple_yaml(&module_with_version("0.2.0")).unwrap())
+            .unwrap();
+
+        assert!(!first.replaced_existing);
+        assert!(second.replaced_existing);
+
+        let modules = store.list_modules().unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].module_ref, "bio/qc_then_quantify");
+        assert_eq!(modules[0].version, "0.2.0");
+        assert_eq!(
+            store.get_module("bio/qc_then_quantify").unwrap().version,
+            "0.2.0"
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn get_module_returns_not_found_for_missing_ref() {
+        let path = temp_project_path("missing");
+        let store = ProjectStore::init(&path, Some("Modules")).unwrap();
+
+        let err = store.get_module("bio/missing").unwrap_err();
+        assert!(matches!(err, StorageError::NotFound(_)));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
 
     #[test]
     fn parses_and_validates_a_module() {

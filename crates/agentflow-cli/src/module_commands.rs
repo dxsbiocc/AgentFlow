@@ -1,12 +1,59 @@
-use agentflow_core::storage::ModuleSpec;
+use agentflow_core::storage::{ModuleSpec, ModuleSummary, ProjectStore};
 
-use crate::cli_args::{ModuleArgs, ModuleCommand, ModuleFileArgs};
-use crate::CliError;
+use crate::cli_args::{
+    ModuleArgs, ModuleCommand, ModuleFileArgs, ModuleListArgs, ModuleRegisterArgs,
+};
+use crate::{project_path_from_json, project_path_from_only, CliError};
 
 pub(crate) fn module_command(args: ModuleArgs) -> Result<String, CliError> {
     match args.command {
+        ModuleCommand::Register(args) => module_register_command(args),
+        ModuleCommand::List(args) => module_list_command(args),
         ModuleCommand::Validate(args) => module_validate_command(args),
         ModuleCommand::Show(args) => module_show_command(args),
+    }
+}
+
+fn module_register_command(args: ModuleRegisterArgs) -> Result<String, CliError> {
+    let source = std::fs::read_to_string(&args.module_yaml)?;
+    let spec = ModuleSpec::from_simple_yaml(&source)?;
+    let project_path = project_path_from_only(args.project)?;
+    let store = ProjectStore::open(&project_path)?;
+    let registration = store.register_module(spec)?;
+    let action = if registration.replaced_existing {
+        "Updated"
+    } else {
+        "Registered"
+    };
+
+    Ok(format!(
+        "{action} module\nRef: {}\nVersion: {}\nSpec hash: {}",
+        registration.module_ref, registration.version, registration.spec_hash
+    ))
+}
+
+fn module_list_command(args: ModuleListArgs) -> Result<String, CliError> {
+    let project = args.project;
+    let json = project.json;
+    let project_path = project_path_from_json(project)?;
+    let store = ProjectStore::open(&project_path)?;
+    let modules = store.list_modules()?;
+
+    if json {
+        Ok(modules_list_json(&modules))
+    } else if modules.is_empty() {
+        Ok("No modules registered".to_string())
+    } else {
+        Ok(modules
+            .iter()
+            .map(|module| {
+                format!(
+                    "{}@{} - {}",
+                    module.module_ref, module.version, module.description
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 }
 
@@ -59,6 +106,36 @@ fn format_module_inputs(spec: &ModuleSpec) -> String {
         .map(|(name, port)| format!("  {name}: {}", port.type_name))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn modules_list_json(modules: &[ModuleSummary]) -> String {
+    let items = modules
+        .iter()
+        .map(|module| {
+            format!(
+                concat!(
+                    "{{",
+                    "\"ref\":\"{}\",",
+                    "\"namespace\":\"{}\",",
+                    "\"name\":\"{}\",",
+                    "\"version\":\"{}\",",
+                    "\"description\":\"{}\"",
+                    "}}"
+                ),
+                crate::escape_json(&module.module_ref),
+                crate::escape_json(&module.namespace),
+                crate::escape_json(&module.name),
+                crate::escape_json(&module.version),
+                crate::escape_json(&module.description)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!(
+        "{{\"schema_version\":\"{}\",\"modules\":[{items}]}}",
+        agentflow_schemas::MODULE_LIST_JSON_SCHEMA_V0
+    )
 }
 
 fn format_module_outputs(spec: &ModuleSpec) -> String {

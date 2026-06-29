@@ -176,3 +176,32 @@ fn module_show_command_renders_ports_and_steps() {
     assert!(output.contains("qc: bio/qc"));
     assert!(output.contains("quant: bio/quantify (needs: qc)"));
 }
+
+#[test]
+fn module_register_then_list_round_trips_through_the_project() {
+    let project = TempProject::new("register-list");
+    let module_path = write_module_yaml(&project.path);
+    let project_arg = project.path.to_str().expect("project path should be UTF-8");
+    let module_arg = module_path.to_str().expect("module path should be UTF-8");
+
+    run_agentflow(["init", "--name", "modreg", "--path", project_arg]);
+
+    let registered = run_agentflow(["module", "register", module_arg, "--path", project_arg]);
+    assert!(
+        registered.contains("bio/qc_then_quantify"),
+        "register should report the module ref: {registered}"
+    );
+
+    let listed = run_agentflow(["module", "list", "--path", project_arg]);
+    assert!(
+        listed.contains("bio/qc_then_quantify"),
+        "list should include the registered module: {listed}"
+    );
+
+    let json = run_agentflow(["module", "list", "--json", "--path", project_arg]);
+    assert!(
+        json.contains("\"schema_version\":\"agentflow.module_list.v0\""),
+        "list --json should carry the schema_version envelope: {json}"
+    );
+    assert!(json.contains("\"ref\":\"bio/qc_then_quantify\""));
+}

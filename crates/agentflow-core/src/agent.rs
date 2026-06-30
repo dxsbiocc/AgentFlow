@@ -1139,7 +1139,13 @@ fn module_producer_steps(
             .map(|(port, _)| (step.id.clone(), port.clone()))
     })?;
 
-    let proposed_steps = expansion
+    let proposed_steps = module_expansion_steps(expansion);
+
+    Some((proposed_steps, producing_step_id, producing_output_port))
+}
+
+fn module_expansion_steps(expansion: &ModuleExpansion) -> Vec<ProposedStep> {
+    expansion
         .steps
         .iter()
         .map(|step| ProposedStep {
@@ -1162,9 +1168,7 @@ fn module_producer_steps(
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
         })
-        .collect();
-
-    Some((proposed_steps, producing_step_id, producing_output_port))
+        .collect()
 }
 
 fn rewrite_module_internal_inputs_for_graph_patch(steps: &mut [ProposedStep]) {
@@ -1184,6 +1188,27 @@ fn rewrite_module_internal_inputs_for_graph_patch(steps: &mut [ProposedStep]) {
             }
         }
     }
+}
+
+fn has_unresolved_required_inputs(step: &ProposedStep) -> bool {
+    step.inputs
+        .iter()
+        .any(|(name, value)| value == &format!("artifact_REPLACE_{name}"))
+}
+
+fn has_unresolved_required_params(
+    step: &ProposedStep,
+    param_specs: &BTreeMap<String, ToolParamSpec>,
+) -> bool {
+    param_specs.iter().any(|(name, spec)| {
+        spec.required
+            && step
+                .params
+                .iter()
+                .find(|(param_name, _)| param_name == name)
+                .map(|(_, value)| value)
+                .is_none_or(|value| value == &format!("REPLACE_{name}"))
+    })
 }
 
 fn sanitize_module_instance_id(value: &str) -> String {
@@ -1313,6 +1338,14 @@ impl ProjectStore {
             scorer,
         )?;
         let top = candidates.into_iter().next();
+        let tool_answers = top.as_ref().map(|c| c.answer_priority).unwrap_or(false);
+        if !tool_answers {
+            if let Some(proposal) =
+                self.module_answer_proposal(&decision, available_input_types, available)?
+            {
+                return Ok((proposal, Vec::new()));
+            }
+        }
 
         let Some(candidate) = top else {
             return Ok((
@@ -1354,6 +1387,16 @@ impl ProjectStore {
             available,
             max_chain_depth,
         )?;
+        if candidate.answer_priority
+            && (has_unresolved_required_inputs(&drafted_step)
+                || has_unresolved_required_params(&drafted_step, &executable.params))
+        {
+            if let Some(proposal) =
+                self.module_answer_proposal(&decision, available_input_types, available)?
+            {
+                return Ok((proposal, Vec::new()));
+            }
+        }
         let needs = self.infer_step_needs(&drafted_step)?;
         let drafted_step = ProposedStep {
             needs,
@@ -1370,6 +1413,74 @@ impl ProjectStore {
             },
             inferred_param_names,
         ))
+    }
+
+    fn module_answer_proposal(
+        &self,
+        decision: &BranchDecision,
+        available_input_types: &[String],
+        available: &[(String, String)],
+    ) -> Result<Option<EnrichedProposal>, StorageError> {
+        for module in self.answer_capable_modules(available_input_types)? {
+            if module.fit != Fit::High {
+                continue;
+            }
+
+            let spec = self.get_module(&module.module_ref)?;
+            let mut bindings = BTreeMap::new();
+            let mut bound_all_inputs = true;
+            for (port_name, port) in &spec.inputs {
+                let Some((_, artifact_id)) = available
+                    .iter()
+                    .find(|(type_name, _)| type_name == &port.type_name)
+                else {
+                    bound_all_inputs = false;
+                    break;
+                };
+                bindings.insert(port_name.clone(), artifact_id.clone());
+            }
+            if !bound_all_inputs {
+                continue;
+            }
+
+            let instance_id = sanitize_module_instance_id(&format!(
+                "{}__{}",
+                decision.candidate.hypothesis_id, module.module_ref
+            ));
+            // Bindings are built from `spec.inputs` and `instance_id` is a
+            // non-empty sanitized ident, so expand should not fail here; skip the
+            // candidate defensively rather than abort the whole cycle if it does.
+            let Ok(expansion) = spec.expand(&instance_id, &bindings) else {
+                continue;
+            };
+            let mut steps = module_expansion_steps(&expansion);
+            rewrite_module_internal_inputs_for_graph_patch(&mut steps);
+
+            let answer_step_id = format!("{instance_id}__{}", module.answer_step);
+            let Some(answer_index) = steps.iter().position(|step| step.id == answer_step_id) else {
+                continue;
+            };
+            let drafted = steps.remove(answer_index);
+            if !drafted
+                .outputs
+                .iter()
+                .any(|(output_name, _)| output_name == &module.observer_port)
+            {
+                continue;
+            }
+            let answer_tool_ref = drafted.tool.clone();
+
+            return Ok(Some(EnrichedProposal {
+                decision: decision.clone(),
+                matched_tool: Some(answer_tool_ref),
+                matched_fit: Some(module.fit.as_str().to_string()),
+                match_reason: Some(format!("module:{} ({})", module.module_ref, module.reason)),
+                drafted_step: Some(drafted),
+                prerequisite_steps: steps,
+            }));
+        }
+
+        Ok(None)
     }
 
     /// For each required input the consumer step still binds to an

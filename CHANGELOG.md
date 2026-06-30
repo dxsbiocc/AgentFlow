@@ -9,6 +9,16 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **The agent answers with a registered module (slice 4b-3b).** When no tool can
+  answer a hypothesis, the autonomous loop now falls back to a registered module
+  that produces an observation (an internal step whose tool has an observed
+  output): the module is inline-expanded, its observed step becomes the answer and
+  the rest become prerequisites. It also falls back to a module when a tool
+  "answers" but its drafted step has unresolved required inputs/params. Module
+  answer steps use the module's fixed params (no per-hypothesis inference yet).
+
+### Added
+
 - **Module answer-capability discovery (`answer_capable_modules`, slice 4b-3a).**
   `ProjectStore::answer_capable_modules` ranks registered modules that can answer
   a hypothesis — i.e. whose first internal step is a tool with an observed output

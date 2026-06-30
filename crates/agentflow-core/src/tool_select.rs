@@ -59,6 +59,18 @@ pub struct ModuleCandidate {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleAnswerCandidate {
+    pub module_ref: String,
+    /// The module-local internal step id whose tool yields the observation.
+    pub answer_step: String,
+    /// That step's observed output port name.
+    pub observer_port: String,
+    pub fit: Fit,
+    pub score: i32,
+    pub reason: String,
+}
+
 impl ProjectStore {
     pub fn match_tools(&self, query: &CapabilityQuery) -> Result<Vec<ToolCandidate>, StorageError> {
         let available_types = query
@@ -249,6 +261,81 @@ impl ProjectStore {
         // Atomic producers (High = every input already available, no further
         // chaining) rank ahead of those still needing inputs, then by score, then
         // by ref for a stable order.
+        candidates.sort_by(|left, right| {
+            module_fit_rank(left.fit)
+                .cmp(&module_fit_rank(right.fit))
+                .then_with(|| right.score.cmp(&left.score))
+                .then_with(|| left.module_ref.cmp(&right.module_ref))
+        });
+        Ok(candidates)
+    }
+
+    /// Registered modules that can answer a hypothesis by yielding an
+    /// observation from one of their internal steps. This is a pure discovery
+    /// primitive; the autonomous loop decides how to compose candidates.
+    pub fn answer_capable_modules(
+        &self,
+        available_input_types: &[String],
+    ) -> Result<Vec<ModuleAnswerCandidate>, StorageError> {
+        let available = available_input_types
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut candidates = Vec::new();
+
+        for summary in self.list_modules()? {
+            let module_ref = summary.module_ref;
+            let spec = self.get_module(&module_ref)?;
+            let mut answer = None;
+
+            for step in &spec.steps {
+                let executable = match self.executable_tool(&step.tool_ref) {
+                    Ok(executable) => executable,
+                    Err(StorageError::NotFound(_)) => continue,
+                    Err(error) => return Err(error),
+                };
+                if let Some(observer_port) = executable
+                    .outputs
+                    .iter()
+                    .find(|(_, output)| output.observer.is_some())
+                    .map(|(name, _)| name.clone())
+                {
+                    answer = Some((step.id.clone(), observer_port));
+                    break;
+                }
+            }
+
+            let Some((answer_step, observer_port)) = answer else {
+                continue;
+            };
+
+            let mut score = SCORE_OUTPUT_TYPE;
+            let mut reasons = vec![format!("answer:{module_ref}")];
+            let mut satisfied_inputs = 0usize;
+            for (name, port) in &spec.inputs {
+                if available.contains(port.type_name.as_str()) {
+                    satisfied_inputs += 1;
+                    score += SCORE_REQUIRED_INPUT;
+                    reasons.push(format!("input:{name}:{}", port.type_name));
+                }
+            }
+            let all_inputs_available = satisfied_inputs == spec.inputs.len();
+            let fit = if all_inputs_available {
+                Fit::High
+            } else {
+                Fit::Medium
+            };
+
+            candidates.push(ModuleAnswerCandidate {
+                module_ref,
+                answer_step,
+                observer_port,
+                fit,
+                score,
+                reason: reason_text(reasons),
+            });
+        }
+
         candidates.sort_by(|left, right| {
             module_fit_rank(left.fit)
                 .cmp(&module_fit_rank(right.fit))
@@ -543,6 +630,152 @@ steps:
         assert_eq!(ranked[0].fit, Fit::High);
         assert_eq!(ranked[1].module_ref, "bio/needs_two");
         assert_eq!(ranked[1].fit, Fit::Medium);
+    }
+
+    #[test]
+    fn answer_capable_modules_discovers_observed_internal_steps() {
+        let (_path, store) = init_store("answer-capable-modules");
+        register_tool(
+            &store,
+            &tool_yaml(
+                "bio",
+                "qc",
+                "verified",
+                "Clean raw counts before downstream analysis.",
+                &one_required_input("counts", "RawCounts"),
+                no_params(),
+                "  clean:\n    type: RawCounts\n",
+            ),
+        );
+        register_tool(
+            &store,
+            &tool_yaml(
+                "bio",
+                "report",
+                "verified",
+                "Build an observation report.",
+                &one_required_input("counts", "RawCounts"),
+                no_params(),
+                "  report:\n    type: Markdown\n    observer: marker_report\n",
+            ),
+        );
+        register_module(
+            &store,
+            r#"
+schema_version: agentflow.module.v0
+namespace: bio
+name: diff_then_report
+version: 0.1.0
+description: QC counts, then report an observed answer.
+inputs:
+  counts:
+    type: RawCounts
+outputs:
+  report:
+    type: Markdown
+    from: report_md
+steps:
+  - id: qc
+    tool: bio/qc
+    inputs:
+      counts: counts
+    outputs:
+      clean: qc_clean
+  - id: report
+    tool: bio/report
+    needs: [qc]
+    inputs:
+      counts: qc_clean
+    outputs:
+      report: report_md
+"#,
+        );
+        register_module(
+            &store,
+            r#"
+schema_version: agentflow.module.v0
+namespace: bio
+name: qc_only
+version: 0.1.0
+description: QC counts without producing an observation.
+inputs:
+  counts:
+    type: RawCounts
+outputs:
+  clean:
+    type: RawCounts
+    from: qc_clean
+steps:
+  - id: qc
+    tool: bio/qc
+    inputs:
+      counts: counts
+    outputs:
+      clean: qc_clean
+"#,
+        );
+
+        let candidates = store
+            .answer_capable_modules(&["RawCounts".to_string()])
+            .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].module_ref, "bio/diff_then_report");
+        assert_eq!(candidates[0].answer_step, "report");
+        assert_eq!(candidates[0].observer_port, "report");
+        assert_eq!(candidates[0].fit, Fit::High);
+        assert!(candidates[0].reason.contains("answer:bio/diff_then_report"));
+        assert!(candidates[0].reason.contains("input:counts:RawCounts"));
+        assert!(!candidates
+            .iter()
+            .any(|candidate| candidate.module_ref == "bio/qc_only"));
+    }
+
+    #[test]
+    fn answer_capable_modules_assigns_medium_fit_when_inputs_are_missing() {
+        let (_path, store) = init_store("answer-capable-modules-medium");
+        register_tool(
+            &store,
+            &tool_yaml(
+                "bio",
+                "report",
+                "verified",
+                "Build an observation report.",
+                &one_required_input("counts", "RawCounts"),
+                no_params(),
+                "  report:\n    type: Markdown\n    observer: marker_report\n",
+            ),
+        );
+        register_module(
+            &store,
+            r#"
+schema_version: agentflow.module.v0
+namespace: bio
+name: diff_then_report
+version: 0.1.0
+description: Report an observed answer.
+inputs:
+  counts:
+    type: RawCounts
+outputs:
+  report:
+    type: Markdown
+    from: report_md
+steps:
+  - id: report
+    tool: bio/report
+    inputs:
+      counts: counts
+    outputs:
+      report: report_md
+"#,
+        );
+
+        let candidates = store.answer_capable_modules(&[]).unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].module_ref, "bio/diff_then_report");
+        assert_eq!(candidates[0].fit, Fit::Medium);
     }
 
     fn tool_yaml(

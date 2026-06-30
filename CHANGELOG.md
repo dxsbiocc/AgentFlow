@@ -9,6 +9,15 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **Module answer-capability discovery (`answer_capable_modules`, slice 4b-3a).**
+  `ProjectStore::answer_capable_modules` ranks registered modules that can answer
+  a hypothesis — i.e. whose first internal step is a tool with an observed output
+  port — High-fit (all inputs available) first, reporting the answer step + its
+  observer port. Pure discovery primitive (mirrors `match_modules`); not yet wired
+  into the agent's answer-matching (slice 4b-3b).
+
+### Added
+
 - **The agent composes registered modules (slice 4b-2).** When the autonomous
   loop backward-chains to satisfy a step's missing input type and no tool can
   produce it, it now falls back to a registered **module** whose output port

@@ -7,6 +7,16 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+### Added
+
+- **Per-hypothesis param inference for module answers (slice 4b-4c).** When the
+  agent answers a hypothesis with a registered module, an inferable param
+  (`infer:` hint, e.g. `gene`) that the module leaves unset is now filled from the
+  hypothesis (e.g. the gene symbol), instead of requiring a fixed module value.
+  The inferred value is recorded as an unconfirmed inferred param, so the verdict
+  stays grade-capped (honesty interlock) — exactly as for a tool answer.
+  Module-set params are never overwritten.
+
 ## [0.4.0] - 2026-06-30
 
 The autonomous agent can now discover and compose registered **modules**

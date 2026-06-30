@@ -1340,10 +1340,14 @@ impl ProjectStore {
         let top = candidates.into_iter().next();
         let tool_answers = top.as_ref().map(|c| c.answer_priority).unwrap_or(false);
         if !tool_answers {
-            if let Some(proposal) =
-                self.module_answer_proposal(&decision, available_input_types, available)?
-            {
-                return Ok((proposal, Vec::new()));
+            if let Some((proposal, inferred_param_names)) = self.module_answer_proposal(
+                &decision,
+                available_input_types,
+                available,
+                inferer,
+                cohort_inferer,
+            )? {
+                return Ok((proposal, inferred_param_names));
             }
         }
 
@@ -1391,10 +1395,14 @@ impl ProjectStore {
             && (has_unresolved_required_inputs(&drafted_step)
                 || has_unresolved_required_params(&drafted_step, &executable.params))
         {
-            if let Some(proposal) =
-                self.module_answer_proposal(&decision, available_input_types, available)?
-            {
-                return Ok((proposal, Vec::new()));
+            if let Some((proposal, inferred_param_names)) = self.module_answer_proposal(
+                &decision,
+                available_input_types,
+                available,
+                inferer,
+                cohort_inferer,
+            )? {
+                return Ok((proposal, inferred_param_names));
             }
         }
         let needs = self.infer_step_needs(&drafted_step)?;
@@ -1420,7 +1428,9 @@ impl ProjectStore {
         decision: &BranchDecision,
         available_input_types: &[String],
         available: &[(String, String)],
-    ) -> Result<Option<EnrichedProposal>, StorageError> {
+        inferer: &dyn ParamInferer,
+        cohort_inferer: &dyn CohortInferer,
+    ) -> Result<Option<(EnrichedProposal, Vec<String>)>, StorageError> {
         for module in self.answer_capable_modules(available_input_types)? {
             if module.fit != Fit::High {
                 continue;
@@ -1460,7 +1470,7 @@ impl ProjectStore {
             let Some(answer_index) = steps.iter().position(|step| step.id == answer_step_id) else {
                 continue;
             };
-            let drafted = steps.remove(answer_index);
+            let mut drafted = steps.remove(answer_index);
             if !drafted
                 .outputs
                 .iter()
@@ -1470,14 +1480,44 @@ impl ProjectStore {
             }
             let answer_tool_ref = drafted.tool.clone();
 
-            return Ok(Some(EnrichedProposal {
-                decision: decision.clone(),
-                matched_tool: Some(answer_tool_ref),
-                matched_fit: Some(module.fit.as_str().to_string()),
-                match_reason: Some(format!("module:{} ({})", module.module_ref, module.reason)),
-                drafted_step: Some(drafted),
-                prerequisite_steps: steps,
-            }));
+            // Per-hypothesis param inference for the module's answer step. The
+            // answer step is a real tool; for any inferable param (infer hint) the
+            // module left unset, add a REPLACE placeholder so it is filled from the
+            // hypothesis. The inferred names are returned so the apply path records
+            // them — an inferred value keeps the verdict grade-capped (honesty
+            // interlock), exactly as for a tool answer.
+            let answer_params = self.executable_tool(&answer_tool_ref)?.params;
+            for (param_name, param_spec) in &answer_params {
+                if param_spec.infer.is_some()
+                    && !drafted
+                        .params
+                        .iter()
+                        .any(|(existing, _)| existing == param_name)
+                {
+                    drafted
+                        .params
+                        .push((param_name.clone(), format!("REPLACE_{param_name}")));
+                }
+            }
+            let inferred_param_names = infer_replace_params(
+                &mut drafted,
+                &decision.candidate.statement,
+                inferer,
+                cohort_inferer,
+                &answer_params,
+            );
+
+            return Ok(Some((
+                EnrichedProposal {
+                    decision: decision.clone(),
+                    matched_tool: Some(answer_tool_ref),
+                    matched_fit: Some(module.fit.as_str().to_string()),
+                    match_reason: Some(format!("module:{} ({})", module.module_ref, module.reason)),
+                    drafted_step: Some(drafted),
+                    prerequisite_steps: steps,
+                },
+                inferred_param_names,
+            )));
         }
 
         Ok(None)

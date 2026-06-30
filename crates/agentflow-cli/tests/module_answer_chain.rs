@@ -325,3 +325,221 @@ fn agent_answers_hypothesis_with_registered_module() {
         "module step should supply the fixed report param\n{observations}"
     );
 }
+
+/// Like `write_report_tool` but the `marker` param is inferable (`infer: gene`),
+/// so the agent can fill it from the hypothesis when the module leaves it unset.
+fn write_report_tool_inferred(project: &Path) -> PathBuf {
+    let script_path = project.join("bio_report_inferred.sh");
+    fs::write(
+        &script_path,
+        r#"set -eu
+cat "$AGENTFLOW_INPUT_EXPRESSION_TABLE" >/dev/null
+cat "$AGENTFLOW_INPUT_SURVIVAL_TABLE" >/dev/null
+marker="${AGENTFLOW_PARAM_MARKER:?missing marker}"
+cohort="${AGENTFLOW_PARAM_COHORT:?missing cohort}"
+{
+  printf '# Marker report\n'
+  printf 'Gene: %s\n' "$marker"
+  printf 'Cohort: %s\n' "$cohort"
+  printf 'score: 0.91\n'
+  printf 'rows: 4\n'
+  printf 'summary: inferred-marker module answer fixture\n'
+} > "$AGENTFLOW_OUTPUT_REPORT"
+printf 'report ok\n'
+"#,
+    )
+    .expect("report script should be written");
+
+    let spec_path = project.join("bio_report_inferred.tool.yaml");
+    fs::write(
+        &spec_path,
+        format!(
+            r#"
+schema_version: agentflow.tool.v0
+namespace: bio
+name: report
+version: 0.1.0
+maturity: verified
+description: Emit a module-scoped survival association report for a gene.
+inputs:
+  expression_table:
+    type: ExpressionTable
+    required: true
+  survival_table:
+    type: SurvivalTable
+    required: true
+params:
+  marker:
+    type: string
+    required: true
+    infer: gene
+  cohort:
+    type: string
+    required: true
+outputs:
+  report:
+    type: Markdown
+    observer: marker_report
+    min_rows: 4
+runtime:
+  backend: local
+  command:
+    - /bin/sh
+    - {}
+"#,
+            script_path.display()
+        ),
+    )
+    .expect("report tool spec should be written");
+    spec_path
+}
+
+/// Like `write_module` but the report step OMITS the `marker` param, so the agent
+/// must infer it from the hypothesis (slice 4b-4c).
+fn write_module_inferred(project: &Path) -> PathBuf {
+    let module_path = project.join("bio_assoc_report.module.yaml");
+    fs::write(
+        &module_path,
+        r#"
+schema_version: agentflow.module.v0
+namespace: bio
+name: assoc_report
+version: 0.1.0
+description: Prepare raw counts and emit an association report for the inferred gene.
+inputs:
+  counts:
+    type: RawCounts
+  survival:
+    type: SurvivalTable
+outputs:
+  report:
+    type: Markdown
+    from: report_md
+steps:
+  - id: prep
+    tool: bio/prep
+    inputs:
+      counts: counts
+    outputs:
+      expression: expression_table
+  - id: report
+    tool: bio/report
+    needs: [prep]
+    inputs:
+      expression_table: expression_table
+      survival_table: survival
+    params:
+      cohort: FIXED_COHORT
+    outputs:
+      report: report_md
+"#,
+    )
+    .expect("module spec should be written");
+    module_path
+}
+
+#[test]
+fn agent_infers_module_answer_param_from_hypothesis() {
+    let project = TempProject::new("module-answer-infer");
+    let path = project.path.to_string_lossy().to_string();
+
+    run_agentflow(["init", "--name", "ModuleAnswerInfer", "--path", &path]);
+    let prep = write_prep_tool(&project.path);
+    let report = write_report_tool_inferred(&project.path);
+    let module = write_module_inferred(&project.path);
+    run_agentflow([
+        "tools",
+        "register",
+        &prep.to_string_lossy(),
+        "--path",
+        &path,
+    ]);
+    run_agentflow([
+        "tools",
+        "register",
+        &report.to_string_lossy(),
+        "--path",
+        &path,
+    ]);
+    run_agentflow([
+        "module",
+        "register",
+        &module.to_string_lossy(),
+        "--path",
+        &path,
+    ]);
+
+    let (counts, survival) = write_input_tables(&project.path);
+    run_agentflow([
+        "import",
+        &counts.to_string_lossy(),
+        "--type",
+        "RawCounts",
+        "--mode",
+        "copy",
+        "--path",
+        &path,
+    ]);
+    run_agentflow([
+        "import",
+        &survival.to_string_lossy(),
+        "--type",
+        "SurvivalTable",
+        "--mode",
+        "copy",
+        "--path",
+        &path,
+    ]);
+    // The hypothesis names a gene; the module omits the marker, so the agent must
+    // infer TP53 from the statement and fill the answer step's param.
+    run_agentflow([
+        "hypothesis",
+        "create",
+        "--statement",
+        "TP53 shows a survival association in the imported cohort",
+        "--origin",
+        "user_goal",
+        "--goal",
+        "g1",
+        "--path",
+        &path,
+    ]);
+
+    let output = run_agentflow([
+        "agent",
+        "run",
+        "--apply",
+        "--auto-run",
+        "--no-auto-synth",
+        "--no-auto-forage",
+        "--no-semantic-match",
+        "--path",
+        &path,
+    ]);
+    assert!(
+        output.contains("__bio_assoc_report__report ran and observed"),
+        "module answer step should have run as a module instance\n{output}"
+    );
+    assert!(
+        !output.contains("missing required"),
+        "the inferred marker should satisfy the answer step's required param\n{output}"
+    );
+    // Honesty interlock: the inferred param is recorded as an unconfirmed inferred
+    // value, so the verdict stays grade-capped (it cannot autonomously affirm).
+    assert!(
+        output.contains("marker=TP53"),
+        "the inferred marker must be recorded as an unconfirmed inferred param\n{output}"
+    );
+
+    let observations = run_agentflow(["observations", "list", "--json", "--path", &path]);
+    assert!(
+        observations.contains("\"kind\":\"marker_report\""),
+        "module report should produce a marker observation\n{observations}"
+    );
+    // The gene inferred from the hypothesis (not a fixed module value) reached the
+    // answer step's report.
+    assert!(
+        observations.contains("TP53"),
+        "the agent should have inferred TP53 from the hypothesis into the module answer\n{observations}"
+    );
+}

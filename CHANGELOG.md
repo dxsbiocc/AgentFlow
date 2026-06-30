@@ -7,6 +7,14 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-30
+
+The autonomous agent can now discover and compose registered **modules**
+(reusable typed sub-flows) on its own — both as intermediate producers and as the
+top-level answer to a hypothesis — and modules persist in the project. The
+deterministic 0-LLM verdict core (`argument.rs`) remains byte-identical to 0.3.0,
+and the scheduler/runtime are unchanged.
+
 ### Added
 
 - **The agent answers with a registered module (slice 4b-3b).** When no tool can

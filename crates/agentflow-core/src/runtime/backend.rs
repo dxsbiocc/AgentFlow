@@ -51,6 +51,25 @@ impl ToolExecutionBackend for LocalBackend {
     }
 }
 
+/// Runs the declared submit command for a detached runtime.
+struct DetachedBackend;
+
+impl ToolExecutionBackend for DetachedBackend {
+    fn prepare_command(
+        &self,
+        runtime: &ToolRuntimeSpec,
+        _ctx: &ExecContext,
+    ) -> Result<PreparedRuntimeCommand, StorageError> {
+        let executable = runtime.command.first().ok_or_else(|| {
+            StorageError::InvalidInput("runtime.command must not be empty".to_string())
+        })?;
+        Ok(PreparedRuntimeCommand {
+            executable: executable.clone(),
+            args: runtime.command.iter().skip(1).cloned().collect(),
+        })
+    }
+}
+
 /// Runs the declared command inside an existing conda/micromamba environment
 /// via `<runner> run [...] <command>`. `conda_no_capture` preserves the one
 /// historical difference between the `conda` and `micromamba` runners.
@@ -279,6 +298,7 @@ impl ToolExecutionBackend for ContainerBackend {
 pub(super) fn backend_for(backend: &str) -> Option<Box<dyn ToolExecutionBackend>> {
     match backend {
         "local" => Some(Box::new(LocalBackend)),
+        "detached" => Some(Box::new(DetachedBackend)),
         "conda" => Some(Box::new(CondaBackend {
             conda_no_capture: true,
             prefix_flag: "--prefix",
@@ -292,6 +312,42 @@ pub(super) fn backend_for(backend: &str) -> Option<Box<dyn ToolExecutionBackend>
         "nextflow" => Some(Box::new(NextflowBackend)),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum DetachedStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_job_handle(stdout: &str) -> Option<String> {
+    stdout.lines().rev().find_map(|line| {
+        let value = line.trim().strip_prefix("job_handle=")?;
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_detached_status(stdout: &str) -> Option<DetachedStatus> {
+    stdout.lines().rev().find_map(|line| {
+        let value = line.trim().strip_prefix("status=")?;
+        if value.eq_ignore_ascii_case("running") {
+            Some(DetachedStatus::Running)
+        } else if value.eq_ignore_ascii_case("succeeded") {
+            Some(DetachedStatus::Succeeded)
+        } else if value.eq_ignore_ascii_case("failed") {
+            Some(DetachedStatus::Failed)
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(test)]
@@ -392,6 +448,7 @@ mod tests {
         let runtime = ToolRuntimeSpec {
             backend: "container".to_string(),
             command: vec!["python".to_string(), "tool.py".to_string()],
+            poll: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -441,6 +498,7 @@ mod tests {
         let runtime = ToolRuntimeSpec {
             backend: "container".to_string(),
             command: vec!["python".to_string(), "tool.py".to_string()],
+            poll: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -533,6 +591,7 @@ mod tests {
                 "-profile".to_string(),
                 "standard".to_string(),
             ],
+            poll: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -563,6 +622,7 @@ mod tests {
         let runtime = ToolRuntimeSpec {
             backend: "nextflow".to_string(),
             command: vec!["/abs/mod.nf".to_string()],
+            poll: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -584,5 +644,104 @@ mod tests {
         assert!(err
             .to_string()
             .contains("nextflow runtime must declare runner"));
+    }
+
+    #[test]
+    fn test_parse_job_handle_single() {
+        assert_eq!(
+            parse_job_handle("job_handle=abc123"),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_job_handle_with_surrounding_lines() {
+        assert_eq!(
+            parse_job_handle("submitting\njob_handle=abc123\nsubmitted"),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_job_handle_missing() {
+        assert_eq!(parse_job_handle("submitted job abc123"), None);
+    }
+
+    #[test]
+    fn test_parse_job_handle_empty_value() {
+        assert_eq!(parse_job_handle("job_handle="), None);
+    }
+
+    #[test]
+    fn test_parse_job_handle_trailing_whitespace() {
+        assert_eq!(
+            parse_job_handle("job_handle=abc  "),
+            Some("abc".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_detached_status_running() {
+        assert_eq!(
+            parse_detached_status("status=running"),
+            Some(DetachedStatus::Running)
+        );
+    }
+
+    #[test]
+    fn test_parse_detached_status_succeeded() {
+        assert_eq!(
+            parse_detached_status("status=succeeded"),
+            Some(DetachedStatus::Succeeded)
+        );
+    }
+
+    #[test]
+    fn test_parse_detached_status_failed() {
+        assert_eq!(
+            parse_detached_status("status=failed"),
+            Some(DetachedStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn test_parse_detached_status_mixed_case() {
+        assert_eq!(
+            parse_detached_status("status=Running"),
+            Some(DetachedStatus::Running)
+        );
+    }
+
+    #[test]
+    fn test_parse_detached_status_missing() {
+        assert_eq!(parse_detached_status("state=running"), None);
+    }
+
+    #[test]
+    fn test_detached_backend_prepare_command() {
+        let runtime = ToolRuntimeSpec {
+            backend: "detached".to_string(),
+            command: vec!["/abs/submit.sh".to_string(), "--x".to_string()],
+            poll: vec!["/abs/poll.sh".to_string()],
+            timeout_seconds: None,
+            env_name: None,
+            env_prefix: None,
+            env_file: None,
+            runner: None,
+            image: None,
+        };
+        let staged_inputs = BTreeMap::new();
+        let ctx = ExecContext {
+            workdir: Path::new("/tmp/af-step-work"),
+            staged_inputs: &staged_inputs,
+            output_dir: Path::new("/tmp/af-step-work/outputs"),
+            env_names: &[],
+            container_engine: None,
+        };
+
+        let prepared = DetachedBackend.prepare_command(&runtime, &ctx).unwrap();
+
+        assert_eq!(prepared.executable, "/abs/submit.sh");
+        assert_eq!(prepared.args, vec!["--x"]);
     }
 }

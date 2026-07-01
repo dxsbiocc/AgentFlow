@@ -2612,6 +2612,8 @@ fn runtime_config_json_with_isolated_lock(
     serde_json::to_string(&RuntimeConfigJson {
         backend: runtime.backend.clone(),
         command: runtime.command.clone(),
+        // Empty poll stays omitted so non-detached tool cache keys remain byte-identical.
+        poll: runtime.poll.clone(),
         timeout_seconds: runtime.timeout_seconds,
         env_name: runtime.env_name.clone(),
         env_prefix: runtime.env_prefix.clone(),
@@ -2632,6 +2634,8 @@ fn runtime_config_json_with_isolated_lock(
 struct RuntimeConfigJson {
     backend: String,
     command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    poll: Vec<String>,
     timeout_seconds: Option<u64>,
     env_name: Option<String>,
     env_prefix: Option<String>,
@@ -4824,6 +4828,7 @@ steps:
         let runtime = ToolRuntimeSpec {
             backend: "local".to_string(),
             command: vec!["/bin/echo".to_string(), "hello world".to_string()],
+            poll: Vec::new(),
             timeout_seconds: Some(5),
             env_name: None,
             env_prefix: None,
@@ -4841,10 +4846,30 @@ steps:
     }
 
     #[test]
+    fn runtime_config_local_poll_absent() {
+        let runtime = ToolRuntimeSpec {
+            backend: "local".to_string(),
+            command: vec!["/bin/echo".to_string()],
+            poll: Vec::new(),
+            timeout_seconds: None,
+            env_name: None,
+            env_prefix: None,
+            env_file: None,
+            runner: None,
+            image: None,
+        };
+
+        let json = runtime_config_json(&runtime).unwrap();
+
+        assert!(!json.contains("\"poll\""));
+    }
+
+    #[test]
     fn local_runtime_command_builder_keeps_argv_unchanged() {
         let runtime = ToolRuntimeSpec {
             backend: "local".to_string(),
             command: vec!["/bin/echo".to_string(), "hello world".to_string()],
+            poll: Vec::new(),
             timeout_seconds: Some(5),
             env_name: None,
             env_prefix: None,
@@ -4866,6 +4891,7 @@ steps:
         let runtime = ToolRuntimeSpec {
             backend: "local".to_string(),
             command: vec!["/bin/echo".to_string(), "hello world".to_string()],
+            poll: Vec::new(),
             timeout_seconds: Some(5),
             env_name: None,
             env_prefix: None,
@@ -4908,6 +4934,7 @@ steps:
         ToolRuntimeSpec {
             backend: backend.to_string(),
             command: vec!["python".to_string(), "tool.py".to_string()],
+            poll: Vec::new(),
             timeout_seconds: None,
             env_name: Some("envA".to_string()),
             env_prefix: None,
@@ -4927,6 +4954,7 @@ steps:
                 "--mode".to_string(),
                 "strict".to_string(),
             ],
+            poll: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -4990,6 +5018,7 @@ steps:
         let runtime = ToolRuntimeSpec {
             backend: "container".to_string(),
             command: vec!["python".to_string(), "run.py".to_string()],
+            poll: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -5293,6 +5322,7 @@ steps:
         let runtime = ToolRuntimeSpec {
             backend: "isolated-micromamba".to_string(),
             command: vec!["python".to_string(), "tool.py".to_string()],
+            poll: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -5335,6 +5365,7 @@ steps:
         let runtime = ToolRuntimeSpec {
             backend: "isolated-micromamba".to_string(),
             command: vec!["python".to_string(), "tool.py".to_string()],
+            poll: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: Some(prefix.to_string()),
@@ -5362,6 +5393,7 @@ steps:
         let conda = ToolRuntimeSpec {
             backend: "conda".to_string(),
             command: vec!["python".to_string(), "run.py".to_string()],
+            poll: Vec::new(),
             timeout_seconds: None,
             env_name: Some("af-test".to_string()),
             env_prefix: None,
@@ -5377,6 +5409,7 @@ steps:
         let isolated = ToolRuntimeSpec {
             backend: "isolated-micromamba".to_string(),
             command: vec!["python".to_string(), "run.py".to_string()],
+            poll: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -5394,6 +5427,7 @@ steps:
         let container = ToolRuntimeSpec {
             backend: "container".to_string(),
             command: vec!["python".to_string(), "run.py".to_string()],
+            poll: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -6488,6 +6522,7 @@ steps:
         let runtime = ToolRuntimeSpec {
             backend: "conda".to_string(),
             command: vec!["python".to_string(), "run.py".to_string()],
+            poll: Vec::new(),
             timeout_seconds: None,
             env_name: Some("af-test".to_string()),
             env_prefix: None,

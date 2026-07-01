@@ -284,7 +284,20 @@ namespace + veth + nftables，把真正的 default-deny egress 策略下沉到 O
 这层才是反篡改威胁模型下的真实 containment。Python in-process guard 仍保留为
 defense-in-depth 的早失败/可读错误层，但不能被包装成 anti-tamper 边界。
 
-## 7. 已知边界与残留
+## 7. 一等公民 module 与自治组合
+
+module 是**可复用、typed 的子流程**（schema `agentflow.module.v0`）：声明外部 input/output 端口 + 一组内部 step（普通工具步骤），可注册进项目库（`module register` / `module list` / `module show` / `module validate`）。
+
+- **内联展开（组合方式）**：module 通过 *inline expansion* 组合进 flow——内部 step 的 id 与 artifact 名按实例加前缀（同一 module 可多实例不撞名），外部输入端口改写到调用方绑定,输出端口暴露回调用方。展开后是普通 flow step,**既有调度器/运行时零改动**即可运行。校验拒绝悬空引用、重复 producer、端口/artifact 同名、缺 needs、依赖环。
+- **flow 层组合**：flow step 可写 `module: <ref>` 取代 `tool:`；`flow validate|approve --module <file>` 提供 module,解析时展开(跨实例 needs + `instance.port` 输出接线)。
+- **agent 自治组合**：自治循环能**自己选用已注册 module**——
+  - 作 **producer**：反向链时若没有 tool 能产出所缺类型,改用输出端口匹配该类型且全输入可用的 module(High-fit),内联展开进 flow;
+  - 作 **answer**：若没有 tool 能回答假设,改用"内部含带 observer 输出的 tool"的 module,其 observed step 当答案、其余当前置步骤。
+- **诚实联锁**：module 作答案时,答案 step 上未设的**可推导 param**(如 `infer: gene`)从假设推导填入;推导值记为**未确认推断参数** → 判决 **grade-cap,不能自治 affirm**(与 tool 答案完全一致)。module 显式设定的 param 不被覆盖。
+
+**边界**:嵌套 module(module 引用 module)不支持;agent 不会为 module **自己**未满足的输入端口递归链 producer(仅当 module 输入直接可用或经 flow 层预先接好时可用);module 无成熟度/打分。
+
+## 8. 已知边界与残留
 
 AgentFlow 当前边界应明确写出来：
 
@@ -297,7 +310,7 @@ AgentFlow 当前边界应明确写出来：
 - **网络安全仍有部署级残留**：Python guard 和 seatbelt 是 defense-in-depth；反篡改对手、raw socket、原生扩展、替换解释器等威胁，需要容器 / VM / pf / Kubernetes NetworkPolicy / CNI egress allowlist 等 OS 级边界。
 - **issue36 的核心残留**：真正封堵 RFC1918 / metadata / 私网出网，应在容器或 VM 内运行工具，并使用默认拒绝的 egress policy，只放行明确公网 allowlist。部署级 recipe 已记录在 `docs/ops/egress-containment.md`，但采用和运维集成仍由部署方完成；合作层 guard 不能包装成强沙箱。
 
-## 8. 来源索引
+## 9. 来源索引
 
 本总览主要依据：
 
@@ -307,5 +320,7 @@ AgentFlow 当前边界应明确写出来：
 - `docs/status/issue36-egress-guard-plan.md`
 - `docs/ops/egress-containment.md`
 - `docs/design/tool-evolution-engine-design.md`
+- `docs/design/agent-module-composition-design.md`
+- `docs/status/module-expansion-proof.md`、`agent-module-composition-proof.md`、`agent-module-answer-proof.md`、`module-answer-param-inference-proof.md`、`module-storage-proof.md`、`nextflow-backend-proof.md`
 
-AS18 / AS19 / AS20 已落地并合并入 `main`（见 `docs/status/as18-*`、`as19-*`、`as20-*`），本文件“工具进化引擎”（§4.4）与“已知边界”（§7）两节已同步更新为采纳门 / cohort 接线 / 自动注册候选的现状。
+AS18 / AS19 / AS20 已落地并合并入 `main`（见 `docs/status/as18-*`、`as19-*`、`as20-*`），本文件“工具进化引擎”（§4.4）与“已知边界”（§8）两节已同步更新为采纳门 / cohort 接线 / 自动注册候选的现状。一等公民 module（§7,v0.4.0/v0.4.1）已支持注册、flow 组合与 agent 自治组合（producer + answer + 答案 param 推导）。

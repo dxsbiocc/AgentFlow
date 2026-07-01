@@ -169,6 +169,16 @@ pub struct AttemptSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmittedAttempt {
+    pub attempt_id: String,
+    pub run_id: String,
+    pub flow_id: String,
+    pub step_id: String,
+    pub workdir: String,
+    pub job_handle: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheExplanation {
     pub flow_id: String,
     pub step_id: String,
@@ -1311,6 +1321,140 @@ impl ProjectStore {
             },
         })
         .map_err(|err| StorageError::InvalidInput(format!("status JSON failed: {err}")))
+    }
+
+    pub fn record_submitted_attempt(
+        &self,
+        flow_id: &str,
+        step_id: &str,
+        workdir: &str,
+        job_handle: &str,
+    ) -> Result<SubmittedAttempt, StorageError> {
+        let run_id = format!("run_{}", now_unix_nanos());
+        let attempt_id = format!("attempt_{}", now_unix_nanos());
+        let now = crate::storage::now_unix_seconds();
+
+        self.connection().execute(
+            "INSERT INTO runs
+             (id, flow_id, step_id, status, attempt_count, latest_attempt_id, cache_key, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'running', 1, ?4, NULL, ?5, ?6)",
+            params![&run_id, flow_id, step_id, &attempt_id, now, now],
+        )?;
+        self.connection().execute(
+            "INSERT INTO run_attempts
+             (id, run_id, attempt, status, workdir, started_at, job_handle)
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6)",
+            params![
+                &attempt_id,
+                &run_id,
+                RunAttemptStatus::Submitted.as_str(),
+                workdir,
+                now,
+                job_handle
+            ],
+        )?;
+
+        self.update_step_status(step_id, StepStatus::Ready)?;
+        self.update_step_status(step_id, StepStatus::Running)?;
+
+        Ok(SubmittedAttempt {
+            attempt_id,
+            run_id,
+            flow_id: flow_id.to_string(),
+            step_id: step_id.to_string(),
+            workdir: workdir.to_string(),
+            job_handle: job_handle.to_string(),
+        })
+    }
+
+    pub fn outstanding_submitted_attempts(
+        &self,
+        flow_id: &str,
+    ) -> Result<Vec<SubmittedAttempt>, StorageError> {
+        let mut stmt = self.connection().prepare(
+            "SELECT ra.id, ra.run_id, r.flow_id, r.step_id, ra.workdir, ra.job_handle
+             FROM run_attempts ra
+             JOIN runs r ON r.id = ra.run_id
+             WHERE ra.status = ?1 AND r.flow_id = ?2
+             ORDER BY ra.started_at ASC, ra.id ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![RunAttemptStatus::Submitted.as_str(), flow_id],
+            |row| {
+                Ok(SubmittedAttempt {
+                    attempt_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    flow_id: row.get(2)?,
+                    step_id: row.get(3)?,
+                    workdir: row.get(4)?,
+                    job_handle: row.get(5)?,
+                })
+            },
+        )?;
+
+        let mut attempts = Vec::new();
+        for row in rows {
+            attempts.push(row?);
+        }
+        Ok(attempts)
+    }
+
+    pub fn finalize_submitted_attempt(
+        &self,
+        attempt_id: &str,
+        status: RunAttemptStatus,
+        exit_code: Option<i64>,
+        error_message: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let existing = self
+            .connection()
+            .query_row(
+                "SELECT ra.run_id, r.step_id
+                 FROM run_attempts ra
+                 JOIN runs r ON r.id = ra.run_id
+                 WHERE ra.id = ?1 AND ra.status = ?2",
+                params![attempt_id, RunAttemptStatus::Submitted.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((run_id, step_id)) = existing else {
+            return Ok(());
+        };
+
+        let ended = crate::storage::now_unix_seconds();
+        let changed = self.connection().execute(
+            "UPDATE run_attempts
+             SET status = ?1, ended_at = ?2, exit_code = ?3, error_class = ?4, error_message = ?5
+             WHERE id = ?6 AND status = ?7",
+            params![
+                status.as_str(),
+                ended,
+                exit_code,
+                error_message.map(|_| "runtime"),
+                error_message,
+                attempt_id,
+                RunAttemptStatus::Submitted.as_str()
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(());
+        }
+
+        let step_status = if matches!(
+            status,
+            RunAttemptStatus::Succeeded | RunAttemptStatus::CacheHit
+        ) {
+            StepStatus::Completed
+        } else {
+            StepStatus::Failed
+        };
+        self.connection().execute(
+            "UPDATE runs SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![step_status.as_str(), ended, &run_id],
+        )?;
+        self.update_step_status(&step_id, step_status)?;
+
+        Ok(())
     }
 
     fn run_step(
@@ -4095,6 +4239,56 @@ steps:
             .unwrap()
             .summary
             .id
+    }
+
+    #[test]
+    fn submitted_attempts_round_trip_until_finalized() {
+        let path = temp_project_path("submitted-attempt");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Submitted Demo")).unwrap();
+
+        register_tool(
+            &store,
+            "schema_version: agentflow.tool.v0\nnamespace: async\nname: noop\nversion: 0.1.0\nmaturity: wrapped\ndescription: Noop for submitted attempt storage\noutputs:\n  note:\n    type: Text\nruntime:\n  backend: local\n  command:\n    - /bin/true\n"
+                .to_string(),
+        );
+        let flow = FlowDraft::from_simple_yaml(
+            "schema_version: agentflow.flow.v0\nid: submitted_demo\nname: Submitted demo\nsteps:\n  - id: submit\n    tool: async/noop\n    needs: []\n    outputs:\n      note: submitted_note\n",
+        )
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+        let step_id = store.inspect_flow("submitted_demo").unwrap().steps[0]
+            .id
+            .clone();
+        let workdir = path.join("work-submitted").display().to_string();
+
+        let submitted = store
+            .record_submitted_attempt("submitted_demo", &step_id, &workdir, "job-123")
+            .unwrap();
+        assert_eq!(submitted.flow_id, "submitted_demo");
+        assert_eq!(submitted.step_id, step_id);
+        assert_eq!(submitted.workdir, workdir);
+        assert_eq!(submitted.job_handle, "job-123");
+
+        let outstanding = store
+            .outstanding_submitted_attempts("submitted_demo")
+            .unwrap();
+        assert_eq!(outstanding, vec![submitted.clone()]);
+
+        store
+            .finalize_submitted_attempt(
+                &submitted.attempt_id,
+                RunAttemptStatus::Succeeded,
+                Some(0),
+                None,
+            )
+            .unwrap();
+        assert!(store
+            .outstanding_submitted_attempts("submitted_demo")
+            .unwrap()
+            .is_empty());
+
+        let _ = fs::remove_dir_all(path);
     }
 
     fn run_schedule_flow(test_name: &str, serial: bool) -> (PathBuf, FlowRunSummary) {

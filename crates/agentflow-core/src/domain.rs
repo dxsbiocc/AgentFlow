@@ -71,6 +71,7 @@ impl fmt::Display for StepStatus {
 pub enum RunAttemptStatus {
     Created,
     Running,
+    Submitted,
     Succeeded,
     Failed,
     TimedOut,
@@ -83,6 +84,7 @@ impl RunAttemptStatus {
         match self {
             Self::Created => "created",
             Self::Running => "running",
+            Self::Submitted => "submitted",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::TimedOut => "timed_out",
@@ -90,11 +92,33 @@ impl RunAttemptStatus {
             Self::CacheHit => "cache_hit",
         }
     }
+
+    pub fn parse(input: &str) -> Option<Self> {
+        match input {
+            "created" => Some(Self::Created),
+            "running" => Some(Self::Running),
+            "submitted" => Some(Self::Submitted),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "timed_out" => Some(Self::TimedOut),
+            "cancelled" => Some(Self::Cancelled),
+            "cache_hit" => Some(Self::CacheHit),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for RunAttemptStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for RunAttemptStatus {
+    type Err = ();
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        Self::parse(input).ok_or(())
     }
 }
 
@@ -224,6 +248,7 @@ mod tests {
         let names = [
             RunAttemptStatus::Created.as_str(),
             RunAttemptStatus::Running.as_str(),
+            RunAttemptStatus::Submitted.as_str(),
             RunAttemptStatus::Succeeded.as_str(),
             RunAttemptStatus::Failed.as_str(),
             RunAttemptStatus::TimedOut.as_str(),
@@ -236,6 +261,7 @@ mod tests {
             [
                 "created",
                 "running",
+                "submitted",
                 "succeeded",
                 "failed",
                 "timed_out",
@@ -243,6 +269,25 @@ mod tests {
                 "cache_hit",
             ]
         );
+    }
+
+    #[test]
+    fn run_attempt_status_round_trips_names() {
+        for status in [
+            RunAttemptStatus::Created,
+            RunAttemptStatus::Running,
+            RunAttemptStatus::Submitted,
+            RunAttemptStatus::Succeeded,
+            RunAttemptStatus::Failed,
+            RunAttemptStatus::TimedOut,
+            RunAttemptStatus::Cancelled,
+            RunAttemptStatus::CacheHit,
+        ] {
+            assert_eq!(RunAttemptStatus::parse(status.as_str()), Some(status));
+            assert_eq!(status.as_str().parse::<RunAttemptStatus>(), Ok(status));
+        }
+
+        assert_eq!(RunAttemptStatus::parse("unknown"), None);
     }
 
     #[test]

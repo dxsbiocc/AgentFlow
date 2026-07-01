@@ -174,3 +174,6 @@ CREATE TABLE IF NOT EXISTS modules (
     updated_at INTEGER NOT NULL
 );
 "#;
+
+pub const RUN_ATTEMPT_JOB_HANDLE_SQL: &str =
+    "ALTER TABLE run_attempts ADD COLUMN job_handle TEXT;\n";

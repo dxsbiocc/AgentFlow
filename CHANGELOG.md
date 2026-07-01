@@ -7,6 +7,15 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+### Added
+
+- **Async/detached execution — persistence substrate (design + phase 1).** Groundwork
+  for submit→poll→collect execution of long-running / HPC / Nextflow jobs: a new
+  `RunAttemptStatus::Submitted`, a `run_attempts.job_handle` column (migration v3),
+  and `ProjectStore` methods to record a submitted attempt, list outstanding
+  submitted attempts per flow, and finalize one to a terminal status. Storage-only —
+  no run-loop or backend change yet. See `docs/design/async-execution-design.md`.
+
 ## [0.4.1] - 2026-06-30
 
 Completes the first-class module line: a module answering a hypothesis fills its

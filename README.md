@@ -70,9 +70,11 @@ cargo run -q -p agentflow-cli -- report marker_demo --path "$AF_DEMO"
 
 - Project lifecycle: `init`, `status`, `doctor`
 - Tool registry: `tools register`, `tools list`, `tools inspect`
+- Module registry: reusable, typed sub-flows as first-class objects — `module validate`, `module show`, `module register`, `module list` (schema `agentflow.module.v0`)
 - Artifact registry: reference/copy import, list, inspect
-- Flow lifecycle: `flow validate`, `flow approve`, `flow inspect`
-- Execution: approved local DAG execution with `run`
+- Flow lifecycle: `flow validate`, `flow approve`, `flow inspect`, `flow plan` (dry-run wave preview)
+- Flow composition of modules: a flow step can be `module: <ref>` instead of `tool:`; supply the modules with `flow validate|approve --module <file>` and they are inline-expanded (internal ids/artifacts namespaced per instance, ports wired to the surrounding flow)
+- Execution: approved local DAG execution with `run`, including `run --max-parallel <n>` (concurrent independent steps), `run --keep-going` (continue past failures), and `run --retries <n> [--retry-backoff <s>]` (auto-retry transient step failures); the run summary reports completed / failed / skipped steps
 - Targeted execution: `run-step` with dependency gating
 - Retry: `retry` for failed steps while preserving attempt history
 - Run management visibility: `runs list`, `runs inspect`, and `logs`
@@ -85,6 +87,7 @@ cargo run -q -p agentflow-cli -- report marker_demo --path "$AF_DEMO"
 - Existing Conda/micromamba environment execution through explicit `runtime.runner` plus `env_name` or `env_prefix`
 - Per-tool isolated environments via the `isolated-micromamba` backend: a content-addressed managed env at `.agentflow/envs/<tool>@<lockhash>` is auto-created and locked from the tool's `env_file` (Nextflow-style process==env), with the env lock folded into the run cache key
 - Container execution via `runtime.backend: container`: AgentFlow constructs `<runner> run --rm --network none -v <workdir>:<workdir> -w <workdir> ... <image> <command>` so tools run without network and see only the step workdir mount
+- Nextflow execution via `runtime.backend: nextflow`: a Nextflow module registers as an ordinary typed tool (`runner` = the `nextflow` launcher, `command[0]` = the absolute `.nf` module) and reuses the standard `AGENTFLOW_INPUT_*/PARAM_*/OUTPUT_*` env convention, so the agent can run or chain it like any other tool (runs are synchronous; egress is the module's responsibility)
 - Multi-engine containers: container tools declare a stable per-tool `image`, while each run can choose docker, podman, or singularity/apptainer with `--container-engine` and `--container-runner`; the default engine remains docker
 - Per-step I/O staging: declared inputs are staged into the step workdir (`workdir/inputs/<port>/`) so tools compose only through declared inputs/outputs (logical isolation on local/conda; hard filesystem isolation on container through the workdir-only mount)
 - Environment readiness checks through `env check <tool-ref>`
@@ -121,7 +124,15 @@ the database or shell directly, and the loop never auto-applies graph changes.
   - `branch candidates|select`
 - **Tool selection** — matches the tool registry against a capability query (desired output type,
   available input types, keywords, maturity) and drafts a concrete `ProposedStep` for the top tool.
+  It also backward-chains producer steps to satisfy a matched tool's missing typed inputs
+  (`--max-chain-depth <n>`, default 4).
   - `tools match`, `tools draft-step`
+- **Module composition** — the loop can select a **registered module** on its own, not just a single
+  tool: as an intermediate producer when no tool produces a needed type, or as the top-level answer
+  when no tool answers (the module's observed step becomes the answer; its other steps become
+  prerequisites). The chosen module is inline-expanded into the flow, and an answer module fills its
+  inferable params (e.g. a gene) from the hypothesis — recorded as an unconfirmed inferred value so
+  the verdict stays grade-capped, exactly as for a tool answer.
 - **Handoff engine** — brake policy that hands control back to the user at high-cost / irreversible /
   goal-mutating forks; decision points carry a digest, options, and a recommendation.
   - `decision list|pending|show|resolve`
@@ -152,15 +163,26 @@ agentflow decision pending --path "$AF_DEMO"              # resolve raised decis
 agentflow trace revert <checkpoint-id> --path "$AF_DEMO"  # roll back auto-applied state if needed
 ```
 
+Registering a reusable module and letting the agent compose it:
+
+```bash
+agentflow module validate examples/modules/qc_then_quantify.module.yaml   # parse + type-check
+agentflow module register examples/modules/qc_then_quantify.module.yaml --path "$AF_DEMO"
+agentflow module list --path "$AF_DEMO"
+# When the loop needs a type only this module produces (or only it can answer),
+# `agent run` inline-expands the module into the flow on its own.
+agentflow agent run --apply --auto-run --path "$AF_DEMO"
+```
+
 ## Explicitly Not Supported Yet
 
 - Default-on autonomy: autonomous apply is **off by default** and only runs when the operator passes `agent run --apply`; there is no always-on/unattended autonomous mode
-- Autonomous dependency wiring: applied steps are added without inferred `needs` edges; cross-step graph wiring, multi-flow orchestration, and auto-forage (deepen → fetch evidence) are not yet wired into the loop
+- Multi-flow orchestration: the loop wires cross-step `needs` edges, backward-chains producers, and composes registered modules within one flow, but does not orchestrate across separate flows; nested modules (a module referencing another module) are not supported, and the agent does not chain producers *into* a module's own unmet input ports
 - Curated capability index: tool matching uses description/port-type/maturity heuristics rather than a curated capability index (note: a **tool evolution engine** now detects generalization candidates, validates them cross-cohort, and auto-registers a generalized `exploratory` candidate for human adoption — see [docs/CAPABILITIES.md](docs/CAPABILITIES.md) §4)
 - Implicit environment creation, solving, or package installation during `run`
 - Full lockfile normalization, dependency solving, package-manager-specific diff semantics, or environment garbage collection
-- Remote/batch execution backends such as Singularity or SLURM; the container backend is currently Docker/podman-style argv construction with default `--network none`, not a scheduler integration
-- Parallel scheduler execution or cancellation controls
+- Cluster/scheduler integration such as SLURM, and asynchronous long-running job handles (submit → poll → collect): container tools run via Docker/podman/singularity argv construction with default `--network none`, and the `nextflow` backend runs synchronously — none of these submit to a batch scheduler
+- In-flight cancellation controls: `run --max-parallel <n>` executes independent steps concurrently, but a failed step in a fail-fast wave does not cancel its still-running siblings
 - Rich semantic validators such as file signatures, domain-specific QC policies, and pluggable validator registries
 - Full graph-branch lifecycle such as delete, merge, rollback, or decision-node management (tool-level `supersede` lineage **is** supported — see `agentflow tools supersede`)
 - Cache eviction policy beyond explicit `--all` and `--older-than-seconds` pruning

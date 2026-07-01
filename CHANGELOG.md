@@ -9,6 +9,18 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **Async/detached execution — the `detached` tool contract (phase 2a).** A tool
+  can declare `runtime.backend: detached` with a submit command (`runtime.command`,
+  which prints `job_handle=<id>`) and a new `runtime.poll` command (which prints
+  `status=running|succeeded|failed`). Registration validates the contract (both
+  commands absolute; no env/image/runner; `poll` only on detached tools). Adds the
+  `DetachedBackend` (submit argv construction) and the `job_handle=` / `status=`
+  parse helpers. The `poll` field is cache-key-stable (`skip_serializing_if`) so
+  existing tools' cache keys are byte-identical. Submit/poll execution and run-loop
+  integration follow in later phases.
+
+### Added
+
 - **Async/detached execution — persistence substrate (design + phase 1).** Groundwork
   for submit→poll→collect execution of long-running / HPC / Nextflow jobs: a new
   `RunAttemptStatus::Submitted`, a `run_attempts.job_handle` column (migration v3),

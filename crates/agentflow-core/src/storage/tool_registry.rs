@@ -62,6 +62,7 @@ pub enum ParamInferKind {
 pub struct ToolRuntimeSpec {
     pub backend: String,
     pub command: Vec<String>,
+    pub poll: Vec<String>,
     pub timeout_seconds: Option<u64>,
     pub env_name: Option<String>,
     pub env_prefix: Option<String>,
@@ -212,6 +213,7 @@ impl ToolSpec {
             output_required_columns: required_columns_map(&self.outputs),
             runtime_backend: self.runtime.backend.clone(),
             runtime_command: self.runtime.command.clone(),
+            runtime_poll: self.runtime.poll.clone(),
             runtime_timeout_seconds: self.runtime.timeout_seconds,
             runtime_env_name: self.runtime.env_name.clone(),
             runtime_env_prefix: self.runtime.env_prefix.clone(),
@@ -268,6 +270,8 @@ struct StoredToolSpecJson {
     runtime_backend: String,
     #[serde(default)]
     runtime_command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    runtime_poll: Vec<String>,
     #[serde(default)]
     runtime_timeout_seconds: Option<u64>,
     #[serde(default)]
@@ -531,6 +535,8 @@ struct RawToolRuntimeSpec {
     backend: Option<String>,
     #[serde(default, deserialize_with = "yaml::deserialize_string_vec")]
     command: Vec<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_string_vec")]
+    poll: Vec<String>,
     #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
     timeout_seconds: Option<String>,
     #[serde(
@@ -565,6 +571,7 @@ impl RawToolRuntimeSpec {
         Ok(ToolRuntimeSpec {
             backend: self.backend.unwrap_or_default(),
             command: self.command,
+            poll: self.poll,
             timeout_seconds: self
                 .timeout_seconds
                 .map(|value| {
@@ -1579,6 +1586,12 @@ fn parse_runtime_string(field_name: &str, value: &str) -> Result<String, Storage
 }
 
 fn validate_runtime_backend(runtime: &ToolRuntimeSpec) -> Result<(), StorageError> {
+    if !runtime.poll.is_empty() && runtime.backend != "detached" {
+        return Err(StorageError::InvalidInput(
+            "only the detached runtime may declare runtime.poll".to_string(),
+        ));
+    }
+
     match runtime.backend.as_str() {
         "local" => {
             if runtime.env_name.is_some()
@@ -1589,6 +1602,40 @@ fn validate_runtime_backend(runtime: &ToolRuntimeSpec) -> Result<(), StorageErro
             {
                 return Err(StorageError::InvalidInput(
                     "local runtime must not declare env_name, env_prefix, env_file, runner, or image"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "detached" => {
+            let command = runtime.command.first().ok_or_else(|| {
+                StorageError::InvalidInput(
+                    "detached runtime.command must contain at least one argv entry".to_string(),
+                )
+            })?;
+            if !Path::new(command).is_absolute() {
+                return Err(StorageError::InvalidInput(
+                    "detached runtime.command[0] must be an absolute executable path".to_string(),
+                ));
+            }
+            let poll = runtime.poll.first().ok_or_else(|| {
+                StorageError::InvalidInput(
+                    "detached runtime must declare runtime.poll".to_string(),
+                )
+            })?;
+            if !Path::new(poll).is_absolute() {
+                return Err(StorageError::InvalidInput(
+                    "runtime.poll[0] must be an absolute executable path".to_string(),
+                ));
+            }
+            if runtime.env_name.is_some()
+                || runtime.env_prefix.is_some()
+                || runtime.env_file.is_some()
+                || runtime.image.is_some()
+                || runtime.runner.is_some()
+            {
+                return Err(StorageError::InvalidInput(
+                    "detached runtime must not declare env_name, env_prefix, env_file, image, or runner"
                         .to_string(),
                 ));
             }
@@ -1721,7 +1768,7 @@ fn validate_runtime_backend(runtime: &ToolRuntimeSpec) -> Result<(), StorageErro
             Ok(())
         }
         other => Err(StorageError::InvalidInput(format!(
-            "unsupported runtime.backend {other}; supported backends are local, conda, micromamba, isolated-micromamba, container, nextflow"
+            "unsupported runtime.backend {other}; supported backends are local, detached, conda, micromamba, isolated-micromamba, container, nextflow"
         ))),
     }
 }
@@ -1752,6 +1799,7 @@ fn executable_from_stored_json(
     let runtime = ToolRuntimeSpec {
         backend: stored.runtime_backend,
         command: stored.runtime_command,
+        poll: stored.runtime_poll,
         timeout_seconds: stored.runtime_timeout_seconds,
         env_name: stored.runtime_env_name,
         env_prefix: stored.runtime_env_prefix,
@@ -2272,6 +2320,103 @@ runtime:
         )
         .unwrap_err();
         assert!(non_numeric.to_string().contains("positive integer"));
+    }
+
+    #[test]
+    fn test_detached_valid() {
+        ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: detached_tool
+version: 0.1.0
+maturity: wrapped
+description: detached tool
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: detached
+  command:
+    - /abs/submit.sh
+    - --flag
+  poll:
+    - /abs/poll.sh
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_detached_rejects_missing_poll() {
+        let err = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: detached_missing_poll
+version: 0.1.0
+maturity: wrapped
+description: detached missing poll
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: detached
+  command:
+    - /abs/submit.sh
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("runtime.poll"));
+    }
+
+    #[test]
+    fn test_detached_rejects_relative_command() {
+        let err = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: detached_relative_command
+version: 0.1.0
+maturity: wrapped
+description: detached relative command
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: detached
+  command:
+    - submit.sh
+  poll:
+    - /abs/poll.sh
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("runtime.command[0]"));
+    }
+
+    #[test]
+    fn test_non_detached_rejects_poll() {
+        let err = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: local_poll
+version: 0.1.0
+maturity: wrapped
+description: local poll
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+  poll:
+    - /abs/poll.sh
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("only the detached runtime"));
     }
 
     #[test]

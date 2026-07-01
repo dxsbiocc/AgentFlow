@@ -1,7 +1,9 @@
 use rusqlite::{params, Connection};
 
 use super::project_store::{now_unix_seconds, StorageError};
-use super::schema::{MODULES_TABLE_SQL, SCHEMA_MIGRATIONS_SQL, V0_SCHEMA_SQL};
+use super::schema::{
+    MODULES_TABLE_SQL, RUN_ATTEMPT_JOB_HANDLE_SQL, SCHEMA_MIGRATIONS_SQL, V0_SCHEMA_SQL,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Migration {
@@ -28,6 +30,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "create_modules_table",
         sql: MODULES_TABLE_SQL,
+    },
+    Migration {
+        version: 3,
+        name: "run_attempt_job_handle",
+        sql: RUN_ATTEMPT_JOB_HANDLE_SQL,
     },
 ];
 
@@ -159,7 +166,7 @@ mod tests {
         .unwrap();
 
         let err = apply_migrations(&conn).unwrap_err();
-        assert!(err.to_string().contains("supports up to 2"));
+        assert!(err.to_string().contains("supports up to 3"));
     }
 
     #[test]

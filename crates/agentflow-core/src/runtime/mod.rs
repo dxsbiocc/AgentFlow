@@ -23,6 +23,7 @@ use crate::storage::{
 mod backend;
 mod schedule;
 
+use backend::parse_job_handle;
 use schedule::{RuleBasedStepScheduler, StepScheduler};
 
 const ISOLATED_ENV_BACKEND: &str = "isolated-micromamba";
@@ -1455,6 +1456,72 @@ impl ProjectStore {
         self.update_step_status(&step_id, step_status)?;
 
         Ok(())
+    }
+
+    pub fn mark_attempt_submitted(
+        &self,
+        attempt_id: &str,
+        job_handle: &str,
+    ) -> Result<(), StorageError> {
+        self.connection().execute(
+            "UPDATE run_attempts
+             SET status = ?1, job_handle = ?2
+             WHERE id = ?3 AND status = ?4",
+            params![
+                RunAttemptStatus::Submitted.as_str(),
+                job_handle,
+                attempt_id,
+                RunAttemptStatus::Running.as_str()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn submit_step(
+        &self,
+        flow_id: &str,
+        step: &StoredFlowStep,
+        config: &RunConfig,
+    ) -> Result<AttemptSummary, StorageError> {
+        match self.prepare_step(flow_id, step, config)? {
+            PreparedStep::Finished(summary) => Ok(summary),
+            PreparedStep::Pending(pending) => {
+                let mut pending = *pending;
+                let command = pending
+                    .command
+                    .take()
+                    .expect("prepared step retains its command until execution");
+                let output = run_local_command(command, pending.timeout_seconds);
+                let handle = match &output {
+                    Ok(output) if output.status.success() => {
+                        parse_job_handle(&String::from_utf8_lossy(&output.stdout))
+                    }
+                    _ => None,
+                };
+                match handle {
+                    Some(handle) => {
+                        if let Ok(output) = &output {
+                            fs::write(&pending.stdout_path, &output.stdout)?;
+                            fs::write(&pending.stderr_path, &output.stderr)?;
+                        }
+                        let exit_code =
+                            output.as_ref().ok().and_then(|output| output.status.code());
+                        self.mark_attempt_submitted(&pending.attempt_id, &handle)?;
+                        Ok(AttemptSummary {
+                            run_id: pending.run_id,
+                            attempt_id: pending.attempt_id,
+                            step_id: pending.step_id,
+                            status: RunAttemptStatus::Submitted.as_str().to_string(),
+                            workdir: pending.workdir,
+                            stdout_path: pending.stdout_path,
+                            stderr_path: pending.stderr_path,
+                            exit_code,
+                        })
+                    }
+                    None => self.record_step(pending, output),
+                }
+            }
+        }
     }
 
     fn run_step(
@@ -4289,6 +4356,94 @@ steps:
             .unwrap();
         assert!(store
             .outstanding_submitted_attempts("submitted_demo")
+            .unwrap()
+            .is_empty());
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    fn detached_submit_fixture(
+        test_name: &str,
+        submit_script_body: &str,
+    ) -> (PathBuf, ProjectStore, StoredFlowStep) {
+        let path = temp_project_path(test_name);
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Detached Submit Demo")).unwrap();
+        let submit_script = path.join("submit.sh");
+        fs::write(&submit_script, submit_script_body).unwrap();
+        let poll_script = path.join("poll.sh");
+        fs::write(
+            &poll_script,
+            r#"#!/bin/sh
+printf 'status=running\n'
+"#,
+        )
+        .unwrap();
+
+        register_tool(
+            &store,
+            format!(
+                "schema_version: agentflow.tool.v0\nnamespace: async\nname: detached_note\nversion: 0.1.0\nmaturity: wrapped\ndescription: Detached note\noutputs:\n  note:\n    type: Text\nruntime:\n  backend: detached\n  command:\n    - /bin/sh\n    - {}\n  poll:\n    - /bin/sh\n    - {}\n",
+                submit_script.display(),
+                poll_script.display()
+            ),
+        );
+        let flow = FlowDraft::from_simple_yaml(
+            "schema_version: agentflow.flow.v0\nid: detached_submit_demo\nname: Detached submit demo\nsteps:\n  - id: submit\n    tool: async/detached_note\n    needs: []\n    outputs:\n      note: submitted_note\n",
+        )
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+        let step = store.inspect_flow("detached_submit_demo").unwrap().steps[0].clone();
+
+        (path, store, step)
+    }
+
+    #[test]
+    fn submit_step_marks_attempt_submitted_when_handle_is_reported() {
+        let (path, store, step) = detached_submit_fixture(
+            "submit-step-handle",
+            r#"#!/bin/sh
+printf 'job_handle=abc123\n'
+exit 0
+"#,
+        );
+
+        let summary = store
+            .submit_step("detached_submit_demo", &step, &RunConfig::default())
+            .unwrap();
+
+        assert_eq!(summary.status, RunAttemptStatus::Submitted.as_str());
+        let outstanding = store
+            .outstanding_submitted_attempts("detached_submit_demo")
+            .unwrap();
+        assert_eq!(outstanding.len(), 1);
+        assert_eq!(outstanding[0].attempt_id, summary.attempt_id);
+        assert_eq!(outstanding[0].job_handle, "abc123");
+        assert_eq!(outstanding[0].step_id, step.id);
+        assert_eq!(
+            store.inspect_flow("detached_submit_demo").unwrap().steps[0].status,
+            StepStatus::Running.as_str()
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn submit_step_records_normal_result_when_handle_is_missing() {
+        let (path, store, step) = detached_submit_fixture(
+            "submit-step-no-handle",
+            r#"#!/bin/sh
+exit 0
+"#,
+        );
+
+        let summary = store
+            .submit_step("detached_submit_demo", &step, &RunConfig::default())
+            .unwrap();
+
+        assert_ne!(summary.status, RunAttemptStatus::Submitted.as_str());
+        assert!(store
+            .outstanding_submitted_attempts("detached_submit_demo")
             .unwrap()
             .is_empty());
 

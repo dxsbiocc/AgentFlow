@@ -9,6 +9,15 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **Async/detached execution — `submit_step` (phase 2b).** Runs a detached tool's
+  submit command, parses its `job_handle=`, and marks the run attempt `Submitted`
+  (running detached) — reusing `prepare_step` (whose built command is the submit
+  argv for a detached tool). A submit that fails or prints no handle falls through
+  to the normal record path (recorded failed, since a submit produces no declared
+  outputs). Poll/collect and run-loop integration follow.
+
+### Added
+
 - **Async/detached execution — the `detached` tool contract (phase 2a).** A tool
   can declare `runtime.backend: detached` with a submit command (`runtime.command`,
   which prints `job_handle=<id>`) and a new `runtime.poll` command (which prints

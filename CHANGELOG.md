@@ -7,6 +7,12 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-30
+
+Completes the first-class module line: a module answering a hypothesis fills its
+inferable params (e.g. the gene) from the hypothesis. The deterministic 0-LLM
+verdict core (`argument.rs`) remains byte-identical to 0.3.0.
+
 ### Added
 
 - **Per-hypothesis param inference for module answers (slice 4b-4c).** When the

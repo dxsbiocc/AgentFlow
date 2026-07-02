@@ -65,6 +65,9 @@ pub struct RunConfig {
     pub retries: usize,
     /// Delay before a failed-but-retried step is re-offered. Default zero = immediate (unchanged).
     pub retry_backoff: std::time::Duration,
+    /// Maximum wall-clock time a detached submitted attempt may stay outstanding before
+    /// polling finalizes it as timed out. `None` keeps detached jobs unbounded.
+    pub submitted_timeout_seconds: Option<u64>,
 }
 
 thread_local! {
@@ -181,6 +184,7 @@ pub struct SubmittedAttempt {
     pub step_id: String,
     pub workdir: String,
     pub job_handle: String,
+    pub started_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +192,7 @@ pub enum PollOutcome {
     Running,
     Succeeded,
     Failed,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -750,7 +755,7 @@ impl ProjectStore {
             // readiness, so a job that finishes this iteration can unblock its
             // dependents in the same call (no separate "collect" pass needed).
             for attempt in self.outstanding_submitted_attempts(flow_id)? {
-                match self.poll_submitted_attempt(&attempt)? {
+                match self.poll_submitted_attempt(&attempt, config.submitted_timeout_seconds)? {
                     PollOutcome::Running => {}
                     PollOutcome::Succeeded => {
                         completed_steps += 1;
@@ -771,6 +776,18 @@ impl ProjectStore {
                             retrying = true;
                         }
                         attempts.push(polled_attempt_summary(&attempt, RunAttemptStatus::Failed));
+                    }
+                    PollOutcome::TimedOut => {
+                        if record_step_failure(
+                            &attempt.step_id,
+                            config.retries,
+                            &mut retry_counts,
+                            &mut failed_ids,
+                            &mut failed_steps,
+                        ) {
+                            retrying = true;
+                        }
+                        attempts.push(polled_attempt_summary(&attempt, RunAttemptStatus::TimedOut));
                     }
                 }
             }
@@ -1427,6 +1444,7 @@ impl ProjectStore {
             step_id: step_id.to_string(),
             workdir: workdir.to_string(),
             job_handle: job_handle.to_string(),
+            started_at: now,
         })
     }
 
@@ -1435,7 +1453,7 @@ impl ProjectStore {
         flow_id: &str,
     ) -> Result<Vec<SubmittedAttempt>, StorageError> {
         let mut stmt = self.connection().prepare(
-            "SELECT ra.id, ra.run_id, r.flow_id, r.step_id, ra.workdir, ra.job_handle
+            "SELECT ra.id, ra.run_id, r.flow_id, r.step_id, ra.workdir, ra.job_handle, ra.started_at
              FROM run_attempts ra
              JOIN runs r ON r.id = ra.run_id
              WHERE ra.status = ?1 AND r.flow_id = ?2
@@ -1451,6 +1469,7 @@ impl ProjectStore {
                     step_id: row.get(3)?,
                     workdir: row.get(4)?,
                     job_handle: row.get(5)?,
+                    started_at: row.get(6)?,
                 })
             },
         )?;
@@ -1469,7 +1488,7 @@ impl ProjectStore {
         &self,
     ) -> Result<Vec<SubmittedAttempt>, StorageError> {
         let mut stmt = self.connection().prepare(
-            "SELECT ra.id, ra.run_id, r.flow_id, r.step_id, ra.workdir, ra.job_handle
+            "SELECT ra.id, ra.run_id, r.flow_id, r.step_id, ra.workdir, ra.job_handle, ra.started_at
              FROM run_attempts ra
              JOIN runs r ON r.id = ra.run_id
              WHERE ra.status = ?1
@@ -1483,6 +1502,7 @@ impl ProjectStore {
                 step_id: row.get(3)?,
                 workdir: row.get(4)?,
                 job_handle: row.get(5)?,
+                started_at: row.get(6)?,
             })
         })?;
 
@@ -1491,6 +1511,35 @@ impl ProjectStore {
             attempts.push(row?);
         }
         Ok(attempts)
+    }
+
+    pub fn get_outstanding_submitted_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<SubmittedAttempt, StorageError> {
+        self.connection()
+            .query_row(
+                "SELECT ra.id, ra.run_id, r.flow_id, r.step_id, ra.workdir, ra.job_handle, ra.started_at
+                 FROM run_attempts ra
+                 JOIN runs r ON r.id = ra.run_id
+                 WHERE ra.id = ?1 AND ra.status = ?2",
+                params![attempt_id, RunAttemptStatus::Submitted.as_str()],
+                |row| {
+                    Ok(SubmittedAttempt {
+                        attempt_id: row.get(0)?,
+                        run_id: row.get(1)?,
+                        flow_id: row.get(2)?,
+                        step_id: row.get(3)?,
+                        workdir: row.get(4)?,
+                        job_handle: row.get(5)?,
+                        started_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StorageError::NotFound(format!("outstanding submitted attempt {attempt_id}"))
+            })
     }
 
     pub fn finalize_submitted_attempt(
@@ -1554,7 +1603,20 @@ impl ProjectStore {
     pub fn poll_submitted_attempt(
         &self,
         attempt: &SubmittedAttempt,
+        timeout_seconds: Option<u64>,
     ) -> Result<PollOutcome, StorageError> {
+        if let Some(limit) = timeout_seconds {
+            if (crate::storage::now_unix_seconds() - attempt.started_at) >= limit as i64 {
+                self.finalize_submitted_attempt(
+                    &attempt.attempt_id,
+                    RunAttemptStatus::TimedOut,
+                    None,
+                    Some("submitted job exceeded timeout"),
+                )?;
+                return Ok(PollOutcome::TimedOut);
+            }
+        }
+
         let step = self
             .inspect_flow(&attempt.flow_id)?
             .steps
@@ -1641,6 +1703,56 @@ impl ProjectStore {
                 }
             }
         }
+    }
+
+    pub fn cancel_submitted_attempt(&self, attempt: &SubmittedAttempt) -> Result<(), StorageError> {
+        let step = self
+            .inspect_flow(&attempt.flow_id)?
+            .steps
+            .into_iter()
+            .find(|step| step.id == attempt.step_id)
+            .ok_or_else(|| StorageError::NotFound(format!("submitted step {}", attempt.step_id)))?;
+        let tool_ref = step.tool_ref.as_deref().ok_or_else(|| {
+            StorageError::InvalidInput(format!(
+                "submitted step {} has no tool_ref",
+                attempt.step_id
+            ))
+        })?;
+        let tool = self.executable_tool(tool_ref)?;
+        let Some((cancel_executable, cancel_args)) = tool.runtime.cancel.split_first() else {
+            return Err(StorageError::InvalidInput(format!(
+                "detached tool {tool_ref} has no cancel command"
+            )));
+        };
+
+        let mut command = Command::new(cancel_executable);
+        command
+            .args(cancel_args)
+            .arg(&attempt.job_handle)
+            .current_dir(&attempt.workdir)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin");
+        // Best-effort: still finalize as Cancelled even if the cancel command
+        // itself failed to run or exited non-zero (a flaky/absent cancel path
+        // shouldn't block the operator from marking a stuck job as done), but
+        // don't silently discard that failure — record it in error_message so
+        // it's visible via `runs`/`logs` inspection if the external job turns
+        // out to still be running.
+        let cancel_note = match run_local_command(command, None) {
+            Ok(output) if output.status.success() => "cancelled by user".to_string(),
+            Ok(output) => format!(
+                "cancelled by user (cancel command exited {:?})",
+                output.status.code()
+            ),
+            Err(error) => format!("cancelled by user (cancel command failed to run: {error})"),
+        };
+        self.finalize_submitted_attempt(
+            &attempt.attempt_id,
+            RunAttemptStatus::Cancelled,
+            None,
+            Some(&cancel_note),
+        )?;
+        Ok(())
     }
 
     pub fn mark_attempt_submitted(
@@ -4574,6 +4686,20 @@ printf 'status=running\n'
         submit_script_body: &str,
         poll_script_body: &str,
     ) -> (PathBuf, ProjectStore, StoredFlowStep) {
+        detached_submit_fixture_with_poll_and_cancel(
+            test_name,
+            submit_script_body,
+            poll_script_body,
+            None,
+        )
+    }
+
+    fn detached_submit_fixture_with_poll_and_cancel(
+        test_name: &str,
+        submit_script_body: &str,
+        poll_script_body: &str,
+        cancel_script_body: Option<&str>,
+    ) -> (PathBuf, ProjectStore, StoredFlowStep) {
         let path = temp_project_path(test_name);
         fs::create_dir_all(&path).unwrap();
         let store = ProjectStore::init(&path, Some("Detached Submit Demo")).unwrap();
@@ -4581,13 +4707,24 @@ printf 'status=running\n'
         fs::write(&submit_script, submit_script_body).unwrap();
         let poll_script = path.join("poll.sh");
         fs::write(&poll_script, poll_script_body).unwrap();
+        let cancel_yaml = cancel_script_body
+            .map(|body| {
+                let cancel_script = path.join("cancel.sh");
+                fs::write(&cancel_script, body).unwrap();
+                format!(
+                    "  cancel:\n    - /bin/sh\n    - {}\n",
+                    cancel_script.display()
+                )
+            })
+            .unwrap_or_default();
 
         register_tool(
             &store,
             format!(
-                "schema_version: agentflow.tool.v0\nnamespace: async\nname: detached_note\nversion: 0.1.0\nmaturity: wrapped\ndescription: Detached note\noutputs:\n  note:\n    type: Text\nruntime:\n  backend: detached\n  command:\n    - /bin/sh\n    - {}\n  poll:\n    - /bin/sh\n    - {}\n",
+                "schema_version: agentflow.tool.v0\nnamespace: async\nname: detached_note\nversion: 0.1.0\nmaturity: wrapped\ndescription: Detached note\noutputs:\n  note:\n    type: Text\nruntime:\n  backend: detached\n  command:\n    - /bin/sh\n    - {}\n  poll:\n    - /bin/sh\n    - {}\n{}",
                 submit_script.display(),
-                poll_script.display()
+                poll_script.display(),
+                cancel_yaml
             ),
         );
         let flow = FlowDraft::from_simple_yaml(
@@ -4680,7 +4817,7 @@ printf 'status=succeeded\n'
         );
         let attempt = submit_detached_fixture(&store, &step);
 
-        let outcome = store.poll_submitted_attempt(&attempt).unwrap();
+        let outcome = store.poll_submitted_attempt(&attempt, None).unwrap();
 
         assert_eq!(outcome, PollOutcome::Succeeded);
         assert!(store
@@ -4725,7 +4862,7 @@ printf 'status=running\n'
         );
         let attempt = submit_detached_fixture(&store, &step);
 
-        let outcome = store.poll_submitted_attempt(&attempt).unwrap();
+        let outcome = store.poll_submitted_attempt(&attempt, None).unwrap();
 
         assert_eq!(outcome, PollOutcome::Running);
         let outstanding = store
@@ -4754,7 +4891,7 @@ printf 'status=failed\n'
         );
         let attempt = submit_detached_fixture(&store, &step);
 
-        let outcome = store.poll_submitted_attempt(&attempt).unwrap();
+        let outcome = store.poll_submitted_attempt(&attempt, None).unwrap();
 
         assert_eq!(outcome, PollOutcome::Failed);
         assert!(store
@@ -4799,7 +4936,7 @@ exit 0
         let step = store.inspect_flow("detached_submit_demo").unwrap().steps[0].clone();
         let attempt = submit_detached_fixture(&store, &step);
 
-        let outcome = store.poll_submitted_attempt(&attempt).unwrap();
+        let outcome = store.poll_submitted_attempt(&attempt, None).unwrap();
 
         assert_eq!(outcome, PollOutcome::Failed);
         assert!(store
@@ -4810,6 +4947,199 @@ exit 0
             store.inspect_flow("detached_submit_demo").unwrap().steps[0].status,
             StepStatus::Failed.as_str()
         );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn poll_submitted_attempt_timeout_skips_poll_command() {
+        let (path, store, step) = detached_submit_fixture_with_poll(
+            "poll-submitted-timeout-skips-poll",
+            r#"#!/bin/sh
+printf 'job_handle=job-1\n'
+exit 0
+"#,
+            r#"#!/bin/sh
+touch poll-was-called
+printf 'status=succeeded\n'
+"#,
+        );
+        let attempt = submit_detached_fixture(&store, &step);
+
+        let outcome = store.poll_submitted_attempt(&attempt, Some(0)).unwrap();
+
+        assert_eq!(outcome, PollOutcome::TimedOut);
+        assert!(!Path::new(&attempt.workdir).join("poll-was-called").exists());
+        assert!(store
+            .outstanding_submitted_attempts("detached_submit_demo")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.inspect_flow("detached_submit_demo").unwrap().steps[0].status,
+            StepStatus::Failed.as_str()
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn poll_submitted_attempt_without_timeout_still_polls_and_collects_outputs() {
+        let (path, store, step) = detached_submit_fixture_with_poll(
+            "poll-submitted-no-timeout",
+            r#"#!/bin/sh
+printf 'detached note\n' > "$AGENTFLOW_OUTPUT_NOTE"
+printf 'job_handle=job-1\n'
+exit 0
+"#,
+            r#"#!/bin/sh
+printf 'status=succeeded\n'
+"#,
+        );
+        let attempt = submit_detached_fixture(&store, &step);
+
+        let outcome = store.poll_submitted_attempt(&attempt, None).unwrap();
+
+        assert_eq!(outcome, PollOutcome::Succeeded);
+        assert!(store
+            .outstanding_submitted_attempts("detached_submit_demo")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.inspect_flow("detached_submit_demo").unwrap().steps[0].status,
+            StepStatus::Completed.as_str()
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn cancel_submitted_attempt_finalizes_and_removes_outstanding_job() {
+        let cancel_marker = "cancel-was-called";
+        let (path, store, step) = detached_submit_fixture_with_poll_and_cancel(
+            "cancel-submitted-success",
+            r#"#!/bin/sh
+printf 'job_handle=job-1\n'
+exit 0
+"#,
+            r#"#!/bin/sh
+printf 'status=running\n'
+"#,
+            Some(&format!(
+                r#"#!/bin/sh
+touch {cancel_marker}
+exit 0
+"#
+            )),
+        );
+        let attempt = submit_detached_fixture(&store, &step);
+
+        store.cancel_submitted_attempt(&attempt).unwrap();
+
+        assert!(Path::new(&attempt.workdir).join(cancel_marker).exists());
+        assert!(store
+            .outstanding_submitted_attempts("detached_submit_demo")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.inspect_flow("detached_submit_demo").unwrap().steps[0].status,
+            StepStatus::Failed.as_str()
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn cancel_submitted_attempt_rejects_tool_without_cancel_command() {
+        let (path, store, step) = detached_submit_fixture(
+            "cancel-submitted-missing-command",
+            r#"#!/bin/sh
+printf 'job_handle=job-1\n'
+exit 0
+"#,
+        );
+        let attempt = submit_detached_fixture(&store, &step);
+
+        let err = store.cancel_submitted_attempt(&attempt).unwrap_err();
+
+        assert!(matches!(err, StorageError::InvalidInput(_)));
+        assert!(err.to_string().contains("has no cancel command"));
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn cancel_submitted_attempt_still_finalizes_and_records_a_failing_cancel_command() {
+        let (path, store, step) = detached_submit_fixture_with_poll_and_cancel(
+            "cancel-submitted-command-fails",
+            r#"#!/bin/sh
+printf 'job_handle=job-1\n'
+exit 0
+"#,
+            r#"#!/bin/sh
+printf 'status=running\n'
+"#,
+            Some(
+                r#"#!/bin/sh
+echo "remote job already finished, cannot cancel" 1>&2
+exit 1
+"#,
+            ),
+        );
+        let attempt = submit_detached_fixture(&store, &step);
+
+        // Best-effort: even though the cancel command itself failed, the
+        // attempt is still finalized Cancelled (so the operator isn't blocked
+        // by a flaky/failing external cancel path) — but the failure must be
+        // recorded, not silently discarded.
+        store.cancel_submitted_attempt(&attempt).unwrap();
+
+        assert!(store
+            .outstanding_submitted_attempts("detached_submit_demo")
+            .unwrap()
+            .is_empty());
+        let inspection = store.inspect_run_or_attempt(&attempt.attempt_id).unwrap();
+        let recorded_attempt = inspection
+            .attempts
+            .iter()
+            .find(|record| record.attempt_id == attempt.attempt_id)
+            .expect("attempt should be recorded");
+        assert_eq!(
+            recorded_attempt.status,
+            RunAttemptStatus::Cancelled.as_str()
+        );
+        assert!(
+            recorded_attempt
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cancel command exited"),
+            "the cancel command's failure should be recorded, not swallowed: {:?}",
+            recorded_attempt.error_message
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn get_outstanding_submitted_attempt_finds_submitted_attempt_and_rejects_missing() {
+        let (path, store, step) = detached_submit_fixture(
+            "get-outstanding-submitted-attempt",
+            r#"#!/bin/sh
+printf 'job_handle=job-1\n'
+exit 0
+"#,
+        );
+        let attempt = submit_detached_fixture(&store, &step);
+
+        let found = store
+            .get_outstanding_submitted_attempt(&attempt.attempt_id)
+            .unwrap();
+        let missing = store
+            .get_outstanding_submitted_attempt("attempt_missing")
+            .unwrap_err();
+
+        assert_eq!(found, attempt);
+        assert!(matches!(missing, StorageError::NotFound(_)));
 
         let _ = fs::remove_dir_all(path);
     }
@@ -4987,6 +5317,110 @@ printf 'consumed\n' >> "$AGENTFLOW_OUTPUT_REPORT"
                 StepStatus::Completed.as_str().to_string(),
                 StepStatus::Completed.as_str().to_string()
             ]
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn a_fresh_project_store_handle_resumes_and_collects_a_job_submitted_by_a_prior_handle() {
+        // Simulates a process crash/restart: everything about an outstanding
+        // detached job lives in the project's SQLite database, not in the
+        // `ProjectStore` value itself, so a brand new `ProjectStore::open` on
+        // the same project directory (standing in for a fresh process) must be
+        // able to poll and collect a job a now-dropped, earlier handle submitted.
+        let path = temp_project_path("run-flow-detached-reconnect");
+        fs::create_dir_all(&path).unwrap();
+        let store_before_restart = ProjectStore::init(&path, Some("Reconnect Demo")).unwrap();
+
+        let submit_script = path.join("submit.sh");
+        fs::write(
+            &submit_script,
+            r#"#!/bin/sh
+printf 'submitted note\n' > "$AGENTFLOW_OUTPUT_NOTE"
+printf 'job_handle=job-1\n'
+exit 0
+"#,
+        )
+        .unwrap();
+        // The poll phase runs at the top of every wave, including the wave
+        // right after a fresh submission within the SAME call — so a poll
+        // script that reports `succeeded` unconditionally would collect the
+        // job before this call even returns. Report `running` on the first
+        // poll (still within the submitting call) and `succeeded` only from
+        // the second poll onward, so the job is genuinely still outstanding
+        // when we simulate the restart below.
+        let poll_counter = path.join("poll.count");
+        let poll_script = path.join("poll.sh");
+        fs::write(
+            &poll_script,
+            format!(
+                r#"#!/bin/sh
+COUNTER="{}"
+n=0
+if [ -f "$COUNTER" ]; then n=$(cat "$COUNTER"); fi
+n=$((n + 1))
+printf '%s' "$n" > "$COUNTER"
+if [ "$n" -lt 2 ]; then
+  printf 'status=running\n'
+else
+  printf 'status=succeeded\n'
+fi
+"#,
+                poll_counter.display()
+            ),
+        )
+        .unwrap();
+        register_tool(
+            &store_before_restart,
+            format!(
+                "schema_version: agentflow.tool.v0\nnamespace: async\nname: detached_note\nversion: 0.1.0\nmaturity: wrapped\ndescription: Detached note\noutputs:\n  note:\n    type: Text\nruntime:\n  backend: detached\n  command:\n    - /bin/sh\n    - {}\n  poll:\n    - /bin/sh\n    - {}\n",
+                submit_script.display(),
+                poll_script.display()
+            ),
+        );
+        let flow = FlowDraft::from_simple_yaml(
+            "schema_version: agentflow.flow.v0\nid: reconnect_demo\nname: Reconnect demo\nsteps:\n  - id: submit\n    tool: async/detached_note\n    needs: []\n    outputs:\n      note: submitted_note\n",
+        )
+        .unwrap();
+        store_before_restart.approve_flow(flow, None).unwrap();
+
+        // Submit the job with the "before restart" handle, then drop it — no
+        // in-memory state can leak into the next handle.
+        let submitted = store_before_restart
+            .run_flow_with("reconnect_demo", &RunConfig::default())
+            .unwrap();
+        assert_eq!(submitted.submitted_steps, 1);
+        drop(store_before_restart);
+
+        // Open a brand new handle on the same project path, as a fresh process
+        // would after a restart, and resume: it must see the outstanding job
+        // (persisted independently of the handle that submitted it) and, since
+        // this fixture's poll script reports `succeeded` immediately, collect
+        // it in this single call.
+        let store_after_restart = ProjectStore::open(&path).unwrap();
+        let outstanding = store_after_restart
+            .outstanding_submitted_attempts("reconnect_demo")
+            .unwrap();
+        assert_eq!(
+            outstanding.len(),
+            1,
+            "the job submitted by the dropped handle must still be outstanding"
+        );
+
+        let resumed = store_after_restart
+            .run_flow_with("reconnect_demo", &RunConfig::default())
+            .unwrap();
+        assert_eq!(resumed.completed_steps, 1);
+        assert_eq!(resumed.failed_steps, 0);
+        assert_eq!(resumed.submitted_steps, 0);
+        assert_eq!(
+            store_after_restart
+                .inspect_flow("reconnect_demo")
+                .unwrap()
+                .steps[0]
+                .status,
+            StepStatus::Completed.as_str()
         );
 
         let _ = fs::remove_dir_all(path);
@@ -5526,6 +5960,7 @@ steps:
             backend: "local".to_string(),
             command: vec!["/bin/echo".to_string(), "hello world".to_string()],
             poll: Vec::new(),
+            cancel: Vec::new(),
             timeout_seconds: Some(5),
             env_name: None,
             env_prefix: None,
@@ -5548,6 +5983,7 @@ steps:
             backend: "local".to_string(),
             command: vec!["/bin/echo".to_string()],
             poll: Vec::new(),
+            cancel: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -5567,6 +6003,7 @@ steps:
             backend: "local".to_string(),
             command: vec!["/bin/echo".to_string(), "hello world".to_string()],
             poll: Vec::new(),
+            cancel: Vec::new(),
             timeout_seconds: Some(5),
             env_name: None,
             env_prefix: None,
@@ -5589,6 +6026,7 @@ steps:
             backend: "local".to_string(),
             command: vec!["/bin/echo".to_string(), "hello world".to_string()],
             poll: Vec::new(),
+            cancel: Vec::new(),
             timeout_seconds: Some(5),
             env_name: None,
             env_prefix: None,
@@ -5632,6 +6070,7 @@ steps:
             backend: backend.to_string(),
             command: vec!["python".to_string(), "tool.py".to_string()],
             poll: Vec::new(),
+            cancel: Vec::new(),
             timeout_seconds: None,
             env_name: Some("envA".to_string()),
             env_prefix: None,
@@ -5652,6 +6091,7 @@ steps:
                 "strict".to_string(),
             ],
             poll: Vec::new(),
+            cancel: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -5716,6 +6156,7 @@ steps:
             backend: "container".to_string(),
             command: vec!["python".to_string(), "run.py".to_string()],
             poll: Vec::new(),
+            cancel: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -6020,6 +6461,7 @@ steps:
             backend: "isolated-micromamba".to_string(),
             command: vec!["python".to_string(), "tool.py".to_string()],
             poll: Vec::new(),
+            cancel: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -6063,6 +6505,7 @@ steps:
             backend: "isolated-micromamba".to_string(),
             command: vec!["python".to_string(), "tool.py".to_string()],
             poll: Vec::new(),
+            cancel: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: Some(prefix.to_string()),
@@ -6091,6 +6534,7 @@ steps:
             backend: "conda".to_string(),
             command: vec!["python".to_string(), "run.py".to_string()],
             poll: Vec::new(),
+            cancel: Vec::new(),
             timeout_seconds: None,
             env_name: Some("af-test".to_string()),
             env_prefix: None,
@@ -6107,6 +6551,7 @@ steps:
             backend: "isolated-micromamba".to_string(),
             command: vec!["python".to_string(), "run.py".to_string()],
             poll: Vec::new(),
+            cancel: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -6125,6 +6570,7 @@ steps:
             backend: "container".to_string(),
             command: vec!["python".to_string(), "run.py".to_string()],
             poll: Vec::new(),
+            cancel: Vec::new(),
             timeout_seconds: None,
             env_name: None,
             env_prefix: None,
@@ -7220,6 +7666,7 @@ steps:
             backend: "conda".to_string(),
             command: vec!["python".to_string(), "run.py".to_string()],
             poll: Vec::new(),
+            cancel: Vec::new(),
             timeout_seconds: None,
             env_name: Some("af-test".to_string()),
             env_prefix: None,

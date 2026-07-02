@@ -83,7 +83,10 @@ pub fn usage() -> String {
         "  agentflow flow approve <flow.yaml> [--module <path>]... [--path <path>]",
         "  agentflow flow inspect <flow-id> [--json] [--path <path>]",
         "  agentflow flow plan <flow-id> [--json] [--path <path>]",
-        "  agentflow run <flow-id> [--container-engine docker|podman|singularity|apptainer] [--container-runner <path>] [--max-parallel <n>] [--keep-going] [--retries <n>] [--retry-backoff <seconds>] [--path <path>]",
+        "  agentflow run <flow-id> [--container-engine docker|podman|singularity|apptainer] [--container-runner <path>] [--max-parallel <n>] [--keep-going] [--retries <n>] [--retry-backoff <seconds>] [--job-timeout <seconds>] [--path <path>]",
+        "  agentflow jobs list [--flow <flow-id>] [--json] [--path <path>]",
+        "  agentflow jobs poll [--flow <flow-id>] [--job-timeout <seconds>] [--json] [--path <path>]",
+        "  agentflow jobs cancel <attempt-id> [--json] [--path <path>]",
         "  agentflow run-step <step-id|flow.step|step:flow/step> [--path <path>]",
         "  agentflow report <flow-id> [--path <path>]",
         "  agentflow report research [--path <path>]",
@@ -181,6 +184,7 @@ fn run_command(args: RunArgs) -> Result<String, CliError> {
     run_config.retries = last_value(args.retries).unwrap_or(0);
     run_config.retry_backoff =
         std::time::Duration::from_secs(last_value(args.retry_backoff).unwrap_or(0) as u64);
+    run_config.submitted_timeout_seconds = last_value(args.job_timeout).map(|value| value as u64);
     let project_path = project_path_from_only(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let summary = store.run_flow_with(&flow_id, &run_config)?;
@@ -395,6 +399,7 @@ fn jobs_command(args: JobsArgs) -> Result<String, CliError> {
     match args.command {
         JobsCommand::List(args) => jobs_list_command(args),
         JobsCommand::Poll(args) => jobs_poll_command(args),
+        JobsCommand::Cancel(args) => jobs_cancel_command(args),
     }
 }
 
@@ -419,9 +424,10 @@ fn jobs_list_command(args: JobsFilterArgs) -> Result<String, CliError> {
     }
 }
 
-fn jobs_poll_command(args: JobsFilterArgs) -> Result<String, CliError> {
-    let flow_id = last_value(args.flow);
-    let options = ProjectOptions::from(args.project);
+fn jobs_poll_command(args: JobsPollArgs) -> Result<String, CliError> {
+    let flow_id = last_value(args.filter.flow);
+    let options = ProjectOptions::from(args.filter.project);
+    let timeout_seconds = last_value(args.job_timeout).map(|value| value as u64);
     let project_path = options.path.unwrap_or(std::env::current_dir()?);
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let attempts = match &flow_id {
@@ -431,30 +437,55 @@ fn jobs_poll_command(args: JobsFilterArgs) -> Result<String, CliError> {
 
     let mut succeeded = 0usize;
     let mut failed = 0usize;
+    let mut timed_out = 0usize;
     let mut running = 0usize;
     for attempt in &attempts {
-        match store.poll_submitted_attempt(attempt)? {
+        match store.poll_submitted_attempt(attempt, timeout_seconds)? {
             agentflow_core::runtime::PollOutcome::Running => running += 1,
             agentflow_core::runtime::PollOutcome::Succeeded => succeeded += 1,
             agentflow_core::runtime::PollOutcome::Failed => failed += 1,
+            agentflow_core::runtime::PollOutcome::TimedOut => timed_out += 1,
         }
     }
 
     if options.json {
         Ok(format!(
-            "{{\"schema_version\":\"agentflow.jobs_poll.v0\",\"polled\":{},\"succeeded\":{},\"failed\":{},\"running\":{}}}",
+            "{{\"schema_version\":\"agentflow.jobs_poll.v1\",\"polled\":{},\"succeeded\":{},\"failed\":{},\"timed_out\":{},\"running\":{}}}",
             attempts.len(),
             succeeded,
             failed,
+            timed_out,
             running
         ))
     } else {
         Ok(format!(
-            "Poll complete\nPolled: {}\nSucceeded: {}\nFailed: {}\nStill running: {}",
+            "Poll complete\nPolled: {}\nSucceeded: {}\nFailed: {}\nTimed out: {}\nStill running: {}",
             attempts.len(),
             succeeded,
             failed,
+            timed_out,
             running
+        ))
+    }
+}
+
+fn jobs_cancel_command(args: JobsCancelArgs) -> Result<String, CliError> {
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
+    let attempt = store.get_outstanding_submitted_attempt(&args.attempt_id)?;
+    store.cancel_submitted_attempt(&attempt)?;
+
+    if options.json {
+        Ok(format!(
+            "{{\"schema_version\":\"agentflow.jobs_cancel.v0\",\"attempt_id\":\"{}\",\"step_id\":\"{}\"}}",
+            escape_json(&args.attempt_id),
+            escape_json(&attempt.step_id)
+        ))
+    } else {
+        Ok(format!(
+            "Cancelled\nAttempt: {}\nStep: {}",
+            args.attempt_id, attempt.step_id
         ))
     }
 }

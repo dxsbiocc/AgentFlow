@@ -7,6 +7,16 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-02
+
+Completes the async/detached execution line end to end: a step can now submit
+a long-running/HPC/Nextflow-style job instead of blocking on it, and a later
+`run` (or `jobs poll`) polls the job, collects its outputs once it finishes,
+and unblocks downstream steps — resumable across process restarts, with an
+optional per-job timeout and a `cancel` command. See
+`docs/design/async-execution-design.md` for the full design and the phase
+breakdown below.
+
 ### Added
 
 - **Async/detached execution — submitted-job timeout + cancellation (phase 4).**

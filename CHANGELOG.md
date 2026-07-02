@@ -7,6 +7,39 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ## [Unreleased]
 
+### Added
+
+- **Desktop UI — read-only project viewer, first slice.** Adds a native
+  desktop app via Tauri: a project picker (native folder dialog) and a
+  status/overview screen (project name, root path, engine version,
+  timestamps, and flow/tool/run/artifact counts). Two new crates:
+  `agentflow-desktop-api` (a thin, GUI-framework-agnostic Rust facade over
+  `agentflow-core` — no Tauri dependency, independently unit-tested) and
+  `agentflow-desktop` (the Tauri v2 app + a React/Vite/TypeScript frontend).
+  The frontend talks to the facade via Tauri's built-in IPC commands, not an
+  HTTP server — no port/CORS/network surface for a local single-user app.
+  This slice is entirely read-only: no run-triggering, tool registration, or
+  flow approval from the UI; those remain CLI-only. `ProjectSummary` gains
+  `#[derive(Serialize)]` (purely additive — a data-shape annotation, not a
+  UI dependency) and `ProjectStore` gains `count_flows()` (flows have no
+  `list` method, only lookup-by-known-id, so this is a plain count). This is
+  the **first JavaScript/Node toolchain and first GUI/webview crate** in a
+  repo that has been 100% Rust-only until now — see
+  `docs/design/desktop-ui-design.md` for the full rationale, the
+  Tauri-IPC-not-HTTP decision, and the phased slice plan (flows/runs/
+  artifacts/cache browsers are follow-on slices, not built yet). CI gains a
+  Linux Tauri-prerequisites install step (`libwebkit2gtk` et al.), required
+  for the new crate to even compile there, plus a `desktop-frontend` job
+  running `npm ci && npm run build` (tsc + vite build) so a broken frontend
+  can't merge silently. `agentflow-core`'s and `agentflow-cli`'s own
+  dependency lists are unchanged. Visual language (color/typography tokens)
+  is grounded in real values pulled from CodexMonitor
+  (github.com/Dimillian/CodexMonitor, MIT, same Tauri stack) — its
+  `themes.light.css`/`themes.dark.css`/`ds-tokens.css` design tokens (text,
+  border, accent, and error colors, and its `--ui-font-family` stack) are
+  reused as CSS custom properties here; no code was copied, only visual
+  inspiration, cited in a comment in `App.css`.
+
 ## [0.5.0] - 2026-07-02
 
 Completes the async/detached execution line end to end: a step can now submit

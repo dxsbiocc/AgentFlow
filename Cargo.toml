@@ -2,6 +2,8 @@
 members = [
     "crates/agentflow-cli",
     "crates/agentflow-core",
+    "crates/agentflow-desktop/src-tauri",
+    "crates/agentflow-desktop-api",
     "crates/agentflow-schemas",
 ]
 resolver = "2"

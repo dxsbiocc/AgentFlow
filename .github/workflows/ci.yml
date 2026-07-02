@@ -18,6 +18,11 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -27,3 +32,25 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  desktop-frontend:
+    name: Desktop frontend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/agentflow-desktop/package-lock.json
+
+      - name: Install dependencies
+        working-directory: crates/agentflow-desktop
+        run: npm ci
+
+      - name: Type-check and build
+        working-directory: crates/agentflow-desktop
+        run: npm run build

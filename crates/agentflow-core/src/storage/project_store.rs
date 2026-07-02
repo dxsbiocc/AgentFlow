@@ -53,7 +53,7 @@ impl From<rusqlite::Error> for StorageError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProjectSummary {
     pub id: String,
     pub name: String,
@@ -227,6 +227,16 @@ impl ProjectStore {
 
     pub fn root_path(&self) -> &Path {
         &self.root_path
+    }
+
+    /// Number of flows registered in the project. Flows have no `list`
+    /// method (only lookup by known id via `inspect_flow`/`plan_flow`), so
+    /// this is a plain count rather than a listing.
+    pub fn count_flows(&self) -> Result<usize, StorageError> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM flows", [], |row| row.get(0))?;
+        Ok(count as usize)
     }
 
     pub(crate) fn connection(&self) -> &Connection {

@@ -63,6 +63,7 @@ pub struct ToolRuntimeSpec {
     pub backend: String,
     pub command: Vec<String>,
     pub poll: Vec<String>,
+    pub cancel: Vec<String>,
     pub timeout_seconds: Option<u64>,
     pub env_name: Option<String>,
     pub env_prefix: Option<String>,
@@ -214,6 +215,7 @@ impl ToolSpec {
             runtime_backend: self.runtime.backend.clone(),
             runtime_command: self.runtime.command.clone(),
             runtime_poll: self.runtime.poll.clone(),
+            runtime_cancel: self.runtime.cancel.clone(),
             runtime_timeout_seconds: self.runtime.timeout_seconds,
             runtime_env_name: self.runtime.env_name.clone(),
             runtime_env_prefix: self.runtime.env_prefix.clone(),
@@ -272,6 +274,8 @@ struct StoredToolSpecJson {
     runtime_command: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     runtime_poll: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    runtime_cancel: Vec<String>,
     #[serde(default)]
     runtime_timeout_seconds: Option<u64>,
     #[serde(default)]
@@ -537,6 +541,8 @@ struct RawToolRuntimeSpec {
     command: Vec<String>,
     #[serde(default, deserialize_with = "yaml::deserialize_string_vec")]
     poll: Vec<String>,
+    #[serde(default, deserialize_with = "yaml::deserialize_string_vec")]
+    cancel: Vec<String>,
     #[serde(default, deserialize_with = "yaml::deserialize_optional_scalar_string")]
     timeout_seconds: Option<String>,
     #[serde(
@@ -572,6 +578,7 @@ impl RawToolRuntimeSpec {
             backend: self.backend.unwrap_or_default(),
             command: self.command,
             poll: self.poll,
+            cancel: self.cancel,
             timeout_seconds: self
                 .timeout_seconds
                 .map(|value| {
@@ -1591,6 +1598,11 @@ fn validate_runtime_backend(runtime: &ToolRuntimeSpec) -> Result<(), StorageErro
             "only the detached runtime may declare runtime.poll".to_string(),
         ));
     }
+    if !runtime.cancel.is_empty() && runtime.backend != "detached" {
+        return Err(StorageError::InvalidInput(
+            "only the detached runtime may declare runtime.cancel".to_string(),
+        ));
+    }
 
     match runtime.backend.as_str() {
         "local" => {
@@ -1627,6 +1639,14 @@ fn validate_runtime_backend(runtime: &ToolRuntimeSpec) -> Result<(), StorageErro
                 return Err(StorageError::InvalidInput(
                     "runtime.poll[0] must be an absolute executable path".to_string(),
                 ));
+            }
+            if let Some(cancel) = runtime.cancel.first() {
+                if !Path::new(cancel).is_absolute() {
+                    return Err(StorageError::InvalidInput(
+                        "detached runtime.cancel[0] must be an absolute executable path"
+                            .to_string(),
+                    ));
+                }
             }
             if runtime.env_name.is_some()
                 || runtime.env_prefix.is_some()
@@ -1800,6 +1820,7 @@ fn executable_from_stored_json(
         backend: stored.runtime_backend,
         command: stored.runtime_command,
         poll: stored.runtime_poll,
+        cancel: stored.runtime_cancel,
         timeout_seconds: stored.runtime_timeout_seconds,
         env_name: stored.runtime_env_name,
         env_prefix: stored.runtime_env_prefix,
@@ -2412,6 +2433,58 @@ runtime:
     - /bin/echo
   poll:
     - /abs/poll.sh
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("only the detached runtime"));
+    }
+
+    #[test]
+    fn test_detached_rejects_relative_cancel() {
+        let err = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: detached_relative_cancel
+version: 0.1.0
+maturity: wrapped
+description: detached relative cancel
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: detached
+  command:
+    - /abs/submit.sh
+  poll:
+    - /abs/poll.sh
+  cancel:
+    - cancel.sh
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("runtime.cancel[0]"));
+    }
+
+    #[test]
+    fn test_non_detached_rejects_cancel() {
+        let err = ToolSpec::from_simple_yaml(
+            r#"
+schema_version: agentflow.tool.v0
+name: local_cancel
+version: 0.1.0
+maturity: wrapped
+description: local cancel
+outputs:
+  report:
+    type: Markdown
+runtime:
+  backend: local
+  command:
+    - /bin/echo
+  cancel:
+    - /abs/cancel.sh
 "#,
         )
         .unwrap_err();

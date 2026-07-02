@@ -9,6 +9,40 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **Async/detached execution — submitted-job timeout + cancellation (phase 4).**
+  Completes the async/detached execution design (`docs/design/async-execution-design.md`).
+  `poll_submitted_attempt` now takes an optional `timeout_seconds`; when a
+  submitted job's elapsed wall-clock time exceeds it, the attempt is
+  finalized `TimedOut` without ever invoking the poll command. `RunConfig`
+  gains `submitted_timeout_seconds` (`run --job-timeout <seconds>`, `jobs
+  poll --job-timeout <seconds>`); `run_flow_with`'s poll phase and `jobs
+  poll`'s reporting both handle the new outcome alongside
+  running/succeeded/failed. A detached tool can now also declare an optional
+  `runtime.cancel` command (validated like `poll`: absolute path, detached-only)
+  — `ProjectStore::cancel_submitted_attempt` runs it with the job handle and
+  finalizes the attempt `Cancelled`; new `agentflow jobs cancel <attempt-id>
+  [--json]` (backed by `ProjectStore::get_outstanding_submitted_attempt`).
+  Cancellation is best-effort — the attempt is still finalized `Cancelled`
+  even if the cancel command itself fails to run or exits non-zero (so a
+  flaky/absent cancel path never blocks marking a stuck job as done) — but
+  that failure is now recorded in `error_message` rather than discarded (a
+  HIGH from an independent review). Also adds a test proving a fresh
+  `ProjectStore::open` on the same project (simulating a process
+  restart/crash) can poll and collect a job an earlier, now-dropped handle
+  submitted — everything about an outstanding job lives in the project
+  database, not in-process. Known follow-up (not fixed here, flagged by
+  review): a poll-phase timeout doesn't automatically trigger `cancel` even
+  when one is configured, so a timed-out job's real external process may
+  keep running after AgentFlow considers it terminated — the operator must
+  separately `jobs cancel` it. Reviewed by an independent code-reviewer
+  (1 HIGH found and fixed, as above) and a security-reviewer pass (0
+  CRITICAL/HIGH; confirmed no shell interpolation of the job-handle string,
+  no new privilege beyond what `command`/`poll` already grant, and that the
+  timeout-doesn't-auto-cancel gap is a design tradeoff, not a vulnerability).
+  Implemented by a codex subagent from a fully-specified task (exact
+  signatures, call sites, and required tests); I verified the diff line by
+  line, added the reconnect-proof test and one review-driven fix myself.
+
 - **Async/detached execution — run-loop integration + `jobs` CLI (phase 3).**
   Wires the submit/poll primitives into the actual scheduler. `run_flow_with`
   gains a poll phase at the top of every wave: it polls every outstanding

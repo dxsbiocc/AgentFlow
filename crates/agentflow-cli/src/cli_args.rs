@@ -124,6 +124,8 @@ pub(crate) struct RunArgs {
     pub(crate) retries: Vec<usize>,
     #[arg(long, value_name = "seconds")]
     pub(crate) retry_backoff: Vec<usize>,
+    #[arg(long, value_name = "seconds")]
+    pub(crate) job_timeout: Vec<usize>,
     #[command(flatten)]
     pub(crate) project: PathOnlyArgs,
 }
@@ -441,13 +443,30 @@ pub(crate) struct JobsArgs {
 #[derive(Debug, Subcommand)]
 pub(crate) enum JobsCommand {
     List(JobsFilterArgs),
-    Poll(JobsFilterArgs),
+    Poll(JobsPollArgs),
+    Cancel(JobsCancelArgs),
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct JobsFilterArgs {
     #[arg(long, value_name = "flow-id")]
     pub(crate) flow: Vec<String>,
+    #[command(flatten)]
+    pub(crate) project: PathJsonArgs,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct JobsPollArgs {
+    #[command(flatten)]
+    pub(crate) filter: JobsFilterArgs,
+    #[arg(long, value_name = "seconds")]
+    pub(crate) job_timeout: Vec<usize>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct JobsCancelArgs {
+    #[arg(value_name = "attempt-id")]
+    pub(crate) attempt_id: String,
     #[command(flatten)]
     pub(crate) project: PathJsonArgs,
 }

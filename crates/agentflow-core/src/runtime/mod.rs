@@ -23,7 +23,7 @@ use crate::storage::{
 mod backend;
 mod schedule;
 
-use backend::parse_job_handle;
+use backend::{parse_detached_status, parse_job_handle, DetachedStatus};
 use schedule::{RuleBasedStepScheduler, StepScheduler};
 
 const ISOLATED_ENV_BACKEND: &str = "isolated-micromamba";
@@ -177,6 +177,13 @@ pub struct SubmittedAttempt {
     pub step_id: String,
     pub workdir: String,
     pub job_handle: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollOutcome {
+    Running,
+    Succeeded,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1458,6 +1465,98 @@ impl ProjectStore {
         Ok(())
     }
 
+    pub fn poll_submitted_attempt(
+        &self,
+        attempt: &SubmittedAttempt,
+    ) -> Result<PollOutcome, StorageError> {
+        let step = self
+            .inspect_flow(&attempt.flow_id)?
+            .steps
+            .into_iter()
+            .find(|step| step.id == attempt.step_id)
+            .ok_or_else(|| StorageError::NotFound(format!("submitted step {}", attempt.step_id)))?;
+        let tool_ref = step.tool_ref.as_deref().ok_or_else(|| {
+            StorageError::InvalidInput(format!(
+                "submitted step {} has no tool_ref",
+                attempt.step_id
+            ))
+        })?;
+        let tool = self.executable_tool(tool_ref)?;
+        let Some((poll_executable, poll_args)) = tool.runtime.poll.split_first() else {
+            return Err(StorageError::InvalidInput(format!(
+                "detached tool {tool_ref} has no poll command"
+            )));
+        };
+
+        let mut command = Command::new(poll_executable);
+        command
+            .args(poll_args)
+            .arg(&attempt.job_handle)
+            .current_dir(&attempt.workdir)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin");
+        let output = match run_local_command(command, None) {
+            Ok(output) => output,
+            Err(error) => {
+                let message = error.to_string();
+                self.finalize_submitted_attempt(
+                    &attempt.attempt_id,
+                    RunAttemptStatus::Failed,
+                    None,
+                    Some(&message),
+                )?;
+                return Ok(PollOutcome::Failed);
+            }
+        };
+        let status = parse_detached_status(&String::from_utf8_lossy(&output.stdout));
+        let exit_code = output.status.code().map(i64::from);
+
+        match status {
+            None | Some(DetachedStatus::Running) => Ok(PollOutcome::Running),
+            Some(DetachedStatus::Failed) => {
+                self.finalize_submitted_attempt(
+                    &attempt.attempt_id,
+                    RunAttemptStatus::Failed,
+                    exit_code,
+                    Some("detached job reported failed"),
+                )?;
+                Ok(PollOutcome::Failed)
+            }
+            Some(DetachedStatus::Succeeded) => {
+                let outputs_map = parse_json_map(&step.outputs_json)?;
+                let resolved = output_paths(Path::new(&attempt.workdir), &outputs_map);
+                match self.publish_declared_outputs(
+                    &resolved,
+                    &tool.outputs,
+                    &attempt.step_id,
+                    &attempt.run_id,
+                ) {
+                    Ok(_) => {
+                        // P2c publishes detached outputs but does not cache them; submitted
+                        // attempts do not persist the per-run hashes needed for a cache entry.
+                        self.finalize_submitted_attempt(
+                            &attempt.attempt_id,
+                            RunAttemptStatus::Succeeded,
+                            exit_code,
+                            None,
+                        )?;
+                        Ok(PollOutcome::Succeeded)
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        self.finalize_submitted_attempt(
+                            &attempt.attempt_id,
+                            RunAttemptStatus::Failed,
+                            exit_code,
+                            Some(&message),
+                        )?;
+                        Ok(PollOutcome::Failed)
+                    }
+                }
+            }
+        }
+    }
+
     pub fn mark_attempt_submitted(
         &self,
         attempt_id: &str,
@@ -1810,63 +1909,28 @@ impl ProjectStore {
                         write_runtime_error(&stderr_path, &StorageError::InvalidInput(message));
                     (RunAttemptStatus::TimedOut, code, Some(message))
                 } else if output.status.success() {
-                    match validate_outputs(&resolved_outputs) {
-                        Ok(()) => match validate_declared_outputs(&resolved_outputs, &tool_outputs)
-                        {
-                            Ok(()) => {
-                                let mut published_outputs = BTreeMap::new();
-                                let publish_result = resolved_outputs.as_map().iter().try_for_each(
-                                    |(output_name, output_path)| {
-                                        let artifact_type = tool_outputs
-                                            .get(output_name)
-                                            .map(|port| port.type_name.clone())
-                                            .unwrap_or_else(|| "File".to_string());
-                                        let artifact = self.register_computed_artifact(
-                                            ComputedArtifactRequest {
-                                                source_path: output_path.clone(),
-                                                artifact_type,
-                                                output_name: output_name.clone(),
-                                                source_step_id: step_id.clone(),
-                                                source_run_id: run_id.clone(),
-                                            },
-                                        )?;
-                                        self.observe_declared_output(
-                                            &artifact.summary.id,
-                                            output_name,
-                                            &tool_outputs,
-                                        )?;
-                                        published_outputs.insert(
-                                            output_name.clone(),
-                                            artifact.summary.id.clone(),
-                                        );
-                                        Ok::<(), StorageError>(())
-                                    },
-                                );
-                                match publish_result {
-                                    Ok(()) => {
-                                        self.save_cache_entry(CacheEntryWrite {
-                                            cache_key: cache_key.clone(),
-                                            tool_ref: tool_ref.to_string(),
-                                            input_hashes_json: input_hashes_json.clone(),
-                                            params_hash: params_hash.clone(),
-                                            runtime_hash: runtime_hash.clone(),
-                                            output_artifacts_json: string_map_json(
-                                                &published_outputs,
-                                            ),
-                                        })?;
-                                        (RunAttemptStatus::Succeeded, code, None)
-                                    }
-                                    Err(error) => {
-                                        let message = write_runtime_error(&stderr_path, &error);
-                                        (RunAttemptStatus::Failed, code, Some(message))
-                                    }
+                    match self.publish_declared_outputs(
+                        &resolved_outputs,
+                        &tool_outputs,
+                        &step_id,
+                        &run_id,
+                    ) {
+                        Ok(published_outputs) => {
+                            match self.save_cache_entry(CacheEntryWrite {
+                                cache_key: cache_key.clone(),
+                                tool_ref: tool_ref.to_string(),
+                                input_hashes_json: input_hashes_json.clone(),
+                                params_hash: params_hash.clone(),
+                                runtime_hash: runtime_hash.clone(),
+                                output_artifacts_json: string_map_json(&published_outputs),
+                            }) {
+                                Ok(()) => (RunAttemptStatus::Succeeded, code, None),
+                                Err(error) => {
+                                    let message = write_runtime_error(&stderr_path, &error);
+                                    (RunAttemptStatus::Failed, code, Some(message))
                                 }
                             }
-                            Err(error) => {
-                                let message = write_runtime_error(&stderr_path, &error);
-                                (RunAttemptStatus::Failed, code, Some(message))
-                            }
-                        },
+                        }
                         Err(error) => {
                             let message = write_runtime_error(&stderr_path, &error);
                             (RunAttemptStatus::Failed, code, Some(message))
@@ -2023,6 +2087,34 @@ impl ProjectStore {
             params![crate::storage::now_unix_seconds(), cache_key],
         )?;
         Ok(())
+    }
+
+    fn publish_declared_outputs(
+        &self,
+        resolved_outputs: &OutputPaths,
+        tool_outputs: &BTreeMap<String, crate::storage::ToolPortSpec>,
+        step_id: &str,
+        run_id: &str,
+    ) -> Result<BTreeMap<String, String>, StorageError> {
+        validate_outputs(resolved_outputs)?;
+        validate_declared_outputs(resolved_outputs, tool_outputs)?;
+        let mut published = BTreeMap::new();
+        for (output_name, output_path) in resolved_outputs.as_map() {
+            let artifact_type = tool_outputs
+                .get(output_name)
+                .map(|port| port.type_name.clone())
+                .unwrap_or_else(|| "File".to_string());
+            let artifact = self.register_computed_artifact(ComputedArtifactRequest {
+                source_path: output_path.clone(),
+                artifact_type,
+                output_name: output_name.clone(),
+                source_step_id: step_id.to_string(),
+                source_run_id: run_id.to_string(),
+            })?;
+            self.observe_declared_output(&artifact.summary.id, output_name, tool_outputs)?;
+            published.insert(output_name.clone(), artifact.summary.id.clone());
+        }
+        Ok(published)
     }
 
     fn save_cache_entry(&self, entry: CacheEntryWrite) -> Result<(), StorageError> {
@@ -4366,19 +4458,27 @@ steps:
         test_name: &str,
         submit_script_body: &str,
     ) -> (PathBuf, ProjectStore, StoredFlowStep) {
+        detached_submit_fixture_with_poll(
+            test_name,
+            submit_script_body,
+            r#"#!/bin/sh
+printf 'status=running\n'
+"#,
+        )
+    }
+
+    fn detached_submit_fixture_with_poll(
+        test_name: &str,
+        submit_script_body: &str,
+        poll_script_body: &str,
+    ) -> (PathBuf, ProjectStore, StoredFlowStep) {
         let path = temp_project_path(test_name);
         fs::create_dir_all(&path).unwrap();
         let store = ProjectStore::init(&path, Some("Detached Submit Demo")).unwrap();
         let submit_script = path.join("submit.sh");
         fs::write(&submit_script, submit_script_body).unwrap();
         let poll_script = path.join("poll.sh");
-        fs::write(
-            &poll_script,
-            r#"#!/bin/sh
-printf 'status=running\n'
-"#,
-        )
-        .unwrap();
+        fs::write(&poll_script, poll_script_body).unwrap();
 
         register_tool(
             &store,
@@ -4396,6 +4496,19 @@ printf 'status=running\n'
         let step = store.inspect_flow("detached_submit_demo").unwrap().steps[0].clone();
 
         (path, store, step)
+    }
+
+    fn submit_detached_fixture(store: &ProjectStore, step: &StoredFlowStep) -> SubmittedAttempt {
+        let summary = store
+            .submit_step("detached_submit_demo", step, &RunConfig::default())
+            .unwrap();
+        assert_eq!(summary.status, RunAttemptStatus::Submitted.as_str());
+        let attempts = store
+            .outstanding_submitted_attempts("detached_submit_demo")
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].attempt_id, summary.attempt_id);
+        attempts[0].clone()
     }
 
     #[test]
@@ -4446,6 +4559,155 @@ exit 0
             .outstanding_submitted_attempts("detached_submit_demo")
             .unwrap()
             .is_empty());
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn poll_submitted_attempt_collects_outputs_on_success() {
+        let (path, store, step) = detached_submit_fixture_with_poll(
+            "poll-submitted-success",
+            r#"#!/bin/sh
+printf 'detached note\n' > "$AGENTFLOW_OUTPUT_NOTE"
+printf 'job_handle=job-1\n'
+exit 0
+"#,
+            r#"#!/bin/sh
+printf 'status=succeeded\n'
+"#,
+        );
+        let attempt = submit_detached_fixture(&store, &step);
+
+        let outcome = store.poll_submitted_attempt(&attempt).unwrap();
+
+        assert_eq!(outcome, PollOutcome::Succeeded);
+        assert!(store
+            .outstanding_submitted_attempts("detached_submit_demo")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.inspect_flow("detached_submit_demo").unwrap().steps[0].status,
+            StepStatus::Completed.as_str()
+        );
+        let computed = store
+            .list_artifacts()
+            .unwrap()
+            .into_iter()
+            .filter(|artifact| artifact.kind == "computed")
+            .collect::<Vec<_>>();
+        assert_eq!(computed.len(), 1);
+        assert_eq!(
+            computed[0].source_step_id.as_deref(),
+            Some(step.id.as_str())
+        );
+        assert_eq!(
+            fs::read_to_string(&computed[0].path).unwrap(),
+            "detached note\n"
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn poll_submitted_attempt_keeps_running_attempt_outstanding() {
+        let (path, store, step) = detached_submit_fixture_with_poll(
+            "poll-submitted-running",
+            r#"#!/bin/sh
+printf 'detached note\n' > "$AGENTFLOW_OUTPUT_NOTE"
+printf 'job_handle=job-1\n'
+exit 0
+"#,
+            r#"#!/bin/sh
+printf 'status=running\n'
+"#,
+        );
+        let attempt = submit_detached_fixture(&store, &step);
+
+        let outcome = store.poll_submitted_attempt(&attempt).unwrap();
+
+        assert_eq!(outcome, PollOutcome::Running);
+        let outstanding = store
+            .outstanding_submitted_attempts("detached_submit_demo")
+            .unwrap();
+        assert_eq!(outstanding, vec![attempt]);
+        assert_eq!(
+            store.inspect_flow("detached_submit_demo").unwrap().steps[0].status,
+            StepStatus::Running.as_str()
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn poll_submitted_attempt_finalizes_failed_status() {
+        let (path, store, step) = detached_submit_fixture_with_poll(
+            "poll-submitted-failed",
+            r#"#!/bin/sh
+printf 'job_handle=job-1\n'
+exit 0
+"#,
+            r#"#!/bin/sh
+printf 'status=failed\n'
+"#,
+        );
+        let attempt = submit_detached_fixture(&store, &step);
+
+        let outcome = store.poll_submitted_attempt(&attempt).unwrap();
+
+        assert_eq!(outcome, PollOutcome::Failed);
+        assert!(store
+            .outstanding_submitted_attempts("detached_submit_demo")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.inspect_flow("detached_submit_demo").unwrap().steps[0].status,
+            StepStatus::Failed.as_str()
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn poll_submitted_attempt_finalizes_failed_when_poll_command_fails_to_spawn() {
+        let path = temp_project_path("poll-submitted-spawn-error");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Detached Submit Demo")).unwrap();
+        let submit_script = path.join("submit.sh");
+        fs::write(
+            &submit_script,
+            r#"#!/bin/sh
+printf 'job_handle=job-1\n'
+exit 0
+"#,
+        )
+        .unwrap();
+
+        register_tool(
+            &store,
+            format!(
+                "schema_version: agentflow.tool.v0\nnamespace: async\nname: detached_note\nversion: 0.1.0\nmaturity: wrapped\ndescription: Detached note\noutputs:\n  note:\n    type: Text\nruntime:\n  backend: detached\n  command:\n    - /bin/sh\n    - {}\n  poll:\n    - /nonexistent/agentflow-poll-binary\n",
+                submit_script.display()
+            ),
+        );
+        let flow = FlowDraft::from_simple_yaml(
+            "schema_version: agentflow.flow.v0\nid: detached_submit_demo\nname: Detached submit demo\nsteps:\n  - id: submit\n    tool: async/detached_note\n    needs: []\n    outputs:\n      note: submitted_note\n",
+        )
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+        let step = store.inspect_flow("detached_submit_demo").unwrap().steps[0].clone();
+        let attempt = submit_detached_fixture(&store, &step);
+
+        let outcome = store.poll_submitted_attempt(&attempt).unwrap();
+
+        assert_eq!(outcome, PollOutcome::Failed);
+        assert!(store
+            .outstanding_submitted_attempts("detached_submit_demo")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.inspect_flow("detached_submit_demo").unwrap().steps[0].status,
+            StepStatus::Failed.as_str()
+        );
 
         let _ = fs::remove_dir_all(path);
     }

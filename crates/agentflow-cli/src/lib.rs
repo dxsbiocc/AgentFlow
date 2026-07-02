@@ -185,13 +185,27 @@ fn run_command(args: RunArgs) -> Result<String, CliError> {
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let summary = store.run_flow_with(&flow_id, &run_config)?;
     Ok(format!(
-        "Run complete\nFlow: {}\nCompleted steps: {}\nFailed steps: {}\nSkipped steps: {}\nAttempts:\n{}",
+        "Run complete\nFlow: {}\nCompleted steps: {}\nFailed steps: {}\nSkipped steps: {}{}\nAttempts:\n{}",
         summary.flow_id,
         summary.completed_steps,
         summary.failed_steps,
         summary.skipped_steps,
+        submitted_steps_hint(summary.submitted_steps),
         format_attempts(&summary.attempts)
     ))
+}
+
+/// A trailing note for text-mode run/run-step/retry output when a detached job
+/// is still outstanding — empty string when there's nothing to report, so
+/// callers can splice it in without conditional formatting at each call site.
+fn submitted_steps_hint(submitted_steps: usize) -> String {
+    if submitted_steps == 0 {
+        String::new()
+    } else {
+        format!(
+            "\n{submitted_steps} step(s) still running (detached) — re-run to collect, or use `jobs poll`."
+        )
+    }
 }
 
 fn agent_command(args: AgentArgs) -> Result<String, CliError> {
@@ -231,10 +245,11 @@ fn run_step_command(args: StepRefArgs) -> Result<String, CliError> {
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let summary = store.run_step_ref(&step_id)?;
     Ok(format!(
-        "Run step complete\nFlow: {}\nCompleted steps: {}\nFailed steps: {}\nAttempts:\n{}",
+        "Run step complete\nFlow: {}\nCompleted steps: {}\nFailed steps: {}{}\nAttempts:\n{}",
         summary.flow_id,
         summary.completed_steps,
         summary.failed_steps,
+        submitted_steps_hint(summary.submitted_steps),
         format_attempts(&summary.attempts)
     ))
 }
@@ -376,16 +391,85 @@ fn cache_prune_command(args: CachePruneArgs) -> Result<String, CliError> {
     }
 }
 
+fn jobs_command(args: JobsArgs) -> Result<String, CliError> {
+    match args.command {
+        JobsCommand::List(args) => jobs_list_command(args),
+        JobsCommand::Poll(args) => jobs_poll_command(args),
+    }
+}
+
+fn jobs_list_command(args: JobsFilterArgs) -> Result<String, CliError> {
+    let flow_id = last_value(args.flow);
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
+    let attempts = match &flow_id {
+        Some(flow_id) => store.outstanding_submitted_attempts(flow_id)?,
+        None => store.all_outstanding_submitted_attempts()?,
+    };
+    if options.json {
+        Ok(submitted_attempts_json(&attempts))
+    } else if attempts.is_empty() {
+        Ok("Outstanding jobs\n_none_".to_string())
+    } else {
+        Ok(format!(
+            "Outstanding jobs\n{}",
+            format_submitted_attempts(&attempts)
+        ))
+    }
+}
+
+fn jobs_poll_command(args: JobsFilterArgs) -> Result<String, CliError> {
+    let flow_id = last_value(args.flow);
+    let options = ProjectOptions::from(args.project);
+    let project_path = options.path.unwrap_or(std::env::current_dir()?);
+    let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
+    let attempts = match &flow_id {
+        Some(flow_id) => store.outstanding_submitted_attempts(flow_id)?,
+        None => store.all_outstanding_submitted_attempts()?,
+    };
+
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    let mut running = 0usize;
+    for attempt in &attempts {
+        match store.poll_submitted_attempt(attempt)? {
+            agentflow_core::runtime::PollOutcome::Running => running += 1,
+            agentflow_core::runtime::PollOutcome::Succeeded => succeeded += 1,
+            agentflow_core::runtime::PollOutcome::Failed => failed += 1,
+        }
+    }
+
+    if options.json {
+        Ok(format!(
+            "{{\"schema_version\":\"agentflow.jobs_poll.v0\",\"polled\":{},\"succeeded\":{},\"failed\":{},\"running\":{}}}",
+            attempts.len(),
+            succeeded,
+            failed,
+            running
+        ))
+    } else {
+        Ok(format!(
+            "Poll complete\nPolled: {}\nSucceeded: {}\nFailed: {}\nStill running: {}",
+            attempts.len(),
+            succeeded,
+            failed,
+            running
+        ))
+    }
+}
+
 fn retry_command(args: StepRefArgs) -> Result<String, CliError> {
     let step_id = args.step_id;
     let project_path = project_path_from_only(args.project)?;
     let store = agentflow_core::storage::ProjectStore::open(&project_path)?;
     let summary = store.retry_step_ref(&step_id)?;
     Ok(format!(
-        "Retry complete\nFlow: {}\nCompleted steps: {}\nFailed steps: {}\nAttempts:\n{}",
+        "Retry complete\nFlow: {}\nCompleted steps: {}\nFailed steps: {}{}\nAttempts:\n{}",
         summary.flow_id,
         summary.completed_steps,
         summary.failed_steps,
+        submitted_steps_hint(summary.submitted_steps),
         format_attempts(&summary.attempts)
     ))
 }
@@ -2251,6 +2335,42 @@ fn optional_json_path(value: Option<&PathBuf>) -> String {
         || "null".to_string(),
         |value| format!("\"{}\"", escape_json(&value.display().to_string())),
     )
+}
+
+fn format_submitted_attempts(attempts: &[agentflow_core::runtime::SubmittedAttempt]) -> String {
+    attempts
+        .iter()
+        .map(|attempt| {
+            format!(
+                "{} {} {} handle={} {}",
+                attempt.attempt_id,
+                attempt.run_id,
+                attempt.step_id,
+                attempt.job_handle,
+                attempt.workdir
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn submitted_attempts_json(attempts: &[agentflow_core::runtime::SubmittedAttempt]) -> String {
+    let entries = attempts
+        .iter()
+        .map(|attempt| {
+            format!(
+                "{{\"attempt_id\":\"{}\",\"run_id\":\"{}\",\"flow_id\":\"{}\",\"step_id\":\"{}\",\"job_handle\":\"{}\",\"workdir\":\"{}\"}}",
+                escape_json(&attempt.attempt_id),
+                escape_json(&attempt.run_id),
+                escape_json(&attempt.flow_id),
+                escape_json(&attempt.step_id),
+                escape_json(&attempt.job_handle),
+                escape_json(&attempt.workdir)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"schema_version\":\"agentflow.jobs_list.v0\",\"jobs\":[{entries}]}}")
 }
 
 fn cache_entries_json(entries: &[agentflow_core::runtime::CacheEntrySummary]) -> String {

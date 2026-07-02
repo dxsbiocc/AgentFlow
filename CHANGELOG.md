@@ -9,6 +9,33 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **Async/detached execution — run-loop integration + `jobs` CLI (phase 3).**
+  Wires the submit/poll primitives into the actual scheduler. `run_flow_with`
+  gains a poll phase at the top of every wave: it polls every outstanding
+  `Submitted` attempt (`poll_submitted_attempt`), applying the same
+  completed/failed/retry-budget bookkeeping as a normal step; a ready
+  detached-backend step is now *submitted* (not waited on) via `submit_step`,
+  which replaces `run_step` at both call sites (`run_flow_with`'s sequential
+  path, and `run_step_ref` used by `run-step`/`retry`) — for a synchronous
+  tool this is behavior-identical (`submit_step` only diverges when the
+  command prints `job_handle=`). The parallel wave path
+  (`run_ready_wave_parallel`) now also recognizes a job handle, via a shared
+  `finalize_pending_step` extracted from `submit_step` — previously it called
+  `record_step` directly, which had no job-handle awareness, so a detached
+  tool run under `--max-parallel > 1` would have been misrecorded as failed
+  (its declared outputs don't exist yet while the job runs in the
+  background). `FlowRunSummary` gains `submitted_steps: usize` — jobs still
+  outstanding when a `run`/`run-step`/`retry` call returns; `run` is
+  resumable (re-run, or `jobs poll`, to collect). New `agentflow jobs list
+  [--flow <id>] [--json]` / `agentflow jobs poll [--flow <id>] [--json]`
+  (`ProjectStore::all_outstanding_submitted_attempts` is the project-wide,
+  non-flow-scoped counterpart to phase 1's `outstanding_submitted_attempts`);
+  `jobs poll` polls and collects without advancing the flow. `run`/`run-step`/
+  `retry` text output now notes when steps are still running detached.
+  `run_step_ref`'s status classification is also fixed: it previously
+  reported ANY non-`succeeded`/`cache_hit` attempt as 1 failed step, which
+  would have misreported a successful detached submission as a failure.
+
 - **Async/detached execution — poll + collect (phase 2c).** Adds
   `poll_submitted_attempt`, which runs a detached tool's poll command for an
   outstanding submitted attempt and parses its `status=` line: `running` leaves

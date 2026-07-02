@@ -67,6 +67,7 @@ enum TopCommand {
     RunStep(StepRefArgs),
     Report(ReportArgs),
     Cache(CacheArgs),
+    Jobs(JobsArgs),
     Retry(StepRefArgs),
     Observe(ObserveArgs),
     Observations(ObservationsArgs),
@@ -427,6 +428,26 @@ pub(crate) struct CachePruneArgs {
     pub(crate) all: bool,
     #[arg(long, value_name = "seconds")]
     pub(crate) older_than_seconds: Vec<String>,
+    #[command(flatten)]
+    pub(crate) project: PathJsonArgs,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct JobsArgs {
+    #[command(subcommand)]
+    pub(crate) command: JobsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum JobsCommand {
+    List(JobsFilterArgs),
+    Poll(JobsFilterArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct JobsFilterArgs {
+    #[arg(long, value_name = "flow-id")]
+    pub(crate) flow: Vec<String>,
     #[command(flatten)]
     pub(crate) project: PathJsonArgs,
 }
@@ -1033,6 +1054,7 @@ fn dispatch(cli: Cli) -> Result<String, CliError> {
         TopCommand::RunStep(args) => crate::run_step_command(args),
         TopCommand::Report(args) => crate::report_command(args),
         TopCommand::Cache(args) => crate::cache_command(args),
+        TopCommand::Jobs(args) => crate::jobs_command(args),
         TopCommand::Retry(args) => crate::retry_command(args),
         TopCommand::Observe(args) => crate::observe_command(args),
         TopCommand::Observations(args) => crate::observations_command(args),

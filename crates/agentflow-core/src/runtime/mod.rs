@@ -154,6 +154,10 @@ pub struct FlowRunSummary {
     /// Steps that never ran (still `draft`/`ready`) — skipped because a
     /// dependency failed, or because a fail-fast run stopped early.
     pub skipped_steps: usize,
+    /// Detached jobs still outstanding (status `submitted`) when this call
+    /// returned — neither succeeded nor failed yet. Re-run to poll and collect
+    /// them (or use `jobs poll`).
+    pub submitted_steps: usize,
     pub attempts: Vec<AttemptSummary>,
 }
 
@@ -736,6 +740,41 @@ impl ProjectStore {
         let mut retry_counts: BTreeMap<String, usize> = BTreeMap::new();
 
         loop {
+            let mut progressed = false;
+            // Set when a step failed but still has retry budget left, so the run
+            // should keep looping (the step is re-offered next wave) rather than
+            // stopping on a no-progress wave.
+            let mut retrying = false;
+
+            // Poll phase: advance any outstanding detached jobs before computing
+            // readiness, so a job that finishes this iteration can unblock its
+            // dependents in the same call (no separate "collect" pass needed).
+            for attempt in self.outstanding_submitted_attempts(flow_id)? {
+                match self.poll_submitted_attempt(&attempt)? {
+                    PollOutcome::Running => {}
+                    PollOutcome::Succeeded => {
+                        completed_steps += 1;
+                        progressed = true;
+                        attempts.push(polled_attempt_summary(
+                            &attempt,
+                            RunAttemptStatus::Succeeded,
+                        ));
+                    }
+                    PollOutcome::Failed => {
+                        if record_step_failure(
+                            &attempt.step_id,
+                            config.retries,
+                            &mut retry_counts,
+                            &mut failed_ids,
+                            &mut failed_steps,
+                        ) {
+                            retrying = true;
+                        }
+                        attempts.push(polled_attempt_summary(&attempt, RunAttemptStatus::Failed));
+                    }
+                }
+            }
+
             let flow = self.inspect_flow(flow_id)?;
             let mut completed = completed_step_ids(&flow.steps);
             let mut ready = RuleBasedStepScheduler.order(
@@ -749,11 +788,6 @@ impl ProjectStore {
                 break;
             }
 
-            let mut progressed = false;
-            // Set when a step failed but still has retry budget left, so the run
-            // should keep looping (the step is re-offered next wave) rather than
-            // stopping on a no-progress wave.
-            let mut retrying = false;
             if config.max_parallel > 1 {
                 // Parallel wave: prepare + record stay serial on the main thread
                 // (single connection); only the tool subprocesses overlap.
@@ -762,6 +796,11 @@ impl ProjectStore {
                         "succeeded" | "cache_hit" => {
                             completed.insert(attempt.step_id.clone());
                             completed_steps += 1;
+                            progressed = true;
+                        }
+                        // A detached tool's step is now Running (blocked on its
+                        // job, polled by a later wave) — not a failure.
+                        "submitted" => {
                             progressed = true;
                         }
                         _ => {
@@ -780,11 +819,14 @@ impl ProjectStore {
                 }
             } else {
                 for step in ready {
-                    let attempt = self.run_step(flow_id, &step, config)?;
+                    let attempt = self.submit_step(flow_id, &step, config)?;
                     match attempt.status.as_str() {
                         "succeeded" | "cache_hit" => {
                             completed.insert(attempt.step_id.clone());
                             completed_steps += 1;
+                            progressed = true;
+                        }
+                        "submitted" => {
                             progressed = true;
                         }
                         _ => {
@@ -825,12 +867,16 @@ impl ProjectStore {
             .iter()
             .filter(|step| matches!(step.status.as_str(), "draft" | "ready"))
             .count();
+        // Detached jobs still outstanding at the end of this call — the run is
+        // resumable: a later `run` (or `jobs poll`) re-polls these by handle.
+        let submitted_steps = self.outstanding_submitted_attempts(flow_id)?.len();
 
         Ok(FlowRunSummary {
             flow_id: flow_id.to_string(),
             completed_steps,
             failed_steps,
             skipped_steps,
+            submitted_steps,
             attempts,
         })
     }
@@ -956,7 +1002,7 @@ impl ProjectStore {
                     .position(|(candidate, _)| *candidate == slot)
                     .expect("recorded slot for executed subprocess");
                 let (slot, prepared) = records.remove(position);
-                batch_results[slot] = Some(self.record_step(prepared, output)?);
+                batch_results[slot] = Some(self.finalize_pending_step(prepared, output)?);
             }
 
             // Collect in ready order; in fail-fast mode stop the wave after any
@@ -964,7 +1010,13 @@ impl ProjectStore {
             // batch — the caller skips terminally-failed steps' dependents.
             let mut batch_failed = false;
             for summary in batch_results.into_iter().flatten() {
-                if !matches!(summary.status.as_str(), "succeeded" | "cache_hit") {
+                // "submitted" = a detached job now running in the background, not
+                // a failure — it's polled (and may unblock dependents) on a later
+                // wave/call, same as the sequential path.
+                if !matches!(
+                    summary.status.as_str(),
+                    "succeeded" | "cache_hit" | "submitted"
+                ) {
                     batch_failed = true;
                 }
                 attempts.push(summary);
@@ -1137,15 +1189,18 @@ impl ProjectStore {
         }
         ensure_step_dependencies_completed(&flow.steps, &flow.edges, step)?;
 
-        let attempt = self.run_step(&flow_id, step, config)?;
-        let completed_steps =
-            usize::from(matches!(attempt.status.as_str(), "succeeded" | "cache_hit"));
-        let failed_steps = usize::from(completed_steps == 0);
+        let attempt = self.submit_step(&flow_id, step, config)?;
+        let (completed_steps, submitted_steps, failed_steps) = match attempt.status.as_str() {
+            "succeeded" | "cache_hit" => (1, 0, 0),
+            "submitted" => (0, 1, 0),
+            _ => (0, 0, 1),
+        };
         Ok(FlowRunSummary {
             flow_id,
             completed_steps,
             failed_steps,
             skipped_steps: 0,
+            submitted_steps,
             attempts: vec![attempt],
         })
     }
@@ -1407,6 +1462,37 @@ impl ProjectStore {
         Ok(attempts)
     }
 
+    /// Every outstanding `Submitted` attempt across all flows in the project —
+    /// the project-wide counterpart of `outstanding_submitted_attempts`, for
+    /// `jobs list`/`jobs poll` when no `--flow` filter is given.
+    pub fn all_outstanding_submitted_attempts(
+        &self,
+    ) -> Result<Vec<SubmittedAttempt>, StorageError> {
+        let mut stmt = self.connection().prepare(
+            "SELECT ra.id, ra.run_id, r.flow_id, r.step_id, ra.workdir, ra.job_handle
+             FROM run_attempts ra
+             JOIN runs r ON r.id = ra.run_id
+             WHERE ra.status = ?1
+             ORDER BY ra.started_at ASC, ra.id ASC",
+        )?;
+        let rows = stmt.query_map(params![RunAttemptStatus::Submitted.as_str()], |row| {
+            Ok(SubmittedAttempt {
+                attempt_id: row.get(0)?,
+                run_id: row.get(1)?,
+                flow_id: row.get(2)?,
+                step_id: row.get(3)?,
+                workdir: row.get(4)?,
+                job_handle: row.get(5)?,
+            })
+        })?;
+
+        let mut attempts = Vec::new();
+        for row in rows {
+            attempts.push(row?);
+        }
+        Ok(attempts)
+    }
+
     pub fn finalize_submitted_attempt(
         &self,
         attempt_id: &str,
@@ -1576,6 +1662,13 @@ impl ProjectStore {
         Ok(())
     }
 
+    /// Run a step, submitting it (rather than waiting on it) when its command
+    /// reports a `job_handle=`. This is the single entry point the run-loop
+    /// uses for step execution: a synchronous tool's command never prints a
+    /// handle, so `finalize_pending_step` falls through to `record_step` and
+    /// behavior is identical to a plain synchronous run; a detached tool's
+    /// submit command does print one, so the attempt is recorded `Submitted`
+    /// (running detached) instead of waited on.
     pub fn submit_step(
         &self,
         flow_id: &str,
@@ -1591,60 +1684,47 @@ impl ProjectStore {
                     .take()
                     .expect("prepared step retains its command until execution");
                 let output = run_local_command(command, pending.timeout_seconds);
-                let handle = match &output {
-                    Ok(output) if output.status.success() => {
-                        parse_job_handle(&String::from_utf8_lossy(&output.stdout))
-                    }
-                    _ => None,
-                };
-                match handle {
-                    Some(handle) => {
-                        if let Ok(output) = &output {
-                            fs::write(&pending.stdout_path, &output.stdout)?;
-                            fs::write(&pending.stderr_path, &output.stderr)?;
-                        }
-                        let exit_code =
-                            output.as_ref().ok().and_then(|output| output.status.code());
-                        self.mark_attempt_submitted(&pending.attempt_id, &handle)?;
-                        Ok(AttemptSummary {
-                            run_id: pending.run_id,
-                            attempt_id: pending.attempt_id,
-                            step_id: pending.step_id,
-                            status: RunAttemptStatus::Submitted.as_str().to_string(),
-                            workdir: pending.workdir,
-                            stdout_path: pending.stdout_path,
-                            stderr_path: pending.stderr_path,
-                            exit_code,
-                        })
-                    }
-                    None => self.record_step(pending, output),
-                }
+                self.finalize_pending_step(pending, output)
             }
         }
     }
 
-    fn run_step(
+    /// Shared by `submit_step` (sequential path) and `run_ready_wave_parallel`
+    /// (parallel path): given a prepared step and its already-run subprocess
+    /// output, either record a `Submitted` attempt (the output's stdout carries
+    /// a `job_handle=`) or fall through to the normal synchronous `record_step`.
+    fn finalize_pending_step(
         &self,
-        flow_id: &str,
-        step: &StoredFlowStep,
-        config: &RunConfig,
+        pending: PendingStep,
+        output: std::io::Result<LocalCommandOutput>,
     ) -> Result<AttemptSummary, StorageError> {
-        match self.prepare_step(flow_id, step, config)? {
-            PreparedStep::Finished(summary) => Ok(summary),
-            PreparedStep::Pending(pending) => self.execute_and_record_step(*pending),
+        let handle = match &output {
+            Ok(output) if output.status.success() => {
+                parse_job_handle(&String::from_utf8_lossy(&output.stdout))
+            }
+            _ => None,
+        };
+        match handle {
+            Some(handle) => {
+                if let Ok(output) = &output {
+                    fs::write(&pending.stdout_path, &output.stdout)?;
+                    fs::write(&pending.stderr_path, &output.stderr)?;
+                }
+                let exit_code = output.as_ref().ok().and_then(|output| output.status.code());
+                self.mark_attempt_submitted(&pending.attempt_id, &handle)?;
+                Ok(AttemptSummary {
+                    run_id: pending.run_id,
+                    attempt_id: pending.attempt_id,
+                    step_id: pending.step_id,
+                    status: RunAttemptStatus::Submitted.as_str().to_string(),
+                    workdir: pending.workdir,
+                    stdout_path: pending.stdout_path,
+                    stderr_path: pending.stderr_path,
+                    exit_code,
+                })
+            }
+            None => self.record_step(pending, output),
         }
-    }
-
-    fn execute_and_record_step(
-        &self,
-        mut pending: PendingStep,
-    ) -> Result<AttemptSummary, StorageError> {
-        let command = pending
-            .command
-            .take()
-            .expect("prepared step retains its command until execution");
-        let output = run_local_command(command, pending.timeout_seconds);
-        self.record_step(pending, output)
     }
 
     fn prepare_step(
@@ -2341,6 +2421,28 @@ impl ProjectStore {
                 "step ref {step_ref} is ambiguous; use flow.step or step:flow/step"
             ))),
         }
+    }
+}
+
+/// Build an `AttemptSummary` for a detached attempt just finalized by the poll
+/// phase. `poll_submitted_attempt` already persisted the terminal status and
+/// collected/validated outputs (on success) — this only reconstructs the
+/// summary shape the run loop and CLI report, from the attempt's own workdir
+/// (the same `stdout.log`/`stderr.log` convention every attempt uses). The
+/// exit code isn't tracked on `SubmittedAttempt`, so it's reported as `None`.
+fn polled_attempt_summary(attempt: &SubmittedAttempt, status: RunAttemptStatus) -> AttemptSummary {
+    let workdir = PathBuf::from(&attempt.workdir);
+    let stdout_path = workdir.join("stdout.log");
+    let stderr_path = workdir.join("stderr.log");
+    AttemptSummary {
+        run_id: attempt.run_id.clone(),
+        attempt_id: attempt.attempt_id.clone(),
+        step_id: attempt.step_id.clone(),
+        status: status.as_str().to_string(),
+        workdir,
+        stdout_path,
+        stderr_path,
+        exit_code: None,
     }
 }
 
@@ -4707,6 +4809,184 @@ exit 0
         assert_eq!(
             store.inspect_flow("detached_submit_demo").unwrap().steps[0].status,
             StepStatus::Failed.as_str()
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn run_flow_with_submits_detached_step_without_blocking() {
+        let path = temp_project_path("run-flow-detached-submit-only");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Run Flow Detached Demo")).unwrap();
+        let submit_script = path.join("submit.sh");
+        fs::write(
+            &submit_script,
+            "#!/bin/sh\nprintf 'job_handle=job-1\\n'\nexit 0\n",
+        )
+        .unwrap();
+        let poll_script = path.join("poll.sh");
+        fs::write(&poll_script, "#!/bin/sh\nprintf 'status=running\\n'\n").unwrap();
+
+        register_tool(
+            &store,
+            format!(
+                "schema_version: agentflow.tool.v0\nnamespace: async\nname: detached_note\nversion: 0.1.0\nmaturity: wrapped\ndescription: Detached note\noutputs:\n  note:\n    type: Text\nruntime:\n  backend: detached\n  command:\n    - /bin/sh\n    - {}\n  poll:\n    - /bin/sh\n    - {}\n",
+                submit_script.display(),
+                poll_script.display()
+            ),
+        );
+        let flow = FlowDraft::from_simple_yaml(
+            "schema_version: agentflow.flow.v0\nid: run_detached_demo\nname: Run detached demo\nsteps:\n  - id: submit\n    tool: async/detached_note\n    needs: []\n    outputs:\n      note: submitted_note\n",
+        )
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+
+        let summary = store
+            .run_flow_with("run_detached_demo", &RunConfig::default())
+            .unwrap();
+
+        // A detached step being submitted is not a failure, and `run_flow_with`
+        // does not block waiting for it — it returns immediately, reporting the
+        // job as still outstanding.
+        assert_eq!(summary.completed_steps, 0);
+        assert_eq!(summary.failed_steps, 0);
+        assert_eq!(summary.submitted_steps, 1);
+        assert_eq!(summary.attempts.len(), 1);
+        assert_eq!(
+            summary.attempts[0].status,
+            RunAttemptStatus::Submitted.as_str()
+        );
+        assert_eq!(
+            store.inspect_flow("run_detached_demo").unwrap().steps[0].status,
+            StepStatus::Running.as_str()
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn run_flow_with_resumes_polls_and_collects_detached_output_for_downstream_step() {
+        let path = temp_project_path("run-flow-detached-resume");
+        fs::create_dir_all(&path).unwrap();
+        let store = ProjectStore::init(&path, Some("Run Flow Detached Resume Demo")).unwrap();
+
+        // The submit script writes the declared output right away (standing in
+        // for a background job that finishes before it's ever polled) and
+        // prints a handle; the poll script reports `running` on its first
+        // invocation and `succeeded` from the second call onward, so the flow
+        // must be resumed (re-`run_flow_with`) to collect it.
+        let submit_script = path.join("submit.sh");
+        fs::write(
+            &submit_script,
+            r#"#!/bin/sh
+printf 'submitted note\n' > "$AGENTFLOW_OUTPUT_NOTE"
+printf 'job_handle=job-1\n'
+exit 0
+"#,
+        )
+        .unwrap();
+        let poll_counter = path.join("poll.count");
+        let poll_script = path.join("poll.sh");
+        fs::write(
+            &poll_script,
+            format!(
+                r#"#!/bin/sh
+COUNTER="{}"
+n=0
+if [ -f "$COUNTER" ]; then n=$(cat "$COUNTER"); fi
+n=$((n + 1))
+printf '%s' "$n" > "$COUNTER"
+if [ "$n" -lt 2 ]; then
+  printf 'status=running\n'
+else
+  printf 'status=succeeded\n'
+fi
+"#,
+                poll_counter.display()
+            ),
+        )
+        .unwrap();
+        register_tool(
+            &store,
+            format!(
+                "schema_version: agentflow.tool.v0\nnamespace: async\nname: detached_note\nversion: 0.1.0\nmaturity: wrapped\ndescription: Detached note\noutputs:\n  note:\n    type: Text\nruntime:\n  backend: detached\n  command:\n    - /bin/sh\n    - {}\n  poll:\n    - /bin/sh\n    - {}\n",
+                submit_script.display(),
+                poll_script.display()
+            ),
+        );
+
+        let consume_script = path.join("consume.sh");
+        fs::write(
+            &consume_script,
+            r#"#!/bin/sh
+cat "$AGENTFLOW_INPUT_NOTE" > "$AGENTFLOW_OUTPUT_REPORT"
+printf 'consumed\n' >> "$AGENTFLOW_OUTPUT_REPORT"
+"#,
+        )
+        .unwrap();
+        register_tool(
+            &store,
+            format!(
+                "schema_version: agentflow.tool.v0\nnamespace: sync\nname: consume_note\nversion: 0.1.0\nmaturity: wrapped\ndescription: Consume a note\ninputs:\n  note:\n    type: Text\noutputs:\n  report:\n    type: Text\nruntime:\n  backend: local\n  command:\n    - /bin/sh\n    - {}\n",
+                consume_script.display()
+            ),
+        );
+
+        let flow = FlowDraft::from_simple_yaml(
+            "schema_version: agentflow.flow.v0\nid: run_detached_resume_demo\nname: Run detached resume demo\nsteps:\n  - id: submit\n    tool: async/detached_note\n    needs: []\n    outputs:\n      note: submitted_note\n  - id: consume\n    tool: sync/consume_note\n    needs: [submit]\n    inputs:\n      note: submit.note\n    outputs:\n      report: consumed_report\n",
+        )
+        .unwrap();
+        store.approve_flow(flow, None).unwrap();
+
+        // First call: submits the job (poll phase sees nothing outstanding yet,
+        // since the submission happens after this call's only poll pass);
+        // `consume` stays blocked on `submit`, which is now Running/Submitted.
+        let first = store
+            .run_flow_with("run_detached_resume_demo", &RunConfig::default())
+            .unwrap();
+        assert_eq!(first.completed_steps, 0);
+        assert_eq!(first.failed_steps, 0);
+        assert_eq!(first.submitted_steps, 1);
+
+        // Second call (resume): polls the outstanding job (now `succeeded`),
+        // collects its output, unblocks `consume`, and runs it in the same call.
+        let second = store
+            .run_flow_with("run_detached_resume_demo", &RunConfig::default())
+            .unwrap();
+        assert_eq!(second.completed_steps, 2);
+        assert_eq!(second.failed_steps, 0);
+        assert_eq!(second.submitted_steps, 0);
+        assert!(
+            second
+                .attempts
+                .iter()
+                .any(|attempt| attempt.step_id.ends_with("/submit")
+                    && attempt.status == RunAttemptStatus::Succeeded.as_str()),
+            "expected a polled Succeeded attempt for `submit`: {:?}",
+            second.attempts
+        );
+        let consume_attempt = second
+            .attempts
+            .iter()
+            .find(|attempt| attempt.step_id.ends_with("/consume"))
+            .expect("consume should have run once unblocked");
+        let report = fs::read_to_string(consume_attempt.workdir.join("outputs/consumed_report"))
+            .expect("consume's collected input should have produced a report");
+        assert_eq!(report, "submitted note\nconsumed\n");
+
+        assert_eq!(
+            store
+                .inspect_flow("run_detached_resume_demo")
+                .unwrap()
+                .steps
+                .iter()
+                .map(|step| step.status.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                StepStatus::Completed.as_str().to_string(),
+                StepStatus::Completed.as_str().to_string()
+            ]
         );
 
         let _ = fs::remove_dir_all(path);

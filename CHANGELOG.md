@@ -9,6 +9,22 @@ technical preview; the public API and CLI surface may change between minor versi
 
 ### Added
 
+- **Async/detached execution — poll + collect (phase 2c).** Adds
+  `poll_submitted_attempt`, which runs a detached tool's poll command for an
+  outstanding submitted attempt and parses its `status=` line: `running` leaves
+  the attempt untouched (still `Submitted`), `failed` finalizes it as `Failed`,
+  and `succeeded` collects the step's declared outputs from the job's workdir,
+  registers them as computed artifacts, and finalizes the attempt as `Succeeded`
+  (or `Failed` if output validation/registration fails). A poll command that
+  fails to spawn is treated as a poll failure rather than silently retried
+  forever. The output validation-and-publish logic previously inlined in
+  `record_step`'s success path is now a shared `publish_declared_outputs` helper
+  used by both the synchronous and detached paths — behavior-preserving, covered
+  by the full existing test suite. MVP limitation: detached outputs are not
+  cached (`save_cache_entry` is sync-path only for now), so re-running a
+  detached job re-submits rather than hitting cache. Run-loop integration
+  (automatic poll scheduling, `jobs list`/`jobs poll` CLI) follows in phase 3.
+
 - **Async/detached execution — `submit_step` (phase 2b).** Runs a detached tool's
   submit command, parses its `job_handle=`, and marks the run attempt `Submitted`
   (running detached) — reusing `prepare_step` (whose built command is the submit
